@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Venv
+backend/.venv/
+
+# Node
+app/node_modules/
+app/dist/
+
+# Tauri
+src-tauri/target/
+
+# Local
+.DS_Store
+.env
+.env.*
+
+# Databases
+*.db
+
+# Logs
+*.log
+
+# Secrets (local copies)
+/dev-auth.local.md
