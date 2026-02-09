@@ -26,10 +26,12 @@ jobs:
         run: cargo install tauri-cli --version "^2"
 
       - name: Install frontend deps
-        run: npm --prefix app install
+        working-directory: app
+        run: npm install
 
       - name: Build frontend
-        run: npm --prefix app run build
+        working-directory: app
+        run: npm run build
         env:
           VITE_API_URL: https://api.newlaw.app.br
 
