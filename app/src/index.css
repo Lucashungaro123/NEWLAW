@@ -828,6 +828,28 @@ body {
   background: var(--login-bg);
 }
 
+.login-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0 10px;
+}
+
+.login-meta .status {
+  font-weight: 700;
+}
+
+.login-meta .status.ok {
+  color: #2fbf71;
+}
+
+.login-meta .status.error {
+  color: var(--alert);
+}
+
 .login-card {
   width: 380px;
   padding: 24px;

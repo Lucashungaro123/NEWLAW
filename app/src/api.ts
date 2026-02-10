@@ -5,7 +5,7 @@ const REFRESH_KEY = "newlaw.refresh_token";
 const USER_KEY = "newlaw.user";
 
 const defaultBaseURL = import.meta.env.DEV ? "http://127.0.0.1:8000" : "https://api.newlaw.app.br";
-const baseURL = import.meta.env.VITE_API_URL || defaultBaseURL;
+export const baseURL = import.meta.env.VITE_API_URL || defaultBaseURL;
 
 export type AuthUser = { id: number; email: string; name: string; role: string };
 export type AuthSession = { accessToken: string; refreshToken: string; user: AuthUser };

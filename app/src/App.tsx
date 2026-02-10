@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { clearAuthSession, loadAuthSession, login as apiLogin, logout as apiLogout, saveAuthSession } from "./api";
+import { baseURL, clearAuthSession, loadAuthSession, login as apiLogin, logout as apiLogout, ping, saveAuthSession } from "./api";
 import { NavKey } from "./types";
 
 type ClientRow = { id: number; name: string; phone: string; phone2?: string; email: string; city: string; cpf: string };
@@ -1867,6 +1867,7 @@ function App() {
   const [user, setUser] = useState<{ email: string; name: string; role: string } | null>(null);
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
   const [creds, setCreds] = useState({ username: "", password: "" });
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "dark";
@@ -1936,6 +1937,16 @@ function App() {
     }
   };
 
+  const handlePing = async () => {
+    setApiStatus("checking");
+    try {
+      await ping();
+      setApiStatus("ok");
+    } catch {
+      setApiStatus("error");
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await apiLogout();
@@ -1960,6 +1971,14 @@ function App() {
             <div className="field">
               <label>Senha</label>
               <input type="password" value={creds.password} onChange={(e) => setCreds((c) => ({ ...c, password: e.target.value }))} />
+            </div>
+            <div className="login-meta">
+              <span>API: {baseURL}</span>
+              <button className="btn ghost small" type="button" onClick={handlePing} disabled={apiStatus === "checking"}>
+                {apiStatus === "checking" ? "Testando..." : "Testar API"}
+              </button>
+              {apiStatus === "ok" && <span className="status ok">OK</span>}
+              {apiStatus === "error" && <span className="status error">Erro</span>}
             </div>
             {authError && <div className="error">{authError}</div>}
             <button className="btn" type="submit" disabled={authBusy}>
