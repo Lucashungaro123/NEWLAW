@@ -262,6 +262,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",  # Vite dev server
         "tauri://localhost",  # Tauri webview
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "http://localhost",
+        "https://localhost",
     ],
     allow_credentials=True,
     allow_methods=["*"],
