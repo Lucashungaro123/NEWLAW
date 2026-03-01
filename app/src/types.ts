@@ -14,6 +14,7 @@ export type NavKey =
   | "official"
   | "progress"
   | "files"
+  | "wallets"
   | "settings";
 
 export interface Stat {
