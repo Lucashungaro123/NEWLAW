@@ -36,6 +36,7 @@ import {
   updateTeamMember as apiUpdateTeamMember,
   updateCase as apiUpdateCase,
   updateClient as apiUpdateClient,
+  updateWallet as apiUpdateWallet,
   loadAuthSession,
   login as apiLogin,
   logout as apiLogout,
@@ -3735,33 +3736,44 @@ function Wallets({ canManage }: { canManage: boolean }) {
   const [view, setView] = useState<WalletView>("dashboard");
   const [searchTerm, setSearchTerm] = useState("");
   const [wallets, setWallets] = useState<ApiWallet[]>([]);
+  const [members, setMembers] = useState<ApiTeamMember[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMembers, setIsLoadingMembers] = useState(false);
   const [error, setError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
-  const [form, setForm] = useState({ nickname: "", description: "", isActive: true });
+  const [saveSuccess, setSaveSuccess] = useState("");
+  const [editingWalletId, setEditingWalletId] = useState<number | null>(null);
+  const [form, setForm] = useState({ nickname: "", description: "", isActive: true, teamMemberIds: [] as number[] });
 
   useEffect(() => {
     let cancelled = false;
     const loadWallets = async () => {
       setIsLoading(true);
       setError("");
+      if (canManage) {
+        setIsLoadingMembers(true);
+      }
       try {
-        const data = await apiListWallets();
+        const [walletData, memberData] = await Promise.all([apiListWallets(), canManage ? apiListTeamMembers() : Promise.resolve([])]);
         if (cancelled) return;
-        setWallets(data);
+        setWallets(walletData);
+        setMembers(memberData);
       } catch (err) {
         if (cancelled) return;
         setError(extractApiErrorMessage(err, "Não foi possível carregar as carteiras."));
       } finally {
-        if (!cancelled) setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+          setIsLoadingMembers(false);
+        }
       }
     };
     loadWallets();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [canManage]);
 
   useEffect(() => {
     if (!canManage && view === "create") {
@@ -3772,33 +3784,85 @@ function Wallets({ canManage }: { canManage: boolean }) {
   const totalWallets = wallets.length;
   const activeWallets = wallets.filter((wallet) => wallet.is_active).length;
   const linkedCases = wallets.reduce((sum, wallet) => sum + (wallet.case_count || 0), 0);
+  const restrictedWallets = wallets.filter((wallet) => (wallet.team_member_ids?.length || 0) > 0).length;
   const nextWalletNumber = (wallets.length ? Math.max(...wallets.map((wallet) => wallet.number)) : 0) + 1;
+  const editingWallet = editingWalletId ? wallets.find((wallet) => wallet.id === editingWalletId) || null : null;
+  const selectableMembers = members
+    .filter((member) => member.is_active || form.teamMemberIds.includes(member.id))
+    .sort((a, b) => a.full_name.localeCompare(b.full_name, "pt-BR"));
 
   const filteredWallets = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
     if (!term) return wallets;
-    return wallets.filter((wallet) => `${wallet.name} ${wallet.nickname}`.toLowerCase().includes(term));
+    return wallets.filter((wallet) => {
+      const accessNames = (wallet.team_members || []).map((member) => `${member.full_name} ${member.email}`).join(" ");
+      return `${wallet.name} ${wallet.nickname} ${wallet.description || ""} ${accessNames}`.toLowerCase().includes(term);
+    });
   }, [wallets, searchTerm]);
 
-  const handleCreateWallet = async () => {
+  const resetForm = () => {
+    setEditingWalletId(null);
+    setForm({ nickname: "", description: "", isActive: true, teamMemberIds: [] });
+    setSaveError("");
+  };
+
+  const handleOpenCreateWallet = () => {
+    setSaveSuccess("");
+    resetForm();
+    setView("create");
+  };
+
+  const toggleWalletMember = (memberId: number) => {
+    setForm((prev) => ({
+      ...prev,
+      teamMemberIds: prev.teamMemberIds.includes(memberId)
+        ? prev.teamMemberIds.filter((id) => id !== memberId)
+        : [...prev.teamMemberIds, memberId]
+    }));
+  };
+
+  const handleEditWallet = (wallet: ApiWallet) => {
+    setSaveSuccess("");
+    setEditingWalletId(wallet.id);
+    setForm({
+      nickname: wallet.nickname || "",
+      description: wallet.description || "",
+      isActive: wallet.is_active,
+      teamMemberIds: [...(wallet.team_member_ids || [])]
+    });
+    setSaveError("");
+    setView("create");
+  };
+
+  const handleSaveWallet = async () => {
     if (!canManage) {
-      setSaveError("Você não tem permissão para criar carteiras.");
+      setSaveError("Você não tem permissão para gerenciar carteiras.");
       return;
     }
     if (!form.nickname.trim()) return;
     setIsSaving(true);
     setSaveError("");
+    setSaveSuccess("");
     try {
-      const created = await apiCreateWallet({
+      const payload = {
         nickname: form.nickname.trim(),
         description: form.description.trim() || undefined,
-        is_active: form.isActive
-      });
-      setWallets((prev) => [created, ...prev]);
-      setForm({ nickname: "", description: "", isActive: true });
+        is_active: form.isActive,
+        team_member_ids: form.teamMemberIds
+      };
+      if (editingWalletId) {
+        const updated = await apiUpdateWallet(editingWalletId, payload);
+        setWallets((prev) => prev.map((wallet) => (wallet.id === updated.id ? updated : wallet)));
+        setSaveSuccess("Carteira atualizada com sucesso.");
+      } else {
+        const created = await apiCreateWallet(payload);
+        setWallets((prev) => [created, ...prev]);
+        setSaveSuccess("Carteira criada com sucesso.");
+      }
+      resetForm();
       setView("list");
     } catch (err) {
-      setSaveError(extractApiErrorMessage(err, "Não foi possível cadastrar a carteira."));
+      setSaveError(extractApiErrorMessage(err, "Não foi possível salvar a carteira."));
     } finally {
       setIsSaving(false);
     }
@@ -3844,6 +3908,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
           </div>
         </div>
         {error && <div className="error">{error}</div>}
+        {saveSuccess && <div className="success">{saveSuccess}</div>}
 
         {view === "dashboard" && (
           <div className="processes-dashboard">
@@ -3851,7 +3916,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
               <div>
                 <div className="processes-eyebrow">Carteiras</div>
                 <h2>Visão consolidada</h2>
-                <p>Controle de carteiras e seus processos vinculados.</p>
+                <p>Controle de carteiras, processos vinculados e membros com acesso.</p>
               </div>
             </div>
             <div className="processes-kpi-grid">
@@ -3870,6 +3935,11 @@ function Wallets({ canManage }: { canManage: boolean }) {
                 <div className="processes-kpi-value">{linkedCases}</div>
                 <div className="processes-kpi-hint">Distribuídos entre carteiras</div>
               </button>
+              <button type="button" className="processes-kpi-card" onClick={() => setView("list")}>
+                <div className="processes-kpi-title">Carteiras com acesso restrito</div>
+                <div className="processes-kpi-value">{restrictedWallets}</div>
+                <div className="processes-kpi-hint">Membros específicos vinculados</div>
+              </button>
             </div>
           </div>
         )}
@@ -3881,7 +3951,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
                 <div className="processes-eyebrow">Carteiras</div>
                 <h2>Lista completa</h2>
               </div>
-              <button className="btn secondary small" type="button" onClick={() => setView("create")} disabled={!canManage}>
+              <button className="btn secondary small" type="button" onClick={handleOpenCreateWallet} disabled={!canManage}>
                 Nova carteira
               </button>
             </div>
@@ -3889,9 +3959,10 @@ function Wallets({ canManage }: { canManage: boolean }) {
               <div className="wallets-table-row head">
                 <div>Nome</div>
                 <div>Apelido</div>
-                <div>Descrição</div>
+                <div>Acesso</div>
                 <div>Processos</div>
                 <div>Status</div>
+                <div>Ações</div>
               </div>
               {isLoading ? (
                 <div className="processes-empty">Carregando carteiras...</div>
@@ -3901,10 +3972,30 @@ function Wallets({ canManage }: { canManage: boolean }) {
                 filteredWallets.map((wallet) => (
                   <div key={wallet.id} className="wallets-table-row">
                     <div>{wallet.name}</div>
-                    <div>{wallet.nickname}</div>
-                    <div>{wallet.description || "-"}</div>
+                    <div>
+                      <strong>{wallet.nickname}</strong>
+                      <div className="wallets-row-sub">{wallet.description || "Sem descrição"}</div>
+                    </div>
+                    <div className="wallet-access-stack">
+                      {(wallet.team_members || []).length === 0 ? (
+                        <div className="wallet-access-empty">Somente master e administradores</div>
+                      ) : (
+                        (wallet.team_members || []).map((member) => (
+                          <div key={member.id} className="wallet-access-badge">
+                            {member.full_name}
+                          </div>
+                        ))
+                      )}
+                    </div>
                     <div>{wallet.case_count || 0}</div>
                     <div>{wallet.is_active ? "Ativa" : "Inativa"}</div>
+                    <div className="wallets-row-actions">
+                      {canManage && (
+                        <button className="btn ghost small" type="button" onClick={() => handleEditWallet(wallet)}>
+                          Editar
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))
               )}
@@ -3915,12 +4006,14 @@ function Wallets({ canManage }: { canManage: boolean }) {
         {view === "create" && canManage && (
           <div className="wallets-form-card">
             <div className="processes-eyebrow">Cadastro</div>
-            <h2>Nova carteira</h2>
-            <div className="wallets-form-hint">Nome automático: sempre o último número + 1.</div>
+            <h2>{editingWalletId ? "Editar carteira" : "Nova carteira"}</h2>
+            <div className="wallets-form-hint">
+              Nome automático: sempre o último número + 1. O master e administradores sempre visualizam todas as carteiras.
+            </div>
             <div className="modal-grid">
               <div className="field">
                 <label>Nome da carteira</label>
-                <input value={`Carteira ${nextWalletNumber}`} readOnly />
+                <input value={editingWallet?.name || `Carteira ${nextWalletNumber}`} readOnly />
               </div>
               <div className="field">
                 <label>Apelido *</label>
@@ -3948,14 +4041,52 @@ function Wallets({ canManage }: { canManage: boolean }) {
                   <option value="inactive">Inativa</option>
                 </select>
               </div>
+              <div className="field span-2">
+                <label>Membros com acesso</label>
+                {isLoadingMembers ? (
+                  <div className="wallet-access-empty">Carregando equipe...</div>
+                ) : selectableMembers.length === 0 ? (
+                  <div className="wallet-access-empty">Nenhum membro da equipe cadastrado.</div>
+                ) : (
+                  <div className="permissions-grid">
+                    {selectableMembers.map((member) => (
+                      <label key={member.id} className={`permission-item wallet-member-item ${!member.is_active ? "locked" : ""}`}>
+                        <input
+                          type="checkbox"
+                          checked={form.teamMemberIds.includes(member.id)}
+                          onChange={() => toggleWalletMember(member.id)}
+                        />
+                        <div>
+                          <div className="wallet-member-name">{member.full_name}</div>
+                          <div className="wallet-member-meta">
+                            {member.team_name} · {member.role_title} · {member.is_active ? "Ativo" : "Inativo"}
+                          </div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                <div className="wallets-form-hint">
+                  Se nenhum membro for marcado, a carteira fica visível apenas para o master e administradores.
+                </div>
+              </div>
             </div>
             {saveError && <div className="error">{saveError}</div>}
             <div className="modal-actions">
-              <button className="btn ghost" type="button" onClick={() => setView("list")} disabled={isSaving}>
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => {
+                  setSaveSuccess("");
+                  resetForm();
+                  setView("list");
+                }}
+                disabled={isSaving}
+              >
                 Cancelar
               </button>
-              <button className="btn" type="button" onClick={handleCreateWallet} disabled={isSaving || !form.nickname.trim()}>
-                {isSaving ? "Salvando..." : "Salvar carteira"}
+              <button className="btn" type="button" onClick={handleSaveWallet} disabled={isSaving || !form.nickname.trim()}>
+                {isSaving ? "Salvando..." : editingWalletId ? "Salvar alterações" : "Salvar carteira"}
               </button>
             </div>
           </div>

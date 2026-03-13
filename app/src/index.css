@@ -2185,7 +2185,7 @@ body {
 
 .wallets-table-row {
   display: grid;
-  grid-template-columns: 180px 1.1fr 1.4fr 120px 120px;
+  grid-template-columns: 170px 1fr 1.4fr 100px 100px 150px;
   gap: 12px;
   align-items: center;
   padding: 12px 14px;
@@ -2221,6 +2221,49 @@ body {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.wallet-access-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.wallet-access-badge {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-border);
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.wallet-access-empty {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wallet-member-item {
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.wallet-member-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.wallet-member-meta {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .processes-canvas {

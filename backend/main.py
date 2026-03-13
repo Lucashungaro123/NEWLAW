@@ -49,6 +49,7 @@ from .models import (
     Template,
     User,
     Wallet,
+    WalletTeamMemberAccess,
 )
 
 DB_PATH = os.getenv("NEWLAW_DB", "sqlite:///./data.db")
@@ -232,6 +233,50 @@ def serialize_auth_user(user: User) -> dict:
         "is_admin": bool(user.is_team_admin),
         "allowed_nav_keys": get_effective_user_nav_keys(user),
     }
+
+
+def has_full_wallet_access(user: User) -> bool:
+    return user.role in ADMIN_ROLES or bool(user.is_team_admin)
+
+
+def get_team_member_for_user(session: Session, user: User) -> TeamMember | None:
+    if user.organization_id is None:
+        return None
+    return session.exec(
+        select(TeamMember).where(
+            TeamMember.organization_id == user.organization_id,
+            TeamMember.email == normalize_email(user.email),
+        )
+    ).first()
+
+
+def get_accessible_wallet_ids(
+    session: Session,
+    user: User,
+    organization_id: int | None,
+) -> set[int] | None:
+    if has_full_wallet_access(user):
+        return None
+    member = get_team_member_for_user(session, user)
+    if not member or member.id is None:
+        return set()
+    query = (
+        select(WalletTeamMemberAccess.wallet_id)
+        .join(Wallet, Wallet.id == WalletTeamMemberAccess.wallet_id)
+        .where(WalletTeamMemberAccess.team_member_id == member.id)
+    )
+    if organization_id is not None:
+        query = query.where(Wallet.organization_id == organization_id)
+    return set(session.exec(query).all())
+
+
+def ensure_user_can_access_wallet(session: Session, user: User, wallet: Wallet) -> None:
+    if wallet.id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carteira inválida")
+    accessible_wallet_ids = get_accessible_wallet_ids(session, user, wallet.organization_id)
+    if accessible_wallet_ids is None or wallet.id in accessible_wallet_ids:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem acesso a esta carteira")
 
 
 def send_system_email(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
@@ -1574,6 +1619,7 @@ class CreateWalletRequest(BaseModel):
     nickname: str
     description: str | None = None
     is_active: bool = True
+    team_member_ids: list[int] | None = None
     organization_id: int | None = None
 
 
@@ -1581,6 +1627,7 @@ class UpdateWalletRequest(BaseModel):
     nickname: str
     description: str | None = None
     is_active: bool = True
+    team_member_ids: list[int] | None = None
     organization_id: int | None = None
 
 
@@ -1769,7 +1816,84 @@ def build_wallet_case_count_map(session: Session, wallet_ids: list[int]) -> dict
     return counts
 
 
-def serialize_wallet(wallet: Wallet, case_count: int = 0) -> dict:
+def normalize_wallet_team_member_ids(raw_ids: list[int] | None) -> list[int]:
+    cleaned: list[int] = []
+    seen: set[int] = set()
+    for raw_id in raw_ids or []:
+        try:
+            member_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Membros inválidos para esta carteira") from exc
+        if member_id <= 0 or member_id in seen:
+            continue
+        seen.add(member_id)
+        cleaned.append(member_id)
+    return cleaned
+
+
+def resolve_wallet_team_members(session: Session, organization_id: int | None, raw_ids: list[int] | None) -> list[TeamMember]:
+    member_ids = normalize_wallet_team_member_ids(raw_ids)
+    if not member_ids:
+        return []
+    query = select(TeamMember).where(TeamMember.id.in_(member_ids))
+    if organization_id is None:
+        query = query.where(TeamMember.organization_id == None)  # noqa: E711
+    else:
+        query = query.where(TeamMember.organization_id == organization_id)
+    members = session.exec(query).all()
+    member_map = {member.id: member for member in members if member.id is not None}
+    ordered = [member_map[member_id] for member_id in member_ids if member_id in member_map]
+    if len(ordered) != len(member_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Membros inválidos para esta carteira")
+    return ordered
+
+
+def serialize_wallet_team_member(member: TeamMember) -> dict:
+    return {
+        "id": member.id,
+        "full_name": member.full_name,
+        "email": member.email,
+        "team_name": member.team_name,
+        "role_title": member.role_title,
+        "is_active": member.is_active,
+    }
+
+
+def get_wallet_team_member_lookup(session: Session, wallet_ids: list[int]) -> dict[int, list[TeamMember]]:
+    if not wallet_ids:
+        return {}
+    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.wallet_id.in_(wallet_ids))).all()
+    if not access_rows:
+        return {}
+    member_ids = list({row.team_member_id for row in access_rows})
+    members = session.exec(select(TeamMember).where(TeamMember.id.in_(member_ids))).all()
+    member_map = {member.id: member for member in members if member.id is not None}
+    lookup: dict[int, list[TeamMember]] = {}
+    for row in access_rows:
+        member = member_map.get(row.team_member_id)
+        if not member:
+            continue
+        lookup.setdefault(row.wallet_id, []).append(member)
+    for members_list in lookup.values():
+        members_list.sort(key=lambda item: (item.full_name or "").lower())
+    return lookup
+
+
+def sync_wallet_team_member_access(session: Session, wallet: Wallet, team_member_ids: list[int]) -> None:
+    if wallet.id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carteira inválida")
+    desired_ids = set(normalize_wallet_team_member_ids(team_member_ids))
+    existing_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.wallet_id == wallet.id)).all()
+    existing_ids = {row.team_member_id for row in existing_rows}
+    for row in existing_rows:
+        if row.team_member_id not in desired_ids:
+            session.delete(row)
+    for member_id in desired_ids - existing_ids:
+        session.add(WalletTeamMemberAccess(wallet_id=wallet.id, team_member_id=member_id))
+
+
+def serialize_wallet(wallet: Wallet, case_count: int = 0, team_members: list[TeamMember] | None = None) -> dict:
+    assigned_members = team_members or []
     return {
         "id": wallet.id,
         "organization_id": wallet.organization_id,
@@ -1779,6 +1903,8 @@ def serialize_wallet(wallet: Wallet, case_count: int = 0) -> dict:
         "description": wallet.description,
         "is_active": wallet.is_active,
         "case_count": case_count,
+        "team_member_ids": [member.id for member in assigned_members if member.id is not None],
+        "team_members": [serialize_wallet_team_member(member) for member in assigned_members],
         "created_at": wallet.created_at,
         "updated_at": wallet.updated_at,
     }
@@ -1796,6 +1922,7 @@ def resolve_wallet_for_case(
     session: Session,
     wallet_id: int | None,
     case_organization_id: int | None,
+    user: User | None = None,
 ) -> Wallet | None:
     if wallet_id is None:
         return None
@@ -1804,6 +1931,8 @@ def resolve_wallet_for_case(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carteira inválida")
     if wallet.organization_id != case_organization_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Carteira inválida para esta organização")
+    if user is not None:
+        ensure_user_can_access_wallet(session, user, wallet)
     return wallet
 
 
@@ -1857,8 +1986,8 @@ def serialize_case(case: Case, wallet: Wallet | None = None) -> dict:
     }
 
 
-def serialize_case_list(session: Session, cases: list[Case]) -> list[dict]:
-    lookup = get_case_wallet_lookup(session, [case.id for case in cases if case.id is not None])
+def serialize_case_list(session: Session, cases: list[Case], wallet_lookup: dict[int, Wallet] | None = None) -> list[dict]:
+    lookup = wallet_lookup if wallet_lookup is not None else get_case_wallet_lookup(session, [case.id for case in cases if case.id is not None])
     output: list[dict] = []
     for case in cases:
         wallet = lookup.get(case.id) if case.id is not None else None
@@ -2594,8 +2723,12 @@ def list_wallets(
     if scope_organization_id is not None:
         query = query.where(Wallet.organization_id == scope_organization_id)
     wallets = session.exec(query).all()
+    accessible_wallet_ids = get_accessible_wallet_ids(session, user, scope_organization_id)
+    if accessible_wallet_ids is not None:
+        wallets = [wallet for wallet in wallets if wallet.id is not None and wallet.id in accessible_wallet_ids]
     counts = build_wallet_case_count_map(session, [wallet.id for wallet in wallets if wallet.id is not None])
-    return [serialize_wallet(wallet, counts.get(wallet.id or 0, 0)) for wallet in wallets]
+    member_lookup = get_wallet_team_member_lookup(session, [wallet.id for wallet in wallets if wallet.id is not None])
+    return [serialize_wallet(wallet, counts.get(wallet.id or 0, 0), member_lookup.get(wallet.id or 0, [])) for wallet in wallets]
 
 
 @app.post("/wallets")
@@ -2606,6 +2739,7 @@ def create_wallet(
 ) -> dict:
     ensure_can_manage_team_and_wallets(user)
     scope_organization_id = resolve_organization_scope(user, session, payload.organization_id)
+    assigned_members = resolve_wallet_team_members(session, scope_organization_id, payload.team_member_ids)
     next_number = get_next_wallet_number(session, scope_organization_id)
     wallet = Wallet(
         organization_id=scope_organization_id,
@@ -2618,7 +2752,9 @@ def create_wallet(
     session.add(wallet)
     session.commit()
     session.refresh(wallet)
-    return serialize_wallet(wallet, 0)
+    sync_wallet_team_member_access(session, wallet, [member.id for member in assigned_members if member.id is not None])
+    session.commit()
+    return serialize_wallet(wallet, 0, assigned_members)
 
 
 @app.put("/wallets/{wallet_id}")
@@ -2645,15 +2781,17 @@ def update_wallet(
                 detail="Não é permitido mover carteira entre organizações",
             )
 
+    assigned_members = resolve_wallet_team_members(session, target_organization_id, payload.team_member_ids)
     wallet.nickname = payload.nickname.strip()
     wallet.description = (payload.description or "").strip() or None
     wallet.is_active = payload.is_active
     wallet.updated_at = datetime.utcnow()
     session.add(wallet)
+    sync_wallet_team_member_access(session, wallet, [member.id for member in assigned_members if member.id is not None])
     session.commit()
     session.refresh(wallet)
     case_count = build_wallet_case_count_map(session, [wallet.id]).get(wallet.id, 0)
-    return serialize_wallet(wallet, case_count)
+    return serialize_wallet(wallet, case_count, assigned_members)
 
 
 @app.delete("/wallets/{wallet_id}")
@@ -2675,6 +2813,9 @@ def delete_wallet(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Carteira possui processos vinculados. Remova os vínculos antes de excluir.",
         )
+    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.wallet_id == wallet.id)).all()
+    for row in access_rows:
+        session.delete(row)
     session.delete(wallet)
     session.commit()
     return {"status": "ok", "id": wallet_id}
@@ -2843,6 +2984,9 @@ def delete_team_member(
         linked_user.is_active = False
         linked_user.updated_at = datetime.utcnow()
         session.add(linked_user)
+    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.team_member_id == member.id)).all()
+    for row in access_rows:
+        session.delete(row)
     session.delete(member)
     session.commit()
     if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "member" and linked_user.id is not None:
@@ -2951,7 +3095,17 @@ def list_cases(
     if scope_organization_id is not None:
         query = query.where(Case.organization_id == scope_organization_id)
     cases = session.exec(query).all()
-    return serialize_case_list(session, cases)
+    wallet_lookup = get_case_wallet_lookup(session, [case.id for case in cases if case.id is not None])
+    accessible_wallet_ids = get_accessible_wallet_ids(session, user, scope_organization_id)
+    if accessible_wallet_ids is not None:
+        cases = [
+            case
+            for case in cases
+            if case.id is not None and (
+                case.id not in wallet_lookup or wallet_lookup[case.id].id in accessible_wallet_ids
+            )
+        ]
+    return serialize_case_list(session, cases, wallet_lookup)
 
 
 @app.post("/cases")
@@ -2982,7 +3136,7 @@ def create_case(
     session.add(case)
     session.commit()
     session.refresh(case)
-    wallet = resolve_wallet_for_case(session, payload.wallet_id, case.organization_id)
+    wallet = resolve_wallet_for_case(session, payload.wallet_id, case.organization_id, user)
     sync_case_wallet_assignment(session, case.id, wallet.id if wallet else None)
     session.commit()
     return serialize_case(case, wallet)
@@ -3001,6 +3155,9 @@ def update_case(
     current_scope = resolve_existing_record_scope(user, session, case.organization_id)
     if current_scope is not None and case.organization_id != current_scope:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este processo")
+    current_wallet = get_case_wallet_lookup(session, [case.id]).get(case.id)
+    if current_wallet is not None:
+        ensure_user_can_access_wallet(session, user, current_wallet)
 
     target_organization_id = case.organization_id
     if payload.organization_id is not None:
@@ -3026,7 +3183,7 @@ def update_case(
     session.add(case)
     session.commit()
     session.refresh(case)
-    wallet = resolve_wallet_for_case(session, payload.wallet_id, case.organization_id)
+    wallet = resolve_wallet_for_case(session, payload.wallet_id, case.organization_id, user)
     sync_case_wallet_assignment(session, case.id, wallet.id if wallet else None)
     session.commit()
     return serialize_case(case, wallet)
@@ -3044,6 +3201,9 @@ def delete_case(
     current_scope = resolve_existing_record_scope(user, session, case.organization_id)
     if current_scope is not None and case.organization_id != current_scope:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este processo")
+    current_wallet = get_case_wallet_lookup(session, [case.id]).get(case.id)
+    if current_wallet is not None:
+        ensure_user_can_access_wallet(session, user, current_wallet)
 
     link = session.exec(select(CaseWallet).where(CaseWallet.case_id == case.id)).first()
     if link:

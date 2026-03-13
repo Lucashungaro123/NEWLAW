@@ -114,6 +114,14 @@ class CaseWallet(TimestampMixin, table=True):
     wallet_id: int = Field(foreign_key="wallet.id", index=True)
 
 
+class WalletTeamMemberAccess(TimestampMixin, table=True):
+    __table_args__ = (UniqueConstraint("wallet_id", "team_member_id", name="uq_wallet_team_member_access"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    wallet_id: int = Field(foreign_key="wallet.id", index=True)
+    team_member_id: int = Field(foreign_key="teammember.id", index=True)
+
+
 class Invoice(TimestampMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: Optional[int] = Field(default=None, foreign_key="organization.id")

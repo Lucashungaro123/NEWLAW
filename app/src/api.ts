@@ -71,11 +71,21 @@ export type ApiWallet = {
   description?: string | null;
   is_active: boolean;
   case_count?: number;
+  team_member_ids?: number[];
+  team_members?: {
+    id: number;
+    full_name: string;
+    email: string;
+    team_name: string;
+    role_title: string;
+    is_active: boolean;
+  }[];
 };
 export type CreateWalletPayload = {
   nickname: string;
   description?: string;
   is_active?: boolean;
+  team_member_ids?: number[];
   organization_id?: number;
 };
 export type UpdateWalletPayload = CreateWalletPayload;
