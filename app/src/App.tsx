@@ -703,6 +703,26 @@ const extractApiErrorMessage = (err: unknown, fallback: string) => {
   return fallback;
 };
 
+const extractRuntimeErrorMessage = (err: unknown, fallback: string) => {
+  if (err instanceof Error && err.message) {
+    return err.message;
+  }
+  if (typeof err === "string" && err.trim()) {
+    return err.trim();
+  }
+  if (typeof err === "object" && err !== null) {
+    try {
+      const serialized = JSON.stringify(err);
+      if (serialized && serialized !== "{}") {
+        return `${fallback} (${serialized})`;
+      }
+    } catch {
+      // Ignore and fallback.
+    }
+  }
+  return fallback;
+};
+
 const normalizeNavKeys = (keys?: string[] | null): NavKey[] => {
   const valid = new Set<NavKey>(navPermissionOptions.map((item) => item.key));
   const output: NavKey[] = [];
@@ -4714,7 +4734,7 @@ function Settings({
       setAvailableUpdate(null);
       setDownloadProgress(100);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Não foi possível instalar a atualização.";
+      const message = extractRuntimeErrorMessage(error, "Não foi possível instalar a atualização.");
       setUpdateStatus("error");
       setUpdateMessage(message);
     } finally {
@@ -4732,6 +4752,9 @@ function Settings({
 
   const updateMeta = availableUpdate ? `Canal Estável · nova versão ${availableUpdate.version}` : "Canal Estável";
   const updateDescription = availableUpdate?.body || "As atualizações são baixadas e instaladas pelo próprio aplicativo.";
+  const manualUpdateUrl = availableUpdate
+    ? `https://github.com/Lucashungaro123/NEWLAW/releases/tag/v${availableUpdate.version}`
+    : "https://github.com/Lucashungaro123/NEWLAW/releases/latest";
 
   return (
     <div className="content-card page-card settings-page">
@@ -4875,6 +4898,9 @@ function Settings({
             <button className="link-btn" type="button" onClick={handleCheckForUpdates} disabled={!canCheckUpdate}>
               Verificar novamente
             </button>
+            <a className="link-btn" href={manualUpdateUrl} target="_blank" rel="noreferrer">
+              Baixar manual
+            </a>
           </div>
         </div>
       </div>
