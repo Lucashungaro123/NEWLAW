@@ -7,7 +7,15 @@ const USER_KEY = "newlaw.user";
 const defaultBaseURL = import.meta.env.DEV ? "http://127.0.0.1:8000" : "https://api.newlaw.app.br";
 export const baseURL = import.meta.env.VITE_API_URL || defaultBaseURL;
 
-export type AuthUser = { id: number; email: string; name: string; role: string };
+export type AuthUser = {
+  id: number;
+  email: string;
+  name: string;
+  role: string;
+  organization_id?: number | null;
+  is_admin?: boolean;
+  allowed_nav_keys?: string[];
+};
 export type AuthSession = { accessToken: string; refreshToken: string; user: AuthUser };
 export type ApiClient = {
   id: number;
@@ -83,7 +91,56 @@ export type ApiTeamMember = {
   role_title: string;
   team_name: string;
   notes?: string | null;
+  is_admin?: boolean;
+  allowed_nav_keys?: string[];
   is_active: boolean;
+  invite_email_sent?: boolean;
+  invite_token?: string;
+};
+
+export type TeamMembersCapacity = {
+  organization_id: number;
+  plan_slug?: string | null;
+  plan_name?: string | null;
+  user_limit?: number | null;
+  active_users: number;
+  available_slots?: number | null;
+};
+export type CalendarProvider = "google" | "microsoft";
+export type CalendarConnectionStatus = {
+  provider: CalendarProvider;
+  connected: boolean;
+  provider_email?: string | null;
+  last_synced_at?: string | null;
+  sync_error?: string | null;
+};
+export type CalendarConnectionStart = {
+  provider: CalendarProvider;
+  auth_url: string;
+  state: string;
+  expires_in_seconds: number;
+};
+export type AgendaItemKind = "deadline" | "meeting";
+export type AgendaItem = {
+  id: string;
+  entity_id: number;
+  kind: AgendaItemKind;
+  source: string;
+  title: string;
+  starts_at: string;
+  ends_at: string;
+  is_all_day: boolean;
+  location?: string | null;
+  meeting_url?: string | null;
+  reference?: string | null;
+  description?: string | null;
+  status?: string | null;
+};
+export type CreateAgendaDeadlinePayload = {
+  title: string;
+  due_date: string;
+  reference?: string;
+  notes?: string;
 };
 export type CreateTeamMemberPayload = {
   full_name: string;
@@ -94,6 +151,8 @@ export type CreateTeamMemberPayload = {
   role_title: string;
   team_name: string;
   notes?: string;
+  is_admin?: boolean;
+  allowed_nav_keys?: string[];
   is_active?: boolean;
   organization_id?: number;
 };
@@ -287,6 +346,12 @@ export async function listTeamMembers(organizationId?: number) {
   return data as ApiTeamMember[];
 }
 
+export async function getTeamMembersCapacity(organizationId?: number) {
+  const params = organizationId ? { organization_id: organizationId } : undefined;
+  const { data } = await api.get("/team-members/capacity", { params });
+  return data as TeamMembersCapacity;
+}
+
 export async function createTeamMember(payload: CreateTeamMemberPayload) {
   const { data } = await api.post("/team-members", payload);
   return data as ApiTeamMember;
@@ -299,5 +364,45 @@ export async function updateTeamMember(memberId: number, payload: UpdateTeamMemb
 
 export async function deleteTeamMember(memberId: number) {
   const { data } = await api.delete(`/team-members/${memberId}`);
+  return data as { status: string; id: number };
+}
+
+export async function listCalendarConnections() {
+  const { data } = await api.get("/calendar/connections");
+  return data as CalendarConnectionStatus[];
+}
+
+export async function startCalendarConnection(provider: CalendarProvider) {
+  const { data } = await api.post(`/calendar/connections/${provider}/start`);
+  return data as CalendarConnectionStart;
+}
+
+export async function syncCalendarConnection(provider: CalendarProvider) {
+  const { data } = await api.post(`/calendar/connections/${provider}/sync`);
+  return data as { provider: CalendarProvider; synced_events: number; last_synced_at: string };
+}
+
+export async function disconnectCalendarConnection(provider: CalendarProvider) {
+  const { data } = await api.delete(`/calendar/connections/${provider}`);
+  return data as { status: string; provider: CalendarProvider };
+}
+
+export async function listAgendaEvents(params?: { start?: string; end?: string; refresh_external?: boolean }) {
+  const { data } = await api.get("/agenda/events", { params });
+  return data as AgendaItem[];
+}
+
+export async function listAgendaDeadlines() {
+  const { data } = await api.get("/agenda/deadlines");
+  return data as AgendaItem[];
+}
+
+export async function createAgendaDeadline(payload: CreateAgendaDeadlinePayload) {
+  const { data } = await api.post("/agenda/deadlines", payload);
+  return data as AgendaItem;
+}
+
+export async function deleteAgendaDeadline(deadlineId: number) {
+  const { data } = await api.delete(`/agenda/deadlines/${deadlineId}`);
   return data as { status: string; id: number };
 }

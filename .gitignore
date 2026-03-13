@@ -28,3 +28,4 @@ src-tauri/target/
 
 # Secrets (local copies)
 /dev-auth.local.md
+scripts/vps.env

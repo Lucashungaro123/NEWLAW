@@ -3,23 +3,36 @@ import { getVersion } from "@tauri-apps/api/app";
 import { isTauri } from "@tauri-apps/api/core";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
+  AgendaItem,
+  AuthUser,
   ApiCase,
   ApiClient,
   ApiTeamMember,
   ApiWallet,
+  CalendarConnectionStatus,
+  CalendarProvider,
+  TeamMembersCapacity,
   baseURL,
+  createAgendaDeadline as apiCreateAgendaDeadline,
   createTeamMember as apiCreateTeamMember,
   createWallet as apiCreateWallet,
   clearAuthSession,
   createCase as apiCreateCase,
   createClient as apiCreateClient,
+  deleteAgendaDeadline as apiDeleteAgendaDeadline,
   deleteTeamMember as apiDeleteTeamMember,
   deleteCase as apiDeleteCase,
   deleteClient as apiDeleteClient,
+  disconnectCalendarConnection as apiDisconnectCalendarConnection,
+  getTeamMembersCapacity as apiGetTeamMembersCapacity,
+  listAgendaEvents as apiListAgendaEvents,
+  listCalendarConnections as apiListCalendarConnections,
   listTeamMembers as apiListTeamMembers,
   listCases as apiListCases,
   listClients as apiListClients,
   listWallets as apiListWallets,
+  startCalendarConnection as apiStartCalendarConnection,
+  syncCalendarConnection as apiSyncCalendarConnection,
   updateTeamMember as apiUpdateTeamMember,
   updateCase as apiUpdateCase,
   updateClient as apiUpdateClient,
@@ -62,6 +75,10 @@ const navItems: { key: NavKey; label: string }[] = [
   { key: "files", label: "Arquivos" },
   { key: "settings", label: "Configurações" }
 ];
+
+const navPermissionOptions = navItems.map((item) => ({ key: item.key, label: item.label }));
+const defaultMemberNavKeys = navPermissionOptions.map((item) => item.key);
+const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
 
 const navIconProps = {
   viewBox: "0 0 24 24",
@@ -684,6 +701,34 @@ const extractApiErrorMessage = (err: unknown, fallback: string) => {
     return `Sem conexão com a API (${baseURL}).`;
   }
   return fallback;
+};
+
+const normalizeNavKeys = (keys?: string[] | null): NavKey[] => {
+  const valid = new Set<NavKey>(navPermissionOptions.map((item) => item.key));
+  const output: NavKey[] = [];
+  const seen = new Set<NavKey>();
+  for (const raw of keys || []) {
+    const key = raw as NavKey;
+    if (!valid.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    output.push(key);
+  }
+  return output;
+};
+
+const getEffectiveAllowedNavKeys = (user: AuthUser | null): NavKey[] => {
+  if (!user) return [];
+  const isPlatformAdmin = user.role === "superadmin" || user.role === "owner" || user.role === "admin";
+  if (isPlatformAdmin) return [...defaultMemberNavKeys];
+  const keys = normalizeNavKeys(user.allowed_nav_keys);
+  const base = keys.length ? [...keys] : [...defaultMemberNavKeys];
+  if (!base.includes("settings")) base.push("settings");
+  if (user.is_admin) {
+    for (const required of adminRequiredNavKeys) {
+      if (!base.includes(required)) base.push(required);
+    }
+  }
+  return base;
 };
 
 function StatCard({ title, value, description, badge }: { title: string; value: string; description?: string; badge?: string }) {
@@ -2733,6 +2778,401 @@ function Publications() {
   );
 }
 
+const agendaProviders: { provider: CalendarProvider; label: string; description: string }[] = [
+  {
+    provider: "google",
+    label: "Google",
+    description: "Importa reuniões criadas no Google Calendar / Google Meet."
+  },
+  {
+    provider: "microsoft",
+    label: "Microsoft",
+    description: "Importa reuniões criadas no Outlook / Teams."
+  }
+];
+
+const agendaSourceLabel = (source: string) => {
+  if (source === "internal") return "Prazo interno";
+  if (source === "google") return "Google";
+  if (source === "microsoft") return "Microsoft";
+  return source;
+};
+
+const formatAgendaTime = (value: string, isAllDay: boolean) => {
+  if (isAllDay) return "Dia inteiro";
+  const date = new Date(value);
+  return date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+};
+
+const formatAgendaHeaderDate = (value: string) => {
+  const date = parseLocalDate(value);
+  return date.toLocaleDateString("pt-BR", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+    weekday: "long"
+  });
+};
+
+function Agenda() {
+  const [month, setMonth] = useState(() => {
+    const today = new Date();
+    return new Date(today.getFullYear(), today.getMonth(), 1);
+  });
+  const [selectedDate, setSelectedDate] = useState(() => formatIsoDate(new Date()));
+  const [events, setEvents] = useState<AgendaItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [inlineMessage, setInlineMessage] = useState("");
+  const [sourceFilter, setSourceFilter] = useState<"all" | "internal" | CalendarProvider>("all");
+  const [typeFilter, setTypeFilter] = useState<"all" | "deadline" | "meeting">("all");
+  const [savingDeadline, setSavingDeadline] = useState(false);
+  const [deadlineForm, setDeadlineForm] = useState({ title: "", dueDate: formatIsoDate(new Date()), reference: "", notes: "" });
+
+  useEffect(() => {
+    if (!inlineMessage) return;
+    const timeout = window.setTimeout(() => setInlineMessage(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [inlineMessage]);
+
+  const loadAgendaData = async (
+    targetMonth: Date,
+    options: { refreshExternal?: boolean; silent?: boolean } = {}
+  ) => {
+    const { refreshExternal = false, silent = false } = options;
+    const rangeStart = `${formatIsoDate(new Date(targetMonth.getFullYear(), targetMonth.getMonth(), 1))}T00:00:00`;
+    const rangeEnd = `${formatIsoDate(new Date(targetMonth.getFullYear(), targetMonth.getMonth() + 1, 0))}T23:59:59`;
+    if (!silent) {
+      setIsLoading(true);
+    }
+    setError("");
+    try {
+      const agendaData = await apiListAgendaEvents({ start: rangeStart, end: rangeEnd, refresh_external: refreshExternal || undefined });
+      setEvents(agendaData);
+    } catch (err) {
+      setError(extractApiErrorMessage(err, "Não foi possível carregar a agenda."));
+    } finally {
+      if (!silent) {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    void loadAgendaData(month);
+  }, [month]);
+
+  useEffect(() => {
+    const refreshSilently = () => {
+      void loadAgendaData(month, { silent: true, refreshExternal: true });
+    };
+    const intervalId = window.setInterval(refreshSilently, 15000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshSilently();
+      }
+    };
+    const handleWindowFocus = () => refreshSilently();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleWindowFocus);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleWindowFocus);
+    };
+  }, [month]);
+
+  const monthLabel = month.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+  const monthTitle = monthLabel.charAt(0).toUpperCase() + monthLabel.slice(1);
+  const year = month.getFullYear();
+  const monthIndex = month.getMonth();
+  const firstDay = new Date(year, monthIndex, 1);
+  const startOffset = (firstDay.getDay() + 6) % 7;
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  const totalCells = Math.ceil((startOffset + daysInMonth) / 7) * 7;
+  const todayKey = formatIsoDate(new Date());
+
+  const filteredEvents = useMemo(() => {
+    return events.filter((item) => {
+      if (typeFilter !== "all" && item.kind !== typeFilter) return false;
+      if (sourceFilter === "all") return true;
+      if (sourceFilter === "internal") return item.source === "internal";
+      return item.source === sourceFilter;
+    });
+  }, [events, sourceFilter, typeFilter]);
+
+  const eventCountByDate = useMemo(() => {
+    const counts: Record<string, number> = {};
+    filteredEvents.forEach((event) => {
+      const start = new Date(event.starts_at);
+      const end = new Date(event.ends_at);
+      const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+      const endDay = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+      while (cursor <= endDay) {
+        const key = formatIsoDate(cursor);
+        counts[key] = (counts[key] || 0) + 1;
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    });
+    return counts;
+  }, [filteredEvents]);
+
+  const selectedDayEvents = useMemo(() => {
+    const start = parseLocalDate(selectedDate);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return filteredEvents
+      .filter((item) => {
+        const startsAt = new Date(item.starts_at);
+        const endsAt = new Date(item.ends_at);
+        return startsAt < end && endsAt >= start;
+      })
+      .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime());
+  }, [filteredEvents, selectedDate]);
+
+  const upcomingEvents = useMemo(() => {
+    const selectedStart = parseLocalDate(selectedDate);
+    return filteredEvents
+      .filter((item) => new Date(item.starts_at).getTime() >= selectedStart.getTime())
+      .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
+      .slice(0, 8);
+  }, [filteredEvents, selectedDate]);
+
+  const handleCreateDeadline = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!deadlineForm.title.trim() || !deadlineForm.dueDate) return;
+    setSavingDeadline(true);
+    setError("");
+    try {
+      await apiCreateAgendaDeadline({
+        title: deadlineForm.title.trim(),
+        due_date: deadlineForm.dueDate,
+        reference: deadlineForm.reference.trim() || undefined,
+        notes: deadlineForm.notes.trim() || undefined
+      });
+      const dueDate = parseLocalDate(deadlineForm.dueDate);
+      const dueMonth = new Date(dueDate.getFullYear(), dueDate.getMonth(), 1);
+      setMonth(dueMonth);
+      setSelectedDate(deadlineForm.dueDate);
+      setDeadlineForm((prev) => ({ ...prev, title: "", reference: "", notes: "" }));
+      setInlineMessage("Prazo cadastrado com sucesso.");
+      await loadAgendaData(dueMonth);
+    } catch (err) {
+      setError(extractApiErrorMessage(err, "Não foi possível salvar o prazo."));
+    } finally {
+      setSavingDeadline(false);
+    }
+  };
+
+  const handleDeleteDeadline = async (eventItem: AgendaItem) => {
+    if (eventItem.kind !== "deadline") return;
+    try {
+      await apiDeleteAgendaDeadline(eventItem.entity_id);
+      setInlineMessage("Prazo removido.");
+      await loadAgendaData(month);
+    } catch (err) {
+      setError(extractApiErrorMessage(err, "Não foi possível remover o prazo."));
+    }
+  };
+
+  const handleChangeMonth = (offset: number) => {
+    const nextMonth = new Date(month.getFullYear(), month.getMonth() + offset, 1);
+    setMonth(nextMonth);
+    setSelectedDate(formatIsoDate(new Date(nextMonth.getFullYear(), nextMonth.getMonth(), 1)));
+  };
+
+  return (
+    <div className="content-card page-card agenda-page">
+      <div className="page-header">
+        <div>
+          <div className="eyebrow">Agenda</div>
+          <h1 className="page-title">Compromissos e Prazos</h1>
+          <div className="page-subtitle">Reuniões e prazos em uma única agenda. Gerencie conexões em Configurações.</div>
+        </div>
+      </div>
+
+      {error && <div className="error">{error}</div>}
+      {inlineMessage && <div className="agenda-inline">{inlineMessage}</div>}
+
+      <div className="agenda-grid">
+        <div className="agenda-left">
+          <div className="calendar-card agenda-calendar-card">
+            <div className="calendar-head">
+              <div className="calendar-title">{monthTitle}</div>
+              <div className="calendar-actions">
+                <button type="button" className="btn ghost small" onClick={() => handleChangeMonth(-1)}>
+                  Anterior
+                </button>
+                <button type="button" className="btn ghost small" onClick={() => handleChangeMonth(1)}>
+                  Próximo
+                </button>
+              </div>
+            </div>
+            <div className="calendar-week">
+              {weekDays.map((label) => (
+                <div key={label} className="calendar-weekday">
+                  {label}
+                </div>
+              ))}
+            </div>
+            <div className="calendar-grid">
+              {Array.from({ length: totalCells }).map((_, index) => {
+                const dayNumber = index - startOffset + 1;
+                if (dayNumber < 1 || dayNumber > daysInMonth) {
+                  return <div key={`empty-${index}`} className="calendar-cell empty" />;
+                }
+                const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
+                const count = eventCountByDate[dateKey] || 0;
+                const isSelected = dateKey === selectedDate;
+                return (
+                  <button
+                    key={dateKey}
+                    type="button"
+                    className={`calendar-cell agenda-day-btn ${count > 0 ? "has-deadline" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                    onClick={() => {
+                      setSelectedDate(dateKey);
+                      setDeadlineForm((prev) => ({ ...prev, dueDate: dateKey }));
+                    }}
+                  >
+                    <div className="calendar-day">{dayNumber}</div>
+                    {count > 0 && <div className="calendar-count">{count} item{count > 1 ? "s" : ""}</div>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="publication-card agenda-deadline-card">
+            <div className="publication-title">Novo prazo interno</div>
+            <form className="publication-form agenda-deadline-form" onSubmit={handleCreateDeadline}>
+              <div className="field">
+                <label>Título *</label>
+                <input
+                  value={deadlineForm.title}
+                  onChange={(event) => setDeadlineForm((prev) => ({ ...prev, title: event.target.value }))}
+                  placeholder="Ex: Contrarrazões do processo AP-002"
+                />
+              </div>
+              <div className="field">
+                <label>Data *</label>
+                <input
+                  type="date"
+                  value={deadlineForm.dueDate}
+                  onChange={(event) => setDeadlineForm((prev) => ({ ...prev, dueDate: event.target.value }))}
+                />
+              </div>
+              <div className="field">
+                <label>Referência</label>
+                <input
+                  value={deadlineForm.reference}
+                  onChange={(event) => setDeadlineForm((prev) => ({ ...prev, reference: event.target.value }))}
+                  placeholder="Processo/cliente"
+                />
+              </div>
+              <div className="field span-2">
+                <label>Observações</label>
+                <textarea
+                  value={deadlineForm.notes}
+                  onChange={(event) => setDeadlineForm((prev) => ({ ...prev, notes: event.target.value }))}
+                  placeholder="Detalhes do prazo"
+                />
+              </div>
+              <div className="publication-actions">
+                <div className="deadline-preview">
+                  Data selecionada: <strong>{formatBrazilDate(deadlineForm.dueDate || selectedDate)}</strong>
+                </div>
+                <button className="btn" type="submit" disabled={!deadlineForm.title.trim() || !deadlineForm.dueDate || savingDeadline}>
+                  {savingDeadline ? "Salvando..." : "Salvar prazo"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div className="agenda-right">
+          <div className="publication-card agenda-events-card">
+            <div className="agenda-events-head">
+              <div>
+                <div className="publication-title">Compromissos do dia</div>
+                <div className="publication-meta">{formatAgendaHeaderDate(selectedDate)}</div>
+              </div>
+              <div className="agenda-filters">
+                <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as "all" | "internal" | CalendarProvider)}>
+                  <option value="all">Todas origens</option>
+                  <option value="internal">Somente prazos</option>
+                  <option value="google">Google</option>
+                  <option value="microsoft">Microsoft</option>
+                </select>
+                <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as "all" | "deadline" | "meeting")}>
+                  <option value="all">Todos tipos</option>
+                  <option value="deadline">Prazos</option>
+                  <option value="meeting">Reuniões</option>
+                </select>
+              </div>
+            </div>
+
+            {isLoading ? (
+              <div className="publication-empty">Carregando agenda...</div>
+            ) : selectedDayEvents.length === 0 ? (
+              <div className="publication-empty">Nenhum compromisso para o dia selecionado.</div>
+            ) : (
+              <div className="publication-list agenda-event-list">
+                {selectedDayEvents.map((item) => (
+                  <div key={item.id} className={`publication-item agenda-event-item ${item.kind}`}>
+                    <div>
+                      <div className="publication-name">{item.title}</div>
+                      <div className="publication-meta">
+                        {formatAgendaTime(item.starts_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
+                        {item.reference ? ` · ${item.reference}` : ""}
+                      </div>
+                      {item.location && <div className="publication-meta">Local: {item.location}</div>}
+                      {item.meeting_url && (
+                        <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
+                          Entrar na reunião
+                        </a>
+                      )}
+                    </div>
+                    <div className="agenda-event-side">
+                      <span className={`publication-tag agenda-tag ${item.kind}`}>{item.kind === "deadline" ? "Prazo" : "Reunião"}</span>
+                      {item.kind === "deadline" && (
+                        <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
+                          Remover
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="publication-card agenda-upcoming-card">
+            <div className="publication-title">Próximos compromissos</div>
+            {upcomingEvents.length === 0 ? (
+              <div className="publication-empty">Sem itens futuros para os filtros escolhidos.</div>
+            ) : (
+              <div className="publication-list">
+                {upcomingEvents.map((item) => (
+                  <div key={`upcoming-${item.id}`} className="publication-item agenda-upcoming-item">
+                    <div>
+                      <div className="publication-name">{item.title}</div>
+                      <div className="publication-meta">
+                        {new Date(item.starts_at).toLocaleDateString("pt-BR")} · {formatAgendaTime(item.starts_at, item.is_all_day)} ·{" "}
+                        {agendaSourceLabel(item.source)}
+                      </div>
+                    </div>
+                    <span className={`publication-tag agenda-tag ${item.kind}`}>{item.kind === "deadline" ? "Prazo" : "Reunião"}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type CaseRow = {
   id: number;
   title: string;
@@ -3270,7 +3710,7 @@ function Cases() {
   );
 }
 
-function Wallets() {
+function Wallets({ canManage }: { canManage: boolean }) {
   type WalletView = "dashboard" | "list" | "create";
   const [view, setView] = useState<WalletView>("dashboard");
   const [searchTerm, setSearchTerm] = useState("");
@@ -3303,6 +3743,12 @@ function Wallets() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!canManage && view === "create") {
+      setView("list");
+    }
+  }, [canManage, view]);
+
   const totalWallets = wallets.length;
   const activeWallets = wallets.filter((wallet) => wallet.is_active).length;
   const linkedCases = wallets.reduce((sum, wallet) => sum + (wallet.case_count || 0), 0);
@@ -3315,6 +3761,10 @@ function Wallets() {
   }, [wallets, searchTerm]);
 
   const handleCreateWallet = async () => {
+    if (!canManage) {
+      setSaveError("Você não tem permissão para criar carteiras.");
+      return;
+    }
     if (!form.nickname.trim()) return;
     setIsSaving(true);
     setSaveError("");
@@ -3360,6 +3810,7 @@ function Wallets() {
               className={`wallets-switch-btn ${view === "create" ? "active" : ""}`}
               onClick={() => setView("create")}
               aria-pressed={view === "create"}
+              disabled={!canManage}
             >
               Cadastrar
             </button>
@@ -3410,7 +3861,7 @@ function Wallets() {
                 <div className="processes-eyebrow">Carteiras</div>
                 <h2>Lista completa</h2>
               </div>
-              <button className="btn secondary small" type="button" onClick={() => setView("create")}>
+              <button className="btn secondary small" type="button" onClick={() => setView("create")} disabled={!canManage}>
                 Nova carteira
               </button>
             </div>
@@ -3441,7 +3892,7 @@ function Wallets() {
           </div>
         )}
 
-        {view === "create" && (
+        {view === "create" && canManage && (
           <div className="wallets-form-card">
             <div className="processes-eyebrow">Cadastro</div>
             <h2>Nova carteira</h2>
@@ -3494,7 +3945,7 @@ function Wallets() {
   );
 }
 
-const emptyTeamForm = {
+const buildEmptyTeamForm = () => ({
   fullName: "",
   email: "",
   phone: "",
@@ -3503,21 +3954,25 @@ const emptyTeamForm = {
   roleTitle: "",
   teamName: "",
   notes: "",
+  isAdmin: false,
+  allowedNavKeys: [...defaultMemberNavKeys],
   isActive: true
-};
+});
 
-function Team() {
+function Team({ canManage }: { canManage: boolean }) {
   type TeamView = "dashboard" | "list" | "create";
   const [view, setView] = useState<TeamView>("dashboard");
   const [searchTerm, setSearchTerm] = useState("");
   const [members, setMembers] = useState<ApiTeamMember[]>([]);
+  const [capacity, setCapacity] = useState<TeamMembersCapacity | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
   const [saveError, setSaveError] = useState("");
+  const [saveSuccess, setSaveSuccess] = useState("");
   const [deleteError, setDeleteError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
-  const [form, setForm] = useState(emptyTeamForm);
+  const [form, setForm] = useState(buildEmptyTeamForm);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
 
@@ -3527,9 +3982,13 @@ function Team() {
       setIsLoading(true);
       setError("");
       try {
-        const data = await apiListTeamMembers();
+        const [data, teamCapacity] = await Promise.all([
+          apiListTeamMembers(),
+          apiGetTeamMembersCapacity().catch(() => null)
+        ]);
         if (cancelled) return;
         setMembers(data);
+        setCapacity(teamCapacity);
       } catch (err) {
         if (cancelled) return;
         setError(extractApiErrorMessage(err, "Não foi possível carregar a equipe."));
@@ -3542,6 +4001,12 @@ function Team() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!canManage && view === "create") {
+      setView("list");
+    }
+  }, [canManage, view]);
 
   const normalizeCpfDigits = (value: string) => value.replace(/\D/g, "").slice(0, 11);
 
@@ -3581,6 +4046,10 @@ function Team() {
   const totalMembers = members.length;
   const activeMembers = members.filter((member) => member.is_active).length;
   const teamsCount = new Set(members.map((member) => member.team_name.trim().toLowerCase()).filter(Boolean)).size;
+  const activeUsers = capacity?.active_users ?? activeMembers;
+  const userLimit = capacity?.user_limit ?? null;
+  const availableSlots = capacity?.available_slots ?? null;
+  const limitReached = typeof availableSlots === "number" && availableSlots <= 0;
 
   const requiredMissing =
     !form.fullName.trim() ||
@@ -3588,18 +4057,66 @@ function Team() {
     normalizeCpfDigits(form.cpf).length !== 11 ||
     !form.oab.trim() ||
     !form.roleTitle.trim() ||
-    !form.teamName.trim();
+    !form.teamName.trim() ||
+    form.allowedNavKeys.length === 0;
+  const createBlockedByLimit = !editingId && form.isActive && limitReached;
+
+  const refreshCapacity = async () => {
+    try {
+      const teamCapacity = await apiGetTeamMembersCapacity();
+      setCapacity(teamCapacity);
+    } catch {
+      // Keep capacity as-is when endpoint is not available for this role/context.
+    }
+  };
 
   const resetForm = () => {
     setEditingId(null);
-    setForm(emptyTeamForm);
+    setForm(buildEmptyTeamForm());
     setSaveError("");
   };
 
+  const enforceAdminNavAccess = (keys: NavKey[], isAdmin: boolean): NavKey[] => {
+    const normalized = normalizeNavKeys(keys);
+    const withSettings = normalized.includes("settings") ? [...normalized] : [...normalized, "settings"];
+    if (!isAdmin) return withSettings;
+    const output = [...withSettings];
+    for (const required of adminRequiredNavKeys) {
+      if (!output.includes(required)) output.push(required);
+    }
+    return output;
+  };
+
+  const toggleAllowedNavKey = (key: NavKey) => {
+    setForm((prev) => {
+      const current = enforceAdminNavAccess(prev.allowedNavKeys, prev.isAdmin);
+      const isRequiredAdminNav = prev.isAdmin && adminRequiredNavKeys.includes(key);
+      if (isRequiredAdminNav) return { ...prev, allowedNavKeys: current };
+      const next = current.includes(key) ? current.filter((item) => item !== key) : [...current, key];
+      return {
+        ...prev,
+        allowedNavKeys: enforceAdminNavAccess(next, prev.isAdmin)
+      };
+    });
+  };
+
+  const handleToggleAdmin = (checked: boolean) => {
+    setForm((prev) => ({
+      ...prev,
+      isAdmin: checked,
+      allowedNavKeys: enforceAdminNavAccess(prev.allowedNavKeys, checked)
+    }));
+  };
+
   const handleSaveMember = async () => {
-    if (requiredMissing) return;
+    if (!canManage) {
+      setSaveError("Você não tem permissão para cadastrar membros.");
+      return;
+    }
+    if (requiredMissing || createBlockedByLimit) return;
     setIsSaving(true);
     setSaveError("");
+    setSaveSuccess("");
     try {
       const payload = {
         full_name: form.fullName.trim(),
@@ -3610,15 +4127,26 @@ function Team() {
         role_title: form.roleTitle.trim(),
         team_name: form.teamName.trim(),
         notes: form.notes.trim() || undefined,
+        is_admin: form.isAdmin,
+        allowed_nav_keys: form.allowedNavKeys,
         is_active: form.isActive
       };
       if (editingId) {
         const updated = await apiUpdateTeamMember(editingId, payload);
         setMembers((prev) => prev.map((member) => (member.id === updated.id ? updated : member)));
+        setSaveSuccess("Membro atualizado com sucesso.");
       } else {
         const created = await apiCreateTeamMember(payload);
         setMembers((prev) => [created, ...prev]);
+        if (created.invite_email_sent) {
+          setSaveSuccess(`Membro criado e convite enviado para ${created.email}.`);
+        } else if (created.invite_token) {
+          setSaveSuccess(`Membro criado. Token de convite (dev): ${created.invite_token}`);
+        } else {
+          setSaveSuccess("Membro criado. Configure SMTP no VPS para envio automático de convite.");
+        }
       }
+      await refreshCapacity();
       resetForm();
       setView("list");
     } catch (err) {
@@ -3629,7 +4157,10 @@ function Team() {
   };
 
   const handleEditMember = (member: ApiTeamMember) => {
+    setSaveSuccess("");
     setEditingId(member.id);
+    const memberNavKeys = normalizeNavKeys(member.allowed_nav_keys);
+    const baseNavKeys = memberNavKeys.length ? memberNavKeys : [...defaultMemberNavKeys];
     setForm({
       fullName: member.full_name || "",
       email: member.email || "",
@@ -3639,6 +4170,8 @@ function Team() {
       roleTitle: member.role_title || "",
       teamName: member.team_name || "",
       notes: member.notes || "",
+      isAdmin: Boolean(member.is_admin),
+      allowedNavKeys: enforceAdminNavAccess(baseNavKeys, Boolean(member.is_admin)),
       isActive: member.is_active
     });
     setSaveError("");
@@ -3646,12 +4179,17 @@ function Team() {
   };
 
   const handleDeleteMember = async () => {
+    if (!canManage) {
+      setDeleteError("Você não tem permissão para excluir membros.");
+      return;
+    }
     if (!deleteId) return;
     setIsDeleting(true);
     setDeleteError("");
     try {
       await apiDeleteTeamMember(deleteId);
       setMembers((prev) => prev.filter((member) => member.id !== deleteId));
+      await refreshCapacity();
       setDeleteId(null);
       if (editingId === deleteId) resetForm();
     } catch (err) {
@@ -3687,6 +4225,7 @@ function Team() {
               className={`wallets-switch-btn ${view === "create" ? "active" : ""}`}
               onClick={() => setView("create")}
               aria-pressed={view === "create"}
+              disabled={!canManage}
             >
               Cadastrar
             </button>
@@ -3701,6 +4240,7 @@ function Team() {
         </div>
 
         {error && <div className="error">{error}</div>}
+        {saveSuccess && <div className="success">{saveSuccess}</div>}
 
         {view === "dashboard" && (
           <div className="processes-dashboard">
@@ -3719,13 +4259,15 @@ function Team() {
               </button>
               <button type="button" className="processes-kpi-card" onClick={() => setView("list")}>
                 <div className="processes-kpi-title">Ativos</div>
-                <div className="processes-kpi-value">{activeMembers}</div>
-                <div className="processes-kpi-hint">Com acesso habilitado</div>
+                <div className="processes-kpi-value">{activeUsers}</div>
+                <div className="processes-kpi-hint">Usuários ativos com login</div>
               </button>
               <button type="button" className="processes-kpi-card" onClick={() => setView("list")}>
-                <div className="processes-kpi-title">Equipes</div>
-                <div className="processes-kpi-value">{teamsCount}</div>
-                <div className="processes-kpi-hint">Áreas internas cadastradas</div>
+                <div className="processes-kpi-title">Limite do plano</div>
+                <div className="processes-kpi-value">{userLimit ?? "∞"}</div>
+                <div className="processes-kpi-hint">
+                  {typeof availableSlots === "number" ? `${availableSlots} vagas disponíveis` : `${teamsCount} equipes cadastradas`}
+                </div>
               </button>
             </div>
           </div>
@@ -3742,9 +4284,11 @@ function Team() {
                 className="btn secondary small"
                 type="button"
                 onClick={() => {
+                  setSaveSuccess("");
                   resetForm();
                   setView("create");
                 }}
+                disabled={!canManage}
               >
                 Novo membro
               </button>
@@ -3776,12 +4320,16 @@ function Team() {
                     <div>{member.oab}</div>
                     <div>{member.is_active ? "Ativo" : "Inativo"}</div>
                     <div className="wallets-row-actions">
-                      <button className="btn ghost small" type="button" onClick={() => handleEditMember(member)}>
-                        Editar
-                      </button>
-                      <button className="btn danger small" type="button" onClick={() => setDeleteId(member.id)}>
-                        Excluir
-                      </button>
+                      {canManage && (
+                        <>
+                          <button className="btn ghost small" type="button" onClick={() => handleEditMember(member)}>
+                            Editar
+                          </button>
+                          <button className="btn danger small" type="button" onClick={() => setDeleteId(member.id)}>
+                            Excluir
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))
@@ -3790,11 +4338,16 @@ function Team() {
           </div>
         )}
 
-        {view === "create" && (
+        {view === "create" && canManage && (
           <div className="wallets-form-card">
             <div className="processes-eyebrow">Equipe</div>
             <h2>{editingId ? "Editar membro" : "Cadastrar novo membro"}</h2>
-            <div className="wallets-form-hint">Campos obrigatórios: Nome, Email, CPF, OAB, Cargo e Equipe.</div>
+            <div className="wallets-form-hint">
+              Campos obrigatórios: Nome, Email, CPF, OAB, Cargo e Equipe.
+              {typeof userLimit === "number" && (
+                <> Limite de usuários ativos: {activeUsers}/{userLimit} (disponíveis: {availableSlots ?? 0}).</>
+              )}
+            </div>
             <div className="modal-grid">
               <div className="field">
                 <label>Nome completo *</label>
@@ -3848,6 +4401,31 @@ function Team() {
                 <label>Observações</label>
                 <textarea value={form.notes} onChange={(event) => setForm((prev) => ({ ...prev, notes: event.target.value }))} />
               </div>
+              <div className="field span-2">
+                <label className="check-field">
+                  <input type="checkbox" checked={form.isAdmin} onChange={(event) => handleToggleAdmin(event.target.checked)} />
+                  Administrador da equipe (pode cadastrar membros e criar carteiras)
+                </label>
+              </div>
+              <div className="field span-2">
+                <label>Acesso aos menus do software *</label>
+                <div className="permissions-grid">
+                  {navPermissionOptions.map((item) => {
+                    const lockedByAdmin = form.isAdmin && adminRequiredNavKeys.includes(item.key);
+                    return (
+                      <label key={item.key} className={`permission-item ${lockedByAdmin ? "locked" : ""}`}>
+                        <input
+                          type="checkbox"
+                          checked={form.allowedNavKeys.includes(item.key)}
+                          disabled={lockedByAdmin}
+                          onChange={() => toggleAllowedNavKey(item.key)}
+                        />
+                        <span>{item.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
             {saveError && <div className="error">{saveError}</div>}
             <div className="modal-actions">
@@ -3855,6 +4433,7 @@ function Team() {
                 className="btn ghost"
                 type="button"
                 onClick={() => {
+                  setSaveSuccess("");
                   resetForm();
                   setView("list");
                 }}
@@ -3862,10 +4441,11 @@ function Team() {
               >
                 Cancelar
               </button>
-              <button className="btn" type="button" onClick={handleSaveMember} disabled={requiredMissing || isSaving}>
+              <button className="btn" type="button" onClick={handleSaveMember} disabled={requiredMissing || isSaving || createBlockedByLimit}>
                 {isSaving ? "Salvando..." : editingId ? "Salvar alterações" : "Salvar membro"}
               </button>
             </div>
+            {createBlockedByLimit && <div className="error-inline">Limite de usuários ativos atingido para o plano atual.</div>}
           </div>
         )}
       </div>
@@ -3904,6 +4484,14 @@ function Settings({
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const [calendarConnections, setCalendarConnections] = useState<CalendarConnectionStatus[]>([]);
+  const [isLoadingCalendarConnections, setIsLoadingCalendarConnections] = useState(true);
+  const [calendarConnectionsError, setCalendarConnectionsError] = useState("");
+  const [calendarInlineMessage, setCalendarInlineMessage] = useState("");
+  const [connectingProvider, setConnectingProvider] = useState<CalendarProvider | null>(null);
+  const [syncingProvider, setSyncingProvider] = useState<CalendarProvider | null>(null);
+  const [disconnectingProvider, setDisconnectingProvider] = useState<CalendarProvider | null>(null);
+  const pollIntervalRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!runningInTauri) {
@@ -3923,6 +4511,152 @@ function Settings({
       cancelled = true;
     };
   }, [runningInTauri]);
+
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        window.clearInterval(pollIntervalRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!calendarInlineMessage) return;
+    const timeout = window.setTimeout(() => setCalendarInlineMessage(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [calendarInlineMessage]);
+
+  const loadCalendarConnections = async () => {
+    setIsLoadingCalendarConnections(true);
+    setCalendarConnectionsError("");
+    try {
+      const data = await apiListCalendarConnections();
+      setCalendarConnections(data);
+    } catch (err) {
+      setCalendarConnectionsError(extractApiErrorMessage(err, "Não foi possível carregar as integrações de calendário."));
+    } finally {
+      setIsLoadingCalendarConnections(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadCalendarConnections();
+  }, []);
+
+  useEffect(() => {
+    const handleOauthDone = (event: MessageEvent) => {
+      if (!event.data || event.data.type !== "newlaw-calendar-oauth") return;
+      if (event.data.status === "success") {
+        setCalendarInlineMessage("Conta conectada. Você já pode atualizar a agenda.");
+      } else {
+        setCalendarConnectionsError("A conexão com o provedor não foi concluída.");
+      }
+      setConnectingProvider(null);
+      if (pollIntervalRef.current) {
+        window.clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
+      void loadCalendarConnections();
+    };
+    window.addEventListener("message", handleOauthDone);
+    return () => window.removeEventListener("message", handleOauthDone);
+  }, []);
+
+  const pollConnectionUntilReady = (provider: CalendarProvider) => {
+    if (pollIntervalRef.current) {
+      window.clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    const startedAt = Date.now();
+    pollIntervalRef.current = window.setInterval(async () => {
+      try {
+        const statuses = await apiListCalendarConnections();
+        setCalendarConnections(statuses);
+        const connected = statuses.some((item) => item.provider === provider && item.connected);
+        const timeoutReached = Date.now() - startedAt > 120000;
+        if (!connected && !timeoutReached) return;
+        if (pollIntervalRef.current) {
+          window.clearInterval(pollIntervalRef.current);
+          pollIntervalRef.current = null;
+        }
+        setConnectingProvider(null);
+        if (connected) {
+          setCalendarInlineMessage("Conta conectada. Você já pode atualizar a agenda.");
+        } else {
+          setCalendarInlineMessage("A conexão não foi concluída no tempo esperado.");
+        }
+      } catch {
+        // A interface pode ser atualizada manualmente.
+      }
+    }, 3000);
+  };
+
+  const handleConnectProvider = async (provider: CalendarProvider) => {
+    setConnectingProvider(provider);
+    setCalendarConnectionsError("");
+    const popup = window.open("", "newlaw-calendar-oauth", "width=580,height=760");
+    if (popup) {
+      popup.document.title = "NEWLAW - Conectando calendário";
+      popup.document.body.innerHTML = `
+        <div style="font-family:Arial,sans-serif;padding:24px;color:#0f1e3f">
+          <h2 style="margin:0 0 8px 0">Conectando calendário...</h2>
+          <p style="margin:0">Aguarde, estamos abrindo a autenticação.</p>
+        </div>
+      `;
+      popup.focus();
+    }
+    try {
+      const response = await apiStartCalendarConnection(provider);
+      if (popup && !popup.closed) {
+        popup.location.href = response.auth_url;
+      } else {
+        window.location.href = response.auth_url;
+      }
+      setCalendarInlineMessage(`Conclua o login ${provider === "google" ? "Google" : "Microsoft"} na janela aberta.`);
+      pollConnectionUntilReady(provider);
+    } catch (err) {
+      if (popup && !popup.closed) {
+        popup.close();
+      }
+      setConnectingProvider(null);
+      setCalendarConnectionsError(extractApiErrorMessage(err, `Não foi possível iniciar a conexão ${provider}.`));
+    }
+  };
+
+  const handleSyncProvider = async (provider: CalendarProvider) => {
+    setSyncingProvider(provider);
+    setCalendarConnectionsError("");
+    try {
+      await apiSyncCalendarConnection(provider);
+      setCalendarInlineMessage(`Agenda ${provider === "google" ? "Google" : "Microsoft"} sincronizada.`);
+      await loadCalendarConnections();
+    } catch (err) {
+      setCalendarConnectionsError(extractApiErrorMessage(err, "Falha ao sincronizar o calendário externo."));
+    } finally {
+      setSyncingProvider(null);
+    }
+  };
+
+  const handleDisconnectProvider = async (provider: CalendarProvider) => {
+    setDisconnectingProvider(provider);
+    setCalendarConnectionsError("");
+    try {
+      await apiDisconnectCalendarConnection(provider);
+      setCalendarInlineMessage(`Conta ${provider === "google" ? "Google" : "Microsoft"} desconectada.`);
+      await loadCalendarConnections();
+    } catch (err) {
+      setCalendarConnectionsError(extractApiErrorMessage(err, "Falha ao desconectar o calendário."));
+    } finally {
+      setDisconnectingProvider(null);
+    }
+  };
+
+  const calendarConnectionMap = useMemo(() => {
+    return calendarConnections.reduce<Record<string, CalendarConnectionStatus>>((acc, connection) => {
+      acc[connection.provider] = connection;
+      return acc;
+    }, {});
+  }, [calendarConnections]);
 
   const handleCheckForUpdates = async () => {
     if (!runningInTauri) return;
@@ -4050,6 +4784,72 @@ function Settings({
             </button>
           </div>
         </div>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div>
+              <div className="settings-title">Integrações de calendário</div>
+              <div className="settings-sub">Conecte Google e Microsoft para exibir reuniões na agenda.</div>
+            </div>
+            <button className="btn ghost small" type="button" onClick={loadCalendarConnections} disabled={isLoadingCalendarConnections}>
+              {isLoadingCalendarConnections ? "Atualizando..." : "Atualizar integrações"}
+            </button>
+          </div>
+          {calendarConnectionsError && <div className="error">{calendarConnectionsError}</div>}
+          {calendarInlineMessage && <div className="agenda-inline">{calendarInlineMessage}</div>}
+          <div className="agenda-connections-list">
+            {agendaProviders.map((config) => {
+              const status = calendarConnectionMap[config.provider];
+              const connected = Boolean(status?.connected);
+              return (
+                <div key={config.provider} className={`agenda-connection-item ${connected ? "connected" : ""}`}>
+                  <div>
+                    <div className="agenda-connection-title">{config.label}</div>
+                    <div className="agenda-connection-sub">
+                      {connected
+                        ? `Conectado ${status?.provider_email ? `como ${status.provider_email}` : ""}`.trim()
+                        : config.description}
+                    </div>
+                    {status?.sync_error && <div className="agenda-connection-error">{status.sync_error}</div>}
+                  </div>
+                  <div className="agenda-connection-actions">
+                    {connected ? (
+                      <>
+                        <button
+                          type="button"
+                          className="btn ghost small"
+                          onClick={() => handleSyncProvider(config.provider)}
+                          disabled={syncingProvider === config.provider || disconnectingProvider === config.provider}
+                        >
+                          {syncingProvider === config.provider ? "Sincronizando..." : "Sincronizar"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn ghost small danger"
+                          onClick={() => handleDisconnectProvider(config.provider)}
+                          disabled={disconnectingProvider === config.provider || syncingProvider === config.provider}
+                        >
+                          {disconnectingProvider === config.provider ? "Desconectando..." : "Desconectar"}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn small"
+                        onClick={() => handleConnectProvider(config.provider)}
+                        disabled={connectingProvider === config.provider}
+                      >
+                        {connectingProvider === config.provider ? "Aguardando login..." : `Conectar ${config.label}`}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="settings-note">
+            As integrações são somente leitura. Criação e edição de reuniões continuam no Google/Outlook.
+          </div>
+        </div>
         <div className="settings-card update-card">
           <div className="settings-title">Central de Atualizações NEWLAW</div>
           <div className="update-shell">
@@ -4086,7 +4886,7 @@ function App() {
   const [active, setActive] = useState<NavKey>("people");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [token, setToken] = useState<string | null>(null);
-  const [user, setUser] = useState<{ email: string; name: string; role: string } | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
@@ -4111,6 +4911,12 @@ function App() {
 
   const navListRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLElement | null>(null);
+  const allowedNavKeys = useMemo(() => getEffectiveAllowedNavKeys(user), [user]);
+  const visibleNavItems = useMemo(() => navItems.filter((item) => allowedNavKeys.includes(item.key)), [allowedNavKeys]);
+  const canManageTeamAndWallets = Boolean(
+    user && (user.role === "superadmin" || user.role === "owner" || user.role === "admin" || user.is_admin)
+  );
+  const activeNav = visibleNavItems.some((item) => item.key === active) ? active : (visibleNavItems[0]?.key ?? "settings");
 
   useEffect(() => {
     if (!token) return;
@@ -4141,6 +4947,14 @@ function App() {
       cleanupContent();
     };
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !visibleNavItems.length) return;
+    const isActiveVisible = visibleNavItems.some((item) => item.key === active);
+    if (!isActiveVisible) {
+      setActive(visibleNavItems[0].key);
+    }
+  }, [token, visibleNavItems, active]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -4187,7 +5001,7 @@ function App() {
           <p>Informe suas credenciais para acessar.</p>
           <form onSubmit={handleLogin}>
             <div className="field">
-              <label>Usuário</label>
+              <label>Email</label>
               <input value={creds.username} onChange={(e) => setCreds((c) => ({ ...c, username: e.target.value }))} />
             </div>
             <div className="field">
@@ -4213,7 +5027,7 @@ function App() {
   }
 
   const render = () => {
-    switch (active) {
+    switch (activeNav) {
       case "home":
         return <Home />;
       case "people":
@@ -4221,9 +5035,9 @@ function App() {
       case "cases":
         return <Cases />;
       case "wallets":
-        return <Wallets />;
+        return <Wallets canManage={canManageTeamAndWallets} />;
       case "team":
-        return <Team />;
+        return <Team canManage={canManageTeamAndWallets} />;
       case "official":
         return <Publications />;
       case "settings":
@@ -4232,13 +5046,14 @@ function App() {
       case "billing":
         return <Finance />;
       case "agenda":
+        return <Agenda />;
       case "service":
       case "reports":
       case "stats":
       case "progress":
       case "files":
       case "templates":
-        return <Placeholder title={navItems.find((n) => n.key === active)?.label || "Em breve"} />;
+        return <Placeholder title={navItems.find((n) => n.key === activeNav)?.label || "Em breve"} />;
       default:
         return <Placeholder title="Dashboard" />;
     }
@@ -4264,10 +5079,10 @@ function App() {
         </div>
         <div className="section-label">Ferramentas</div>
         <div className="nav-list scroll-area" ref={navListRef}>
-          {navItems.map((item) => (
+          {visibleNavItems.map((item) => (
             <button
               key={item.key}
-              className={`nav-btn ${active === item.key ? "active" : ""}`}
+              className={`nav-btn ${activeNav === item.key ? "active" : ""}`}
               onClick={() => setActive(item.key)}
               title={item.label}
             >
@@ -4280,7 +5095,7 @@ function App() {
         </div>
         <div className="sidebar-footer">
           <div className="sidebar-user">
-            Administrador
+            {canManageTeamAndWallets ? "Administrador" : "Membro"}
             <br />
             {user?.email || "usuario@newlaw.app.br"}
           </div>

@@ -4,6 +4,7 @@
 - App desktop construído com Tauri (janela nativa) + frontend React/Vite + backend FastAPI (Python).
 - Tudo roda localmente: o backend expõe HTTP em `http://127.0.0.1:8000` e o frontend consome em `http://127.0.0.1:5173` durante o desenvolvimento.
 - O Tauri sobe o frontend dentro de uma janela e pode iniciar/parar o backend.
+- Fluxo oficial de entrega e validação no VPS: `docs/local-vps-workflow.md`.
 
 ## Disclaimer de execução e renderização
 - A interface do app é "renderizada" por um WebView nativo do sistema via Tauri (WebKit no macOS, WebView2 no Windows, WebKitGTK no Linux).

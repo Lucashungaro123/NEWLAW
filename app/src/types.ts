@@ -39,5 +39,5 @@ export interface Case {
 
 export interface LoginState {
   token: string | null;
-  user: { email: string; name: string; role: string } | null;
+  user: { email: string; name: string; role: string; is_admin?: boolean; allowed_nav_keys?: string[] } | null;
 }
