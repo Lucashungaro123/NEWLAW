@@ -1,11 +1,14 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 
 const ACCESS_KEY = "newlaw.access_token";
 const REFRESH_KEY = "newlaw.refresh_token";
 const USER_KEY = "newlaw.user";
 
-const defaultBaseURL = import.meta.env.DEV ? "http://127.0.0.1:8000" : "https://api.newlaw.app.br";
-export const baseURL = import.meta.env.VITE_API_URL || defaultBaseURL;
+export const LOCAL_API_BASE_URL = "http://127.0.0.1:8000";
+const configuredBaseURL = import.meta.env.VITE_API_URL;
+const defaultBaseURL = import.meta.env.DEV ? LOCAL_API_BASE_URL : "https://api.newlaw.app.br";
+export const baseURL = configuredBaseURL || defaultBaseURL;
 
 export type AuthUser = {
   id: number;
@@ -152,6 +155,71 @@ export type CreateAgendaDeadlinePayload = {
   reference?: string;
   notes?: string;
 };
+export type FinanceEntryType = "receita" | "despesa";
+export type FinancePaymentMethod = "" | "pix" | "boleto" | "cartao" | "dinheiro" | "transferencia";
+export type FinanceRecurring = "nao-recorrente" | "mensal" | "anual" | "personalizado";
+export type ApiFinanceEntry = {
+  id: number;
+  organization_id: number;
+  created_by_user_id?: number | null;
+  entry_type: FinanceEntryType;
+  category: string;
+  client_id?: number | null;
+  case_id?: number | null;
+  client_name?: string | null;
+  case_number?: string | null;
+  amount: number;
+  due_date: string;
+  payment_date?: string | null;
+  payment_method?: Exclude<FinancePaymentMethod, ""> | null;
+  expense_type?: string | null;
+  recurring?: FinanceRecurring | null;
+  paid_amount?: number | null;
+  installments?: number | null;
+  attachment_name?: string | null;
+};
+export type ApiClientDocument = {
+  id: number;
+  organization_id?: number | null;
+  client_id: number;
+  case_id?: number | null;
+  folder_label: string;
+  original_name: string;
+  content_type: string;
+  size_bytes: number;
+  created_at: string;
+  updated_at: string;
+};
+export type CreateFinanceEntryPayload = {
+  entry_type: FinanceEntryType;
+  category: string;
+  amount: number;
+  due_date: string;
+  client_id?: number;
+  case_id?: number;
+  client_name?: string;
+  case_number?: string;
+  payment_date?: string;
+  payment_method?: Exclude<FinancePaymentMethod, "">;
+  expense_type?: string;
+  recurring?: FinanceRecurring;
+  paid_amount?: number;
+  installments?: number;
+  attachment_name?: string;
+  organization_id?: number;
+};
+export type UpdateFinanceEntryPayload = {
+  payment_date?: string;
+  payment_method?: Exclude<FinancePaymentMethod, "">;
+  paid_amount?: number;
+  organization_id?: number;
+};
+export type UploadClientDocumentPayload = {
+  clientId: number;
+  folderLabel: string;
+  caseId?: number;
+  file: File;
+};
 export type CreateTeamMemberPayload = {
   full_name: string;
   email: string;
@@ -207,7 +275,8 @@ export function getRefreshToken() {
 }
 
 export const api = axios.create({
-  baseURL
+  baseURL,
+  timeout: 10000
 });
 
 api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
@@ -324,9 +393,107 @@ export async function updateCase(caseId: number, payload: UpdateCasePayload) {
   return data as ApiCase;
 }
 
+function buildHttpError(status: number, detail: string) {
+  const error = new Error(detail) as Error & { response?: { status: number; data: { detail: string } } };
+  error.response = { status, data: { detail } };
+  return error;
+}
+
+const isDesktopRemoteApi =
+  typeof window !== "undefined" &&
+  isTauri() &&
+  !baseURL.startsWith("http://127.0.0.1") &&
+  !baseURL.startsWith("http://localhost");
+
 export async function deleteCase(caseId: number) {
-  const { data } = await api.delete(`/cases/${caseId}`);
-  return data as { status: string; id: number };
+  if (isDesktopRemoteApi) {
+    const executeDeleteViaTauri = async (token: string | null) => {
+      if (!token) return { unauthorized: true as const };
+      type TauriDeleteResponse = {
+        status: number;
+        body?: { detail?: string; status?: string; id?: number };
+      };
+      try {
+        const response = await invoke<TauriDeleteResponse>("remote_delete_with_auth", {
+          url: `${baseURL}/cases/${caseId}`,
+          bearerToken: token
+        });
+        if (response.status === 401) return { unauthorized: true as const };
+        if (response.status < 200 || response.status >= 300) {
+          throw buildHttpError(response.status, response.body?.detail || `Falha ao excluir processo (${response.status}).`);
+        }
+        return response.body as { status: string; id: number };
+      } catch (error) {
+        if ((error as Error & { response?: { status: number } }).response) {
+          throw error;
+        }
+        throw new Error((error as Error)?.message || "Falha ao excluir processo.");
+      }
+    };
+
+    const firstAttempt = await executeDeleteViaTauri(getAccessToken());
+    if ("unauthorized" in firstAttempt) {
+      const newToken = await refreshAccessToken();
+      if (!newToken) {
+        throw buildHttpError(401, "Sessão expirada. Faça login novamente.");
+      }
+      const secondAttempt = await executeDeleteViaTauri(newToken);
+      if ("unauthorized" in secondAttempt) {
+        throw buildHttpError(401, "Sessão expirada. Faça login novamente.");
+      }
+      return secondAttempt;
+    }
+    return firstAttempt;
+  }
+
+  const executeDelete = async (token: string | null) => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch(`${baseURL}/cases/${caseId}`, {
+        method: "DELETE",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        signal: controller.signal
+      });
+      const rawBody = await response.text();
+      let payload: { detail?: string; status?: string; id?: number } | null = null;
+      if (rawBody) {
+        try {
+          payload = JSON.parse(rawBody) as { detail?: string; status?: string; id?: number };
+        } catch {
+          payload = { detail: rawBody };
+        }
+      }
+      if (response.status === 401) return { unauthorized: true as const };
+      if (!response.ok) {
+        throw buildHttpError(response.status, payload?.detail || `Falha ao excluir processo (${response.status}).`);
+      }
+      return payload as { status: string; id: number };
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        const timeoutError = new Error("timeout") as Error & { code?: string };
+        timeoutError.code = "ECONNABORTED";
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
+  const firstAttempt = await executeDelete(getAccessToken());
+  if ("unauthorized" in firstAttempt) {
+    const newToken = await refreshAccessToken();
+    if (!newToken) {
+      throw buildHttpError(401, "Sessão expirada. Faça login novamente.");
+    }
+    const secondAttempt = await executeDelete(newToken);
+    if ("unauthorized" in secondAttempt) {
+      throw buildHttpError(401, "Sessão expirada. Faça login novamente.");
+    }
+    return secondAttempt;
+  }
+  return firstAttempt;
 }
 
 export async function listWallets(organizationId?: number) {
@@ -415,4 +582,55 @@ export async function createAgendaDeadline(payload: CreateAgendaDeadlinePayload)
 export async function deleteAgendaDeadline(deadlineId: number) {
   const { data } = await api.delete(`/agenda/deadlines/${deadlineId}`);
   return data as { status: string; id: number };
+}
+
+export async function listFinanceEntries(organizationId?: number) {
+  const params = organizationId ? { organization_id: organizationId } : undefined;
+  const { data } = await api.get("/finance/entries", { params });
+  return data as ApiFinanceEntry[];
+}
+
+export async function createFinanceEntry(payload: CreateFinanceEntryPayload) {
+  const { data } = await api.post("/finance/entries", payload);
+  return data as ApiFinanceEntry;
+}
+
+export async function updateFinanceEntry(entryId: number, payload: UpdateFinanceEntryPayload) {
+  const { data } = await api.patch(`/finance/entries/${entryId}`, payload);
+  return data as ApiFinanceEntry;
+}
+
+export async function deleteFinanceEntry(entryId: number) {
+  const { data } = await api.delete(`/finance/entries/${entryId}`);
+  return data as { status: string; id: number };
+}
+
+export async function listClientDocuments(clientId: number, caseId?: number) {
+  const params = caseId ? { client_id: clientId, case_id: caseId } : { client_id: clientId };
+  const { data } = await api.get("/files/documents", { params });
+  return data as ApiClientDocument[];
+}
+
+export async function uploadClientDocument(payload: UploadClientDocumentPayload) {
+  const formData = new FormData();
+  formData.append("client_id", String(payload.clientId));
+  formData.append("folder_label", payload.folderLabel);
+  if (payload.caseId) {
+    formData.append("case_id", String(payload.caseId));
+  }
+  formData.append("file", payload.file);
+  const { data } = await api.post("/files/documents", formData);
+  return data as ApiClientDocument;
+}
+
+export async function deleteClientDocument(documentId: number) {
+  const { data } = await api.delete(`/files/documents/${documentId}`);
+  return data as { status: string; id: number };
+}
+
+export async function downloadClientDocument(documentId: number) {
+  const { data } = await api.get(`/files/documents/${documentId}/download`, {
+    responseType: "blob"
+  });
+  return data as Blob;
 }

@@ -1,21 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AgendaItem,
   AuthUser,
   ApiCase,
   ApiClient,
+  ApiClientDocument,
+  ApiFinanceEntry,
   ApiTeamMember,
   ApiWallet,
   CalendarConnectionStatus,
   CalendarProvider,
+  LOCAL_API_BASE_URL,
   TeamMembersCapacity,
   baseURL,
   createAgendaDeadline as apiCreateAgendaDeadline,
+  deleteClientDocument as apiDeleteClientDocument,
+  createFinanceEntry as apiCreateFinanceEntry,
   createTeamMember as apiCreateTeamMember,
   createWallet as apiCreateWallet,
+  downloadClientDocument as apiDownloadClientDocument,
   clearAuthSession,
   createCase as apiCreateCase,
   createClient as apiCreateClient,
@@ -23,19 +29,24 @@ import {
   deleteTeamMember as apiDeleteTeamMember,
   deleteCase as apiDeleteCase,
   deleteClient as apiDeleteClient,
+  deleteFinanceEntry as apiDeleteFinanceEntry,
   disconnectCalendarConnection as apiDisconnectCalendarConnection,
   getTeamMembersCapacity as apiGetTeamMembersCapacity,
   listAgendaEvents as apiListAgendaEvents,
   listCalendarConnections as apiListCalendarConnections,
+  listClientDocuments as apiListClientDocuments,
+  listFinanceEntries as apiListFinanceEntries,
   listTeamMembers as apiListTeamMembers,
   listCases as apiListCases,
   listClients as apiListClients,
   listWallets as apiListWallets,
   startCalendarConnection as apiStartCalendarConnection,
   syncCalendarConnection as apiSyncCalendarConnection,
+  uploadClientDocument as apiUploadClientDocument,
   updateTeamMember as apiUpdateTeamMember,
   updateCase as apiUpdateCase,
   updateClient as apiUpdateClient,
+  updateFinanceEntry as apiUpdateFinanceEntry,
   updateWallet as apiUpdateWallet,
   loadAuthSession,
   login as apiLogin,
@@ -58,6 +69,32 @@ type ClientRow = {
 };
 type ThemeMode = "dark" | "light";
 type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "installed" | "up-to-date" | "error" | "unavailable";
+type FileFolderNodeKind = "client-folder" | "case-folder" | "case-section";
+type FileFolderNode = {
+  id: string;
+  label: string;
+  note?: string;
+  kind: FileFolderNodeKind;
+  children?: FileFolderNode[];
+};
+type ClientFileTree = {
+  client: ApiClient;
+  kind: ClientKind;
+  cases: ApiCase[];
+  nodes: FileFolderNode[];
+  totalFolders: number;
+  searchText: string;
+};
+
+const textScaleOptions = [
+  { label: "Normal", value: 1 },
+  { label: "Pouco maior", value: 1.05 },
+  { label: "Confortável", value: 1.1 },
+  { label: "Maior", value: 1.15 },
+  { label: "Grande", value: 1.2 }
+] as const;
+
+const clampTextScaleIndex = (value: number) => Math.min(Math.max(value, 0), textScaleOptions.length - 1);
 
 const navItems: { key: NavKey; label: string }[] = [
   { key: "home", label: "Home" },
@@ -390,6 +427,68 @@ const emptyClientForm: ClientForm = {
   notes: ""
 };
 
+const normalizeCpfDigits = (value: string) => value.replace(/\D/g, "").slice(0, 11);
+
+const formatCpf = (value: string) => {
+  const digits = normalizeCpfDigits(value);
+  const parts = [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6, 9), digits.slice(9, 11)];
+  if (digits.length <= 3) return parts[0];
+  if (digits.length <= 6) return `${parts[0]}.${parts[1]}`;
+  if (digits.length <= 9) return `${parts[0]}.${parts[1]}.${parts[2]}`;
+  return `${parts[0]}.${parts[1]}.${parts[2]}-${parts[3]}`;
+};
+
+const formatCpfFromDigits = (value: string) => formatCpf(value.replace(/\D/g, ""));
+
+const calculateCpfCheckDigit = (digits: string, factor: number) => {
+  const total = digits
+    .split("")
+    .reduce((sum, digit, index) => sum + Number(digit) * (factor - index), 0);
+  const remainder = total % 11;
+  return remainder < 2 ? 0 : 11 - remainder;
+};
+
+const isValidCpf = (value: string) => {
+  const digits = normalizeCpfDigits(value);
+  if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+  const firstDigit = calculateCpfCheckDigit(digits.slice(0, 9), 10);
+  const secondDigit = calculateCpfCheckDigit(digits.slice(0, 10), 11);
+  return digits === `${digits.slice(0, 9)}${firstDigit}${secondDigit}`;
+};
+
+const normalizeCnpjDigits = (value: string) => value.replace(/\D/g, "").slice(0, 14);
+
+const formatCnpj = (value: string) => {
+  const digits = normalizeCnpjDigits(value);
+  const parts = [
+    digits.slice(0, 2),
+    digits.slice(2, 5),
+    digits.slice(5, 8),
+    digits.slice(8, 12),
+    digits.slice(12, 14)
+  ];
+  if (digits.length <= 2) return parts[0];
+  if (digits.length <= 5) return `${parts[0]}.${parts[1]}`;
+  if (digits.length <= 8) return `${parts[0]}.${parts[1]}.${parts[2]}`;
+  if (digits.length <= 12) return `${parts[0]}.${parts[1]}.${parts[2]}/${parts[3]}`;
+  return `${parts[0]}.${parts[1]}.${parts[2]}/${parts[3]}-${parts[4]}`;
+};
+
+const calculateCnpjCheckDigit = (digits: string) => {
+  const weights = digits.length === 12 ? [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] : [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+  const total = digits.split("").reduce((sum, digit, index) => sum + Number(digit) * weights[index], 0);
+  const remainder = total % 11;
+  return remainder < 2 ? 0 : 11 - remainder;
+};
+
+const isValidCnpj = (value: string) => {
+  const digits = normalizeCnpjDigits(value);
+  if (digits.length !== 14 || /^(\d)\1{13}$/.test(digits)) return false;
+  const firstDigit = calculateCnpjCheckDigit(digits.slice(0, 12));
+  const secondDigit = calculateCnpjCheckDigit(`${digits.slice(0, 12)}${firstDigit}`);
+  return digits === `${digits.slice(0, 12)}${firstDigit}${secondDigit}`;
+};
+
 const emptyCaseForm = {
   process: "",
   walletId: "",
@@ -403,15 +502,80 @@ const emptyCaseForm = {
   notes: ""
 };
 
+type CaseForm = typeof emptyCaseForm;
+const caseNumberPattern = /^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$/;
+const isLocalApiBaseUrl = (url: string) => url.startsWith(LOCAL_API_BASE_URL) || url.startsWith("http://localhost");
+
+const formatCaseNumber = (value: string) => {
+  const digits = value.replace(/\D/g, "").slice(0, 20);
+  const parts = [
+    digits.slice(0, 7),
+    digits.slice(7, 9),
+    digits.slice(9, 13),
+    digits.slice(13, 14),
+    digits.slice(14, 16),
+    digits.slice(16, 20)
+  ];
+  let formatted = parts[0];
+  if (digits.length > 7) formatted += `-${parts[1]}`;
+  if (digits.length > 9) formatted += `.${parts[2]}`;
+  if (digits.length > 13) formatted += `.${parts[3]}`;
+  if (digits.length > 14) formatted += `.${parts[4]}`;
+  if (digits.length > 16) formatted += `.${parts[5]}`;
+  return formatted;
+};
+
+const isCompleteCaseNumber = (value: string) => caseNumberPattern.test(formatCaseNumber(value));
+
+const getCaseFormValidationMessage = (form: CaseForm) => {
+  if (!isCompleteCaseNumber(form.process)) {
+    return "Informe o número completo do processo no padrão 0000000-00.0000.0.00.0000.";
+  }
+  if (!form.walletId) {
+    return "Selecione uma carteira para vincular o processo.";
+  }
+  if (!form.court.trim()) {
+    return "Informe a vara do processo.";
+  }
+  if (!form.region.trim()) {
+    return "Informe a comarca do processo.";
+  }
+  return "";
+};
+
+const getClientFormValidationMessage = (form: ClientForm) => {
+  if (!form.name.trim()) {
+    return form.kind === "PF" ? "Informe o nome completo do cliente." : "Informe a razão social do cliente.";
+  }
+  if (form.kind === "PF") {
+    if (!form.cpf.trim()) {
+      return "Informe o CPF do cliente.";
+    }
+    if (!isValidCpf(form.cpf)) {
+      return "Informe um CPF válido.";
+    }
+    return "";
+  }
+  if (!form.cnpj.trim()) {
+    return "Informe o CNPJ do cliente.";
+  }
+  if (!isValidCnpj(form.cnpj)) {
+    return "Informe um CNPJ válido.";
+  }
+  return "";
+};
+
 type FinanceEntryType = "receita" | "despesa";
 type FinancePaymentMethod = "" | "pix" | "boleto" | "cartao" | "dinheiro" | "transferencia";
 type FinanceStatus = "Pago" | "A vencer" | "Vencido" | "Parcial";
 type FinanceRecurring = "nao-recorrente" | "mensal" | "anual" | "personalizado";
+type FinancePeriodFilter = "this-month" | "this-week" | "overdue" | "all";
+type FinanceChartView = "year" | "month";
 
 type RevenueForm = {
   category: string;
-  client: string;
-  process: string;
+  clientId: string;
+  caseId: string;
   amount: string;
   dueDate: string;
   paymentDate: string;
@@ -432,10 +596,18 @@ type ExpenseForm = {
   attachmentName: string;
 };
 
+type FinanceSettlementForm = {
+  paymentDate: string;
+  paymentMethod: FinancePaymentMethod;
+  paidAmount: string;
+};
+
 type FinanceEntry = {
   id: number;
   entryType: FinanceEntryType;
   category: string;
+  clientId?: number;
+  caseId?: number;
   client: string;
   process: string;
   amount: number;
@@ -515,8 +687,8 @@ const paymentMethodLabels: Record<Exclude<FinancePaymentMethod, "">, string> = {
 
 const emptyRevenueForm: RevenueForm = {
   category: "",
-  client: "",
-  process: "",
+  clientId: "",
+  caseId: "",
   amount: "",
   dueDate: "",
   paymentDate: "",
@@ -537,7 +709,48 @@ const emptyExpenseForm: ExpenseForm = {
   attachmentName: ""
 };
 
+const emptyFinanceSettlementForm: FinanceSettlementForm = {
+  paymentDate: "",
+  paymentMethod: "",
+  paidAmount: ""
+};
+
 const financeMonths = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+const financeChartViewOptions: { value: FinanceChartView; label: string }[] = [
+  { value: "year", label: "Ano" },
+  { value: "month", label: "Mês" }
+];
+const financePeriodOptions: { value: FinancePeriodFilter; label: string }[] = [
+  { value: "this-month", label: "Este mês" },
+  { value: "this-week", label: "Esta semana" },
+  { value: "overdue", label: "Vencidos" },
+  { value: "all", label: "Todos" }
+];
+const financeStatusOptions: Array<FinanceStatus | "todos"> = ["todos", "Pago", "A vencer", "Vencido", "Parcial"];
+const clientDocumentMaxSizeBytes = 10 * 1024 * 1024;
+const processFolderBlueprint = [
+  { label: "Petições", note: "Iniciais, intermediárias, recursos e manifestações" },
+  { label: "Andamentos", note: "Movimentações, publicações e intimações" },
+  { label: "Decisões e Sentenças", note: "Despachos, decisões interlocutórias e sentenças" },
+  { label: "Provas e Documentos", note: "Documentos anexados, laudos e evidências" },
+  { label: "Audiências", note: "Atas, pautas e gravações" },
+  { label: "Financeiro", note: "Custas, honorários, guias e comprovantes" },
+  { label: "Acordos e Encerramento", note: "Minutas, termos finais e baixa do caso" }
+] as const;
+
+const getClientFolderBlueprint = (kind: ClientKind) => [
+  { label: "Dados", note: "Cadastro, contatos, observações e documentos de identificação" },
+  {
+    label: kind === "PF" ? "Documentos Pessoais" : "Documentos Societários",
+    note:
+      kind === "PF"
+        ? "CPF, RG, comprovante de endereço e fichas cadastrais"
+        : "Contrato social, CNPJ, alterações contratuais e atos societários"
+  },
+  { label: "Contratos e Procurações", note: "Honorários, procurações, substabelecimentos e aditivos" },
+  { label: "Financeiro", note: "Notas, recibos, comprovantes e cobranças do cliente" },
+  { label: "Correspondências", note: "E-mails, notificações e comunicações relevantes" }
+];
 
 const toIsoDateWithOffset = (days: number) => {
   const date = new Date();
@@ -556,8 +769,123 @@ const currencyFormatter = new Intl.NumberFormat("pt-BR", {
   style: "currency",
   currency: "BRL"
 });
+const compactCurrencyFormatter = new Intl.NumberFormat("pt-BR", {
+  style: "currency",
+  currency: "BRL",
+  notation: "compact",
+  maximumFractionDigits: 1
+});
+const axisCurrencyFormatter = new Intl.NumberFormat("pt-BR", {
+  style: "currency",
+  currency: "BRL",
+  maximumFractionDigits: 0
+});
+const dateTimeFormatterPtBr = new Intl.DateTimeFormat("pt-BR", {
+  dateStyle: "short",
+  timeStyle: "short"
+});
 
 const formatCurrencyBRL = (value: number) => currencyFormatter.format(Number.isFinite(value) ? value : 0);
+const formatCurrencyAxis = (value: number) => {
+  const normalized = Math.abs(value) < 1e-9 ? 0 : value;
+  if (Math.abs(normalized) >= 1000) return compactCurrencyFormatter.format(normalized);
+  return axisCurrencyFormatter.format(normalized);
+};
+const formatDateTimePtBr = (value?: string | null) => {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return dateTimeFormatterPtBr.format(parsed);
+};
+const formatFileSize = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return "0 KB";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1).replace(".", ",")} MB`;
+};
+
+const getNiceChartStep = (value: number, round: boolean) => {
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  const exponent = Math.floor(Math.log10(value));
+  const fraction = value / 10 ** exponent;
+  let niceFraction: number;
+  if (round) {
+    if (fraction < 1.5) niceFraction = 1;
+    else if (fraction < 2.25) niceFraction = 2;
+    else if (fraction < 3.75) niceFraction = 2.5;
+    else if (fraction < 7.5) niceFraction = 5;
+    else niceFraction = 10;
+  } else {
+    if (fraction <= 1) niceFraction = 1;
+    else if (fraction <= 2) niceFraction = 2;
+    else if (fraction <= 2.5) niceFraction = 2.5;
+    else if (fraction <= 5) niceFraction = 5;
+    else niceFraction = 10;
+  }
+  return niceFraction * 10 ** exponent;
+};
+
+const buildNiceChartScale = (values: number[], tickCount = 5) => {
+  const safeValues = values.filter((value) => Number.isFinite(value));
+  const rawMin = safeValues.length ? Math.min(...safeValues, 0) : 0;
+  const rawMax = safeValues.length ? Math.max(...safeValues, 0) : 0;
+
+  let min = rawMin;
+  let max = rawMax;
+
+  if (min === max) {
+    if (max === 0) {
+      max = 1000;
+    } else {
+      const padding = Math.abs(max) * 0.2;
+      min = Math.min(0, min - padding);
+      max = max + padding;
+    }
+  }
+
+  const niceRange = getNiceChartStep(max - min, false);
+  const step = getNiceChartStep(niceRange / Math.max(1, tickCount - 1), true);
+  const niceMin = Math.floor(min / step) * step;
+  const niceMax = Math.ceil(max / step) * step;
+  const ticks: number[] = [];
+
+  for (let current = niceMin; current <= niceMax + step * 0.5; current += step) {
+    const normalized = Math.abs(current) < 1e-9 ? 0 : Number(current.toFixed(10));
+    ticks.push(normalized);
+  }
+
+  const range = Math.max(step, niceMax - niceMin);
+  return {
+    min: niceMin,
+    max: niceMax,
+    step,
+    range,
+    ticks
+  };
+};
+
+const buildRoundedStepChartPath = (points: Array<{ x: number; y: number }>) => {
+  if (!points.length) return "";
+  if (points.length === 1) return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  let path = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (Math.abs(current.y - previous.y) < 0.001) {
+      path += ` H ${current.x.toFixed(2)}`;
+      continue;
+    }
+
+    const deltaX = current.x - previous.x;
+    const curveWidth = Math.min(Math.abs(deltaX) * 0.34, 2.4);
+    const curveStartX = current.x - curveWidth;
+    const controlX1 = curveStartX + curveWidth * 0.5;
+    const controlX2 = current.x - curveWidth * 0.35;
+
+    path += ` H ${curveStartX.toFixed(2)}`;
+    path += ` C ${controlX1.toFixed(2)} ${previous.y.toFixed(2)} ${controlX2.toFixed(2)} ${current.y.toFixed(2)} ${current.x.toFixed(2)} ${current.y.toFixed(2)}`;
+  }
+  return path;
+};
 
 const parseCurrencyBRL = (value: string) => {
   const digits = value.replace(/\D/g, "");
@@ -586,17 +914,36 @@ const daysFromToday = (value: string) => {
 
 const getFinanceStatus = (entry: FinanceEntry): FinanceStatus => {
   const overdue = entry.dueDate ? daysFromToday(entry.dueDate) < 0 : false;
-  if (entry.entryType === "receita") {
-    if (entry.paymentDate) return "Pago";
-    return overdue ? "Vencido" : "A vencer";
-  }
-  const paidAmount = entry.paidAmount || 0;
+  const paidAmount = entry.paidAmount ?? (entry.paymentDate ? entry.amount : 0);
   if (paidAmount >= entry.amount && entry.amount > 0) return "Pago";
   if (paidAmount > 0 && paidAmount < entry.amount) return "Parcial";
   return overdue ? "Vencido" : "A vencer";
 };
 
+const getFinanceSettledAmount = (entry: FinanceEntry) => {
+  return entry.paidAmount ?? (entry.paymentDate ? entry.amount : 0);
+};
+
 const seedFinanceEntries: FinanceEntry[] = [];
+
+const toFinanceEntry = (entry: ApiFinanceEntry): FinanceEntry => ({
+  id: entry.id,
+  entryType: entry.entry_type,
+  category: entry.category,
+  clientId: entry.client_id ?? undefined,
+  caseId: entry.case_id ?? undefined,
+  client: entry.client_name || "Não informado",
+  process: entry.case_number || "",
+  amount: entry.amount,
+  dueDate: entry.due_date,
+  paymentDate: entry.payment_date || undefined,
+  paymentMethod: entry.payment_method || undefined,
+  expenseType: entry.expense_type || undefined,
+  recurring: entry.recurring || undefined,
+  paidAmount: entry.paid_amount ?? undefined,
+  installments: entry.installments ?? undefined,
+  attachmentName: entry.attachment_name || undefined
+});
 
 const parseClientMetadata = (rawNotes?: string | null): Partial<ClientForm> => {
   if (!rawNotes) return {};
@@ -629,10 +976,10 @@ const toClientForm = (client: ApiClient): ClientForm => {
   };
   if (document) {
     if (kind === "PF") {
-      form.cpf = document;
+      form.cpf = formatCpf(document);
       form.cnpj = "";
     } else {
-      form.cnpj = document;
+      form.cnpj = formatCnpj(document);
       form.cpf = "";
     }
   }
@@ -683,10 +1030,62 @@ const toClientRow = (client: ApiClient): ClientRow => {
   };
 };
 
+const normalizeSearchText = (value: string) =>
+  value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+const countFileNodes = (nodes: FileFolderNode[]): number =>
+  nodes.reduce((total, node) => total + 1 + countFileNodes(node.children || []), 0);
+
+const buildClientFileTree = (client: ApiClient, clientCases: ApiCase[]): ClientFileTree => {
+  const kind = resolveClientKind((client.document || "").trim());
+  const baseFolders = getClientFolderBlueprint(kind).map((folder) => ({
+    id: `client-${client.id}-${normalizeSearchText(folder.label).replace(/\s+/g, "-")}`,
+    label: folder.label,
+    note: folder.note,
+    kind: "client-folder" as const
+  }));
+  const sortedCases = [...clientCases].sort((a, b) =>
+    (a.number || "").localeCompare(b.number || "", "pt-BR", { numeric: true, sensitivity: "base" })
+  );
+  const caseFolders = sortedCases.map((caseItem) => ({
+    id: `client-${client.id}-case-${caseItem.id}`,
+    label: caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`,
+    note: [caseItem.title?.trim(), caseItem.status?.trim()].filter(Boolean).join(" · ") || "Subpastas padrão do processo",
+    kind: "case-folder" as const,
+    children: processFolderBlueprint.map((folder) => ({
+      id: `case-${caseItem.id}-${normalizeSearchText(folder.label).replace(/\s+/g, "-")}`,
+      label: folder.label,
+      note: folder.note,
+      kind: "case-section" as const
+    }))
+  }));
+  const nodes = [...baseFolders, ...caseFolders];
+  return {
+    client,
+    kind,
+    cases: sortedCases,
+    nodes,
+    totalFolders: countFileNodes(nodes),
+    searchText: normalizeSearchText(
+      [
+        client.name,
+        client.document || "",
+        ...sortedCases.flatMap((caseItem) => [caseItem.number || "", caseItem.title || "", caseItem.status || ""])
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+  };
+};
+
 const extractApiErrorMessage = (err: unknown, fallback: string) => {
   const error = err as {
     response?: { status?: number; data?: { detail?: string } };
     message?: string;
+    code?: string;
   };
   if (error.response?.status === 401) {
     return "Sessão expirada. Faça login novamente.";
@@ -698,8 +1097,14 @@ const extractApiErrorMessage = (err: unknown, fallback: string) => {
     return error.response.data.detail;
   }
   const raw = (error.message || "").toLowerCase();
+  if (error.code === "ECONNABORTED" || raw.includes("timeout")) {
+    return `Tempo esgotado ao conectar com a API (${baseURL}).`;
+  }
   if (raw.includes("network") || raw.includes("failed to fetch")) {
     return `Sem conexão com a API (${baseURL}).`;
+  }
+  if (error.message) {
+    return error.message;
   }
   return fallback;
 };
@@ -847,31 +1252,6 @@ function AddClientModal({
     return `${parts[0]}/${parts[1]}/${parts[2]}`;
   };
 
-  const formatCpf = (value: string) => {
-    const digits = value.replace(/\D/g, "").slice(0, 11);
-    const parts = [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6, 9), digits.slice(9, 11)];
-    if (digits.length <= 3) return parts[0];
-    if (digits.length <= 6) return `${parts[0]}.${parts[1]}`;
-    if (digits.length <= 9) return `${parts[0]}.${parts[1]}.${parts[2]}`;
-    return `${parts[0]}.${parts[1]}.${parts[2]}-${parts[3]}`;
-  };
-
-  const formatCnpj = (value: string) => {
-    const digits = value.replace(/\D/g, "").slice(0, 14);
-    const parts = [
-      digits.slice(0, 2),
-      digits.slice(2, 5),
-      digits.slice(5, 8),
-      digits.slice(8, 12),
-      digits.slice(12, 14)
-    ];
-    if (digits.length <= 2) return parts[0];
-    if (digits.length <= 5) return `${parts[0]}.${parts[1]}`;
-    if (digits.length <= 8) return `${parts[0]}.${parts[1]}.${parts[2]}`;
-    if (digits.length <= 12) return `${parts[0]}.${parts[1]}.${parts[2]}/${parts[3]}`;
-    return `${parts[0]}.${parts[1]}.${parts[2]}/${parts[3]}-${parts[4]}`;
-  };
-
   const formatRg = (value: string) => {
     const clean = value.replace(/[^0-9xX]/g, "").toUpperCase();
     const digits = clean.slice(0, 8);
@@ -940,8 +1320,9 @@ function AddClientModal({
 
   const cepDigits = (form.cep || "").replace(/\D/g, "");
   const isPerson = form.kind === "PF";
-  const requiredMissing =
-    !form.name.trim() || (isPerson ? form.cpf.trim().length === 0 : form.cnpj.trim().length === 0);
+  const validationMessage = getClientFormValidationMessage(form);
+  const cpfInvalid = isPerson && form.cpf.trim().length > 0 && !isValidCpf(form.cpf);
+  const cnpjInvalid = !isPerson && form.cnpj.trim().length > 0 && !isValidCnpj(form.cnpj);
   const requiredLabel = isPerson ? "Nome completo e CPF" : "Razão social e CNPJ";
 
   return (
@@ -1014,6 +1395,7 @@ function AddClientModal({
                   CPF <span className="required">*</span>
                 </label>
                 <input value={form.cpf} onChange={(e) => handleCpfChange(e.target.value)} inputMode="numeric" />
+                {cpfInvalid && <div className="error-inline">Informe um CPF válido.</div>}
               </div>
               <div className="field">
                 <label>RG</label>
@@ -1027,6 +1409,7 @@ function AddClientModal({
                   CNPJ <span className="required">*</span>
                 </label>
                 <input value={form.cnpj} onChange={(e) => handleCnpjChange(e.target.value)} inputMode="numeric" />
+                {cnpjInvalid && <div className="error-inline">Informe um CNPJ válido.</div>}
               </div>
               <div className="field">
                 <label>Nome fantasia</label>
@@ -1118,10 +1501,87 @@ function AddClientModal({
           <button className="btn ghost" type="button" onClick={onClose}>
             Cancelar
           </button>
-          <button className="btn" type="button" onClick={onSave} disabled={requiredMissing || saving}>
+          <button className="btn" type="button" onClick={onSave} disabled={saving || !!validationMessage}>
             {saving ? "Salvando..." : saveLabel || "Salvar"}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ProcessFormFields({
+  form,
+  wallets,
+  onChange
+}: {
+  form: CaseForm;
+  wallets?: ApiWallet[];
+  onChange: (key: keyof CaseForm, value: string) => void;
+}) {
+  return (
+    <div className="modal-grid process-form-grid">
+      <div className="field">
+        <label>
+          Processo <span className="required">*</span>
+        </label>
+        <input
+          value={form.process}
+          onChange={(e) => onChange("process", formatCaseNumber(e.target.value))}
+          inputMode="numeric"
+          maxLength={25}
+          placeholder="0000000-00.0000.0.00.0000"
+        />
+        <div className="field-hint">Informe o número completo no padrão CNJ.</div>
+      </div>
+      <div className="field">
+        <label>
+          Carteira <span className="required">*</span>
+        </label>
+        <select value={form.walletId} onChange={(e) => onChange("walletId", e.target.value)}>
+          <option value="">Selecione</option>
+          {(wallets || []).map((wallet) => (
+            <option key={wallet.id} value={String(wallet.id)}>
+              {wallet.name} - {wallet.nickname}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="field">
+        <label>
+          Vara <span className="required">*</span>
+        </label>
+        <input value={form.court} onChange={(e) => onChange("court", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>
+          Comarca <span className="required">*</span>
+        </label>
+        <input value={form.region} onChange={(e) => onChange("region", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>Processos associados</label>
+        <input value={form.associated} onChange={(e) => onChange("associated", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>Parte contrária</label>
+        <input value={form.counterparty} onChange={(e) => onChange("counterparty", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>Advogado parte contrária</label>
+        <input value={form.counterLawyer} onChange={(e) => onChange("counterLawyer", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>OAB</label>
+        <input value={form.oab} onChange={(e) => onChange("oab", e.target.value)} />
+      </div>
+      <div className="field">
+        <label>Contato</label>
+        <input value={form.contact} onChange={(e) => onChange("contact", e.target.value)} />
+      </div>
+      <div className="field span-2">
+        <label>Observações</label>
+        <textarea value={form.notes} onChange={(e) => onChange("notes", e.target.value)} />
       </div>
     </div>
   );
@@ -1140,74 +1600,27 @@ function AddProcessModal({
 }: {
   open: boolean;
   clientName?: string;
-  form: typeof emptyCaseForm;
+  form: CaseForm;
   wallets?: ApiWallet[];
   saving?: boolean;
   errorMessage?: string;
-  onChange: (key: keyof typeof emptyCaseForm, value: string) => void;
+  onChange: (key: keyof CaseForm, value: string) => void;
   onClose: () => void;
   onSave: () => void;
 }) {
   if (!open) return null;
+  const validationMessage = getCaseFormValidationMessage(form);
   return (
     <div className="modal-backdrop">
       <div className="modal-card">
         <h2 className="modal-title">Cliente: {clientName}</h2>
-        <div className="modal-grid">
-          <div className="field">
-            <label>Processo</label>
-            <input value={form.process} onChange={(e) => onChange("process", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Carteira</label>
-            <select value={form.walletId} onChange={(e) => onChange("walletId", e.target.value)}>
-              <option value="">Selecione</option>
-              {(wallets || []).map((wallet) => (
-                <option key={wallet.id} value={String(wallet.id)}>
-                  {wallet.name} - {wallet.nickname}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="field">
-            <label>Vara</label>
-            <input value={form.court} onChange={(e) => onChange("court", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Comarca</label>
-            <input value={form.region} onChange={(e) => onChange("region", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Processos associados</label>
-            <input value={form.associated} onChange={(e) => onChange("associated", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Parte contrária</label>
-            <input value={form.counterparty} onChange={(e) => onChange("counterparty", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Advogado parte contrária</label>
-            <input value={form.counterLawyer} onChange={(e) => onChange("counterLawyer", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>OAB</label>
-            <input value={form.oab} onChange={(e) => onChange("oab", e.target.value)} />
-          </div>
-          <div className="field">
-            <label>Contato</label>
-            <input value={form.contact} onChange={(e) => onChange("contact", e.target.value)} />
-          </div>
-          <div className="field" style={{ gridColumn: "1 / -1" }}>
-            <label>Observações</label>
-            <textarea value={form.notes} onChange={(e) => onChange("notes", e.target.value)} />
-          </div>
-        </div>
+        <ProcessFormFields form={form} wallets={wallets} onChange={onChange} />
         {errorMessage && <div className="error">{errorMessage}</div>}
         <div className="modal-actions">
           <button className="btn ghost" type="button" onClick={onClose}>
             Cancelar
           </button>
-          <button className="btn" type="button" onClick={onSave} disabled={saving || !form.process.trim()}>
+          <button className="btn" type="button" onClick={onSave} disabled={saving || !!validationMessage}>
             {saving ? "Salvando..." : "Salvar"}
           </button>
         </div>
@@ -1384,24 +1797,19 @@ function People() {
   const [showClientDetails, setShowClientDetails] = useState(false);
   const [showEditClient, setShowEditClient] = useState(false);
   const [showDeleteClientConfirm, setShowDeleteClientConfirm] = useState(false);
-  const [showAddProcess, setShowAddProcess] = useState(false);
   const [clientForm, setClientForm] = useState(emptyClientForm);
   const [editClientId, setEditClientId] = useState<number | null>(null);
   const [editClientForm, setEditClientForm] = useState<ClientForm>(emptyClientForm);
-  const [caseForm, setCaseForm] = useState(emptyCaseForm);
   const [cepError, setCepError] = useState("");
   const [editCepError, setEditCepError] = useState("");
   const [isLoadingClients, setIsLoadingClients] = useState(true);
   const [isSavingClient, setIsSavingClient] = useState(false);
   const [isUpdatingClient, setIsUpdatingClient] = useState(false);
   const [isDeletingClient, setIsDeletingClient] = useState(false);
-  const [isSavingCase, setIsSavingCase] = useState(false);
   const [pageError, setPageError] = useState("");
   const [saveClientError, setSaveClientError] = useState("");
   const [updateClientError, setUpdateClientError] = useState("");
   const [deleteClientError, setDeleteClientError] = useState("");
-  const [saveCaseError, setSaveCaseError] = useState("");
-  const [wallets, setWallets] = useState<ApiWallet[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1409,10 +1817,9 @@ function People() {
       setIsLoadingClients(true);
       setPageError("");
       try {
-        const [data, walletData] = await Promise.all([apiListClients(), apiListWallets()]);
+        const data = await apiListClients();
         if (cancelled) return;
         setApiClients(data);
-        setWallets(walletData);
         const mapped = data.map(toClientRow);
         setClients(mapped);
       } catch (err) {
@@ -1444,11 +1851,15 @@ function People() {
     return clients.filter((c) => `${c.name} ${c.document}`.toLowerCase().includes(term));
   }, [clients, search]);
 
-  const selectedClient = clients.find((c) => c.id === selectedId);
   const selectedApiClient = apiClients.find((c) => c.id === selectedId);
   const selectedClientForm = selectedApiClient ? toClientForm(selectedApiClient) : emptyClientForm;
 
   const handleSaveClient = async () => {
+    const validationMessage = getClientFormValidationMessage(clientForm);
+    if (validationMessage) {
+      setSaveClientError(validationMessage);
+      return;
+    }
     const payload = buildClientPayload(clientForm);
     const document = (payload.document || "").trim();
     if (!clientForm.name.trim() || !document) return;
@@ -1472,6 +1883,11 @@ function People() {
 
   const handleUpdateClient = async () => {
     if (!editClientId) return;
+    const validationMessage = getClientFormValidationMessage(editClientForm);
+    if (validationMessage) {
+      setUpdateClientError(validationMessage);
+      return;
+    }
     const payload = buildClientPayload(editClientForm);
     if (!payload.name || !payload.document) return;
     setIsUpdatingClient(true);
@@ -1489,30 +1905,6 @@ function People() {
       setUpdateClientError(extractApiErrorMessage(err, "Não foi possível atualizar o cliente na API."));
     } finally {
       setIsUpdatingClient(false);
-    }
-  };
-
-  const handleSaveCase = async () => {
-    if (!selectedClient || !caseForm.process.trim()) return;
-    setIsSavingCase(true);
-    setSaveCaseError("");
-    try {
-      const counterparty = caseForm.counterparty.trim() || "Parte contrária";
-      await apiCreateCase({
-        number: caseForm.process.trim(),
-        title: `${selectedClient.name} x ${counterparty}`,
-        client_id: selectedClient.id,
-        wallet_id: caseForm.walletId ? Number(caseForm.walletId) : undefined,
-        status: "aberto",
-        forum: caseForm.region.trim() || undefined,
-        court: caseForm.court.trim() || undefined
-      });
-      setCaseForm(emptyCaseForm);
-      setShowAddProcess(false);
-    } catch (err) {
-      setSaveCaseError(extractApiErrorMessage(err, "Não foi possível salvar o processo na API."));
-    } finally {
-      setIsSavingCase(false);
     }
   };
 
@@ -1667,16 +2059,6 @@ function People() {
             >
               Adicionar cliente
             </button>
-            <button
-              className="btn secondary"
-              disabled={!selectedClient || isLoadingClients}
-              onClick={() => {
-                setSaveCaseError("");
-                setShowAddProcess(true);
-              }}
-            >
-              Cadastrar processo
-            </button>
           </div>
         </div>
         {pageError && <div className="error">{pageError}</div>}
@@ -1804,25 +2186,6 @@ function People() {
         }}
         cepError={editCepError}
       />
-      <AddProcessModal
-        open={showAddProcess}
-        clientName={selectedClient?.name}
-        form={caseForm}
-        wallets={wallets}
-        saving={isSavingCase}
-        errorMessage={saveCaseError}
-        onChange={(key, value) => {
-          if (saveCaseError) setSaveCaseError("");
-          setCaseForm((prev) => ({ ...prev, [key]: value }));
-        }}
-        onClose={() => {
-          if (isSavingCase) return;
-          setShowAddProcess(false);
-          setCaseForm(emptyCaseForm);
-          setSaveCaseError("");
-        }}
-        onSave={handleSaveCase}
-      />
     </div>
   );
 }
@@ -1842,15 +2205,630 @@ function Placeholder({ title }: { title: string }) {
   );
 }
 
+function FolderNodeIcon({ kind }: { kind: FileFolderNodeKind | "client-root" }) {
+  return (
+    <span className={`files-tree-icon ${kind}`} aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M3 7.5h6l2 2h10v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        <path d="M3 7.5V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1.5" />
+        {kind === "case-folder" && <path d="M9 13h6" />}
+      </svg>
+    </span>
+  );
+}
+
+function FileTreeNode({ node }: { node: FileFolderNode }) {
+  const hasChildren = Boolean(node.children?.length);
+
+  return (
+    <li className={`files-tree-node ${hasChildren ? "has-children" : "leaf"}`}>
+      <div className={`files-tree-item ${node.kind}`}>
+        <FolderNodeIcon kind={node.kind} />
+        <div className="files-tree-copy">
+          <div className="files-tree-name">{node.label}</div>
+          {node.note && <div className="files-tree-note">{node.note}</div>}
+        </div>
+      </div>
+      {hasChildren && (
+        <ul className="files-tree-list">
+          {node.children?.map((child) => (
+            <FileTreeNode key={child.id} node={child} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+function Files() {
+  const [clients, setClients] = useState<ApiClient[]>([]);
+  const [cases, setCases] = useState<ApiCase[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [selectedClientId, setSelectedClientId] = useState<number | null>(null);
+  const [documents, setDocuments] = useState<ApiClientDocument[]>([]);
+  const [isLoadingDocuments, setIsLoadingDocuments] = useState(false);
+  const [documentsError, setDocumentsError] = useState("");
+  const [selectedUploadCaseId, setSelectedUploadCaseId] = useState("");
+  const [selectedUploadFolder, setSelectedUploadFolder] = useState("");
+  const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState("");
+  const [isUploadingDocument, setIsUploadingDocument] = useState(false);
+  const [deletingDocumentId, setDeletingDocumentId] = useState<number | null>(null);
+  const [documentMessage, setDocumentMessage] = useState("");
+  const [documentsRefreshKey, setDocumentsRefreshKey] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadFileTrees = async () => {
+      setIsLoading(true);
+      setError("");
+      try {
+        const [clientData, caseData] = await Promise.all([apiListClients(), apiListCases()]);
+        if (cancelled) return;
+        setClients(clientData);
+        setCases(caseData);
+      } catch (err) {
+        if (cancelled) return;
+        setError(extractApiErrorMessage(err, "Não foi possível carregar clientes e processos para montar as pastas."));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    void loadFileTrees();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!documentMessage) return;
+    const timeout = window.setTimeout(() => setDocumentMessage(""), 2800);
+    return () => window.clearTimeout(timeout);
+  }, [documentMessage]);
+
+  const allClientTrees = useMemo(() => {
+    const casesByClientId = new Map<number, ApiCase[]>();
+    cases.forEach((caseItem) => {
+      if (!caseItem.client_id) return;
+      const current = casesByClientId.get(caseItem.client_id) || [];
+      current.push(caseItem);
+      casesByClientId.set(caseItem.client_id, current);
+    });
+
+    return [...clients]
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" }))
+      .map((client) => buildClientFileTree(client, casesByClientId.get(client.id) || []));
+  }, [cases, clients]);
+
+  const filteredClientTrees = useMemo(() => {
+    const normalizedTerm = normalizeSearchText(searchTerm.trim());
+    if (!normalizedTerm) return allClientTrees;
+    return allClientTrees.filter((tree) => tree.searchText.includes(normalizedTerm));
+  }, [allClientTrees, searchTerm]);
+
+  useEffect(() => {
+    if (!filteredClientTrees.length) {
+      if (selectedClientId !== null) setSelectedClientId(null);
+      return;
+    }
+    if (selectedClientId === null || !filteredClientTrees.some((tree) => tree.client.id === selectedClientId)) {
+      setSelectedClientId(filteredClientTrees[0].client.id);
+    }
+  }, [filteredClientTrees, selectedClientId]);
+
+  const selectedClientTree = useMemo(
+    () => filteredClientTrees.find((tree) => tree.client.id === selectedClientId) ?? null,
+    [filteredClientTrees, selectedClientId]
+  );
+
+  useEffect(() => {
+    if (!selectedClientId) {
+      setDocuments([]);
+      return;
+    }
+    let cancelled = false;
+
+    const loadDocuments = async () => {
+      setIsLoadingDocuments(true);
+      setDocumentsError("");
+      try {
+        const data = await apiListClientDocuments(selectedClientId);
+        if (cancelled) return;
+        setDocuments(data);
+      } catch (err) {
+        if (cancelled) return;
+        setDocumentsError(extractApiErrorMessage(err, "Não foi possível carregar os documentos do cliente."));
+      } finally {
+        if (!cancelled) setIsLoadingDocuments(false);
+      }
+    };
+
+    void loadDocuments();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [documentsRefreshKey, selectedClientId]);
+
+  useEffect(() => {
+    setSelectedUploadCaseId("");
+    setSelectedUploadFile(null);
+    setUploadError("");
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }, [selectedClientId]);
+
+  useEffect(() => {
+    if (!selectedClientTree) {
+      if (selectedUploadCaseId) setSelectedUploadCaseId("");
+      return;
+    }
+    if (selectedUploadCaseId && !selectedClientTree.cases.some((item) => String(item.id) === selectedUploadCaseId)) {
+      setSelectedUploadCaseId("");
+    }
+  }, [selectedClientTree, selectedUploadCaseId]);
+
+  const linkedCaseCount = useMemo(() => cases.filter((caseItem) => Number(caseItem.client_id)).length, [cases]);
+  const totalSuggestedFolders = useMemo(
+    () => allClientTrees.reduce((total, tree) => total + tree.totalFolders, 0),
+    [allClientTrees]
+  );
+  const selectedClientFolders = useMemo(
+    () => (selectedClientTree ? getClientFolderBlueprint(selectedClientTree.kind) : getClientFolderBlueprint("PF")),
+    [selectedClientTree]
+  );
+  const selectedUploadCase = useMemo(
+    () => selectedClientTree?.cases.find((item) => String(item.id) === selectedUploadCaseId) ?? null,
+    [selectedClientTree, selectedUploadCaseId]
+  );
+  const uploadFolderOptions = useMemo(
+    () => (selectedUploadCase ? [...processFolderBlueprint] : selectedClientFolders),
+    [selectedClientFolders, selectedUploadCase]
+  );
+  const caseLabelById = useMemo(() => {
+    const map = new Map<number, string>();
+    selectedClientTree?.cases.forEach((caseItem) => {
+      map.set(caseItem.id, caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`);
+    });
+    return map;
+  }, [selectedClientTree]);
+
+  useEffect(() => {
+    if (!uploadFolderOptions.length) {
+      if (selectedUploadFolder) setSelectedUploadFolder("");
+      return;
+    }
+    if (!uploadFolderOptions.some((folder) => folder.label === selectedUploadFolder)) {
+      setSelectedUploadFolder(uploadFolderOptions[0].label);
+    }
+  }, [selectedUploadFolder, uploadFolderOptions]);
+
+  const firstProcessExample = selectedClientTree?.cases[0] ?? null;
+  const processExamplePath = firstProcessExample
+    ? `${selectedClientTree?.client.name} / ${firstProcessExample.number ? `Processo ${firstProcessExample.number}` : `Processo #${firstProcessExample.id}`} / Petições`
+    : selectedClientTree
+      ? `${selectedClientTree.client.name} / Contratos e Procurações`
+      : "Cliente / Processo / Petições";
+
+  const handleSelectUploadFile = (event: ChangeEvent<HTMLInputElement>) => {
+    const nextFile = event.target.files?.[0] || null;
+    if (!nextFile) {
+      setSelectedUploadFile(null);
+      return;
+    }
+    const isPdfByName = nextFile.name.toLowerCase().endsWith(".pdf");
+    const isPdfByType = !nextFile.type || nextFile.type === "application/pdf" || nextFile.type === "application/octet-stream";
+    if (!isPdfByName || !isPdfByType) {
+      setSelectedUploadFile(null);
+      setUploadError("Envie apenas arquivos PDF.");
+      event.target.value = "";
+      return;
+    }
+    if (nextFile.size > clientDocumentMaxSizeBytes) {
+      setSelectedUploadFile(null);
+      setUploadError("O arquivo excede o limite de 10 MB.");
+      event.target.value = "";
+      return;
+    }
+    setUploadError("");
+    setSelectedUploadFile(nextFile);
+  };
+
+  const handleUploadDocument = async () => {
+    if (!selectedClientTree) return;
+    if (!selectedUploadFolder) {
+      setUploadError("Selecione uma subpasta para enviar o documento.");
+      return;
+    }
+    if (!selectedUploadFile) {
+      setUploadError("Selecione um PDF para enviar.");
+      return;
+    }
+    setIsUploadingDocument(true);
+    setUploadError("");
+    try {
+      await apiUploadClientDocument({
+        clientId: selectedClientTree.client.id,
+        caseId: selectedUploadCase?.id,
+        folderLabel: selectedUploadFolder,
+        file: selectedUploadFile
+      });
+      setSelectedUploadFile(null);
+      setDocumentMessage("Documento enviado com sucesso.");
+      setDocumentsRefreshKey((value) => value + 1);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } catch (err) {
+      setUploadError(extractApiErrorMessage(err, "Não foi possível enviar o documento."));
+    } finally {
+      setIsUploadingDocument(false);
+    }
+  };
+
+  const handleDownloadStoredDocument = async (record: ApiClientDocument) => {
+    setDocumentsError("");
+    try {
+      const fileBlob = await apiDownloadClientDocument(record.id);
+      const objectUrl = window.URL.createObjectURL(fileBlob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = record.original_name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setDocumentsError(extractApiErrorMessage(err, "Não foi possível baixar o documento."));
+    }
+  };
+
+  const handleDeleteStoredDocument = async (record: ApiClientDocument) => {
+    if (!window.confirm(`Deseja remover o documento ${record.original_name}?`)) return;
+    setDeletingDocumentId(record.id);
+    setDocumentsError("");
+    try {
+      await apiDeleteClientDocument(record.id);
+      setDocumentMessage("Documento removido.");
+      setDocumentsRefreshKey((value) => value + 1);
+    } catch (err) {
+      setDocumentsError(extractApiErrorMessage(err, "Não foi possível remover o documento."));
+    } finally {
+      setDeletingDocumentId(null);
+    }
+  };
+
+  return (
+    <div className="content-card page-card files-page">
+      <div className="page-header">
+        <div>
+          <div className="eyebrow">Arquivos</div>
+          <h1 className="page-title">Pastas automáticas para clientes e processos.</h1>
+          <div className="page-subtitle">
+            Cada cliente vira uma pasta raiz, com subpastas fixas e novas pastas de processo conforme o cadastro cresce.
+          </div>
+        </div>
+        <div className="pill">Estrutura automática</div>
+      </div>
+
+      <div className="stats-grid">
+        <StatCard
+          title="Clientes com pasta"
+          value={`${allClientTrees.length}`}
+          description="Uma raiz para cada cliente cadastrado"
+          badge={`${linkedCaseCount} processos já viram subpastas`}
+        />
+        <StatCard
+          title="Pastas sugeridas"
+          value={`${totalSuggestedFolders}`}
+          description="Estrutura lógica atual da aba Arquivos"
+          badge="5 fixas por cliente + 7 por processo"
+        />
+        <StatCard
+          title="Subpastas por processo"
+          value={`${processFolderBlueprint.length}`}
+          description="Modelo base para organizar cada caso"
+          badge="Petições, andamentos, financeiro e mais"
+        />
+      </div>
+
+      <div className="files-shell">
+        <aside className="files-sidebar-card">
+          <div className="files-panel-head">
+            <div>
+              <div className="files-panel-title">Pastas de clientes</div>
+              <div className="files-panel-sub">Selecione um cliente para visualizar a árvore de documentos.</div>
+            </div>
+            <div className="files-panel-badge">{filteredClientTrees.length}</div>
+          </div>
+
+          <div className="search-input files-search">
+            <input
+              placeholder="Pesquisar cliente ou número do processo"
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+            />
+          </div>
+
+          {error && <div className="error">{error}</div>}
+
+          {!error && isLoading ? (
+            <div className="files-empty">Carregando estrutura de pastas...</div>
+          ) : !error && filteredClientTrees.length === 0 ? (
+            <div className="files-empty">
+              {allClientTrees.length === 0
+                ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
+                : "Nenhuma pasta encontrada para a busca informada."}
+            </div>
+          ) : (
+            <div className="files-client-list scroll-area">
+              {filteredClientTrees.map((tree) => (
+                <button
+                  key={tree.client.id}
+                  type="button"
+                  className={`files-client-item ${tree.client.id === selectedClientId ? "active" : ""}`}
+                  onClick={() => setSelectedClientId(tree.client.id)}
+                >
+                  <div className="files-client-avatar">{tree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                  <div className="files-client-copy">
+                    <div className="files-client-row">
+                      <div className="files-client-name">{tree.client.name}</div>
+                      <div className="files-client-folder-count">{tree.totalFolders}</div>
+                    </div>
+                    <div className="files-client-sub">
+                      {tree.cases.length
+                        ? `${tree.cases.length} processo${tree.cases.length > 1 ? "s" : ""} com subpastas`
+                        : "Estrutura pronta para receber o primeiro processo"}
+                    </div>
+                    <div className="files-client-tags">
+                      <span className="files-chip">{tree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                      {tree.client.document && <span className="files-chip muted">{tree.client.document}</span>}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </aside>
+
+        <section className="files-workspace">
+          {!selectedClientTree ? (
+            <div className="files-surface files-empty-workspace">
+              Selecione um cliente para visualizar a estrutura sugerida ou cadastre um novo cliente para criar a primeira pasta.
+            </div>
+          ) : (
+            <>
+              <div className="files-surface files-overview-card">
+                <div className="files-overview-main">
+                  <div className="eyebrow">Pasta principal</div>
+                  <h2 className="files-overview-title">{selectedClientTree.client.name}</h2>
+                  <div className="files-overview-sub">
+                    {selectedClientTree.cases.length
+                      ? "A pasta do cliente já está dividida entre dados fixos e processos vinculados."
+                      : "A pasta raiz já está pronta. Quando um processo for cadastrado para este cliente, ele aparecerá abaixo automaticamente."}
+                  </div>
+                </div>
+                <div className="files-overview-side">
+                  <div className="files-client-avatar large">{selectedClientTree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                  <div className="files-client-tags">
+                    <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                    <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
+                    <span className="files-chip">{selectedClientTree.totalFolders} pastas</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="files-example-grid">
+                <div className="files-surface files-example-card">
+                  <div className="files-example-label">Exemplo de pasta fixa</div>
+                  <div className="files-example-path">{selectedClientTree.client.name} / Dados</div>
+                </div>
+                <div className="files-surface files-example-card">
+                  <div className="files-example-label">Exemplo de pasta por processo</div>
+                  <div className="files-example-path">{processExamplePath}</div>
+                </div>
+              </div>
+
+              <div className="files-operations-grid">
+                <div className="files-surface files-upload-card">
+                  <div className="files-card-head">
+                    <div>
+                      <div className="files-card-title">Upload de documentos</div>
+                      <div className="files-card-sub">Somente PDF, com tamanho máximo de 10 MB por arquivo.</div>
+                    </div>
+                  </div>
+
+                  <div className="files-form-grid">
+                    <label className="files-form-field">
+                      <span>Destino</span>
+                      <select value={selectedUploadCaseId} onChange={(event) => setSelectedUploadCaseId(event.target.value)}>
+                        <option value="">Pasta principal do cliente</option>
+                        {selectedClientTree.cases.map((caseItem) => (
+                          <option key={caseItem.id} value={String(caseItem.id)}>
+                            {caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="files-form-field">
+                      <span>Subpasta</span>
+                      <select value={selectedUploadFolder} onChange={(event) => setSelectedUploadFolder(event.target.value)}>
+                        {uploadFolderOptions.map((folder) => (
+                          <option key={folder.label} value={folder.label}>
+                            {folder.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  <label className="files-upload-input">
+                    <span>Arquivo PDF</span>
+                    <input ref={fileInputRef} type="file" accept=".pdf,application/pdf" onChange={handleSelectUploadFile} />
+                  </label>
+
+                  {selectedUploadFile && (
+                    <div className="files-upload-selected">
+                      <strong>{selectedUploadFile.name}</strong>
+                      <span>{formatFileSize(selectedUploadFile.size)}</span>
+                    </div>
+                  )}
+
+                  {uploadError && <div className="error">{uploadError}</div>}
+                  {documentMessage && <div className="files-status-message">{documentMessage}</div>}
+
+                  <div className="files-upload-actions">
+                    <div className="files-upload-hint">
+                      {selectedUploadCase
+                        ? `Destino atual: ${caseLabelById.get(selectedUploadCase.id) || "Processo"} / ${selectedUploadFolder}`
+                        : `Destino atual: ${selectedClientTree.client.name} / ${selectedUploadFolder}`}
+                    </div>
+                    <button className="btn" type="button" disabled={!selectedUploadFile || isUploadingDocument} onClick={handleUploadDocument}>
+                      {isUploadingDocument ? "Enviando..." : "Enviar PDF"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="files-surface files-documents-card">
+                  <div className="files-card-head">
+                    <div>
+                      <div className="files-card-title">Documentos enviados</div>
+                      <div className="files-card-sub">Arquivos já armazenados para este cliente e seus processos.</div>
+                    </div>
+                    <div className="files-panel-badge">{documents.length}</div>
+                  </div>
+
+                  {documentsError && <div className="error">{documentsError}</div>}
+
+                  {isLoadingDocuments ? (
+                    <div className="files-empty">Carregando documentos...</div>
+                  ) : documents.length === 0 ? (
+                    <div className="files-empty">Nenhum documento enviado ainda para este cliente.</div>
+                  ) : (
+                    <div className="files-document-list">
+                      {documents.map((record) => (
+                        <div key={record.id} className="files-document-item">
+                          <div className="files-document-main">
+                            <div className="files-document-name">{record.original_name}</div>
+                            <div className="files-document-meta">
+                              <span>{record.case_id ? `${caseLabelById.get(record.case_id) || "Processo"} / ${record.folder_label}` : `${selectedClientTree.client.name} / ${record.folder_label}`}</span>
+                              <span>{formatFileSize(record.size_bytes)}</span>
+                              <span>{formatDateTimePtBr(record.created_at)}</span>
+                            </div>
+                          </div>
+                          <div className="files-document-actions">
+                            <button className="btn ghost small" type="button" onClick={() => handleDownloadStoredDocument(record)}>
+                              Baixar
+                            </button>
+                            <button
+                              className="btn ghost small danger"
+                              type="button"
+                              disabled={deletingDocumentId === record.id}
+                              onClick={() => handleDeleteStoredDocument(record)}
+                            >
+                              {deletingDocumentId === record.id ? "Removendo..." : "Excluir"}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="files-surface files-tree-card">
+                <div className="files-card-head">
+                  <div>
+                    <div className="files-card-title">Árvore sugerida</div>
+                    <div className="files-card-sub">Modelo para organizar os documentos do cliente e dos processos.</div>
+                  </div>
+                </div>
+
+                <div className="files-tree-root">
+                  <FolderNodeIcon kind="client-root" />
+                  <div className="files-tree-copy">
+                    <div className="files-tree-name">{selectedClientTree.client.name}</div>
+                    <div className="files-tree-note">{selectedClientTree.client.document || "Cliente sem documento cadastrado"}</div>
+                  </div>
+                </div>
+
+                <ul className="files-tree-list root">
+                  {selectedClientTree.nodes.map((node) => (
+                    <FileTreeNode key={node.id} node={node} />
+                  ))}
+                </ul>
+              </div>
+
+              <div className="files-guideline-grid">
+                <div className="files-surface files-guideline-card">
+                  <div className="files-card-title">Pastas fixas do cliente</div>
+                  <div className="files-card-sub">Essas pastas fazem sentido existir mesmo antes do primeiro processo.</div>
+                  <div className="files-guideline-list">
+                    {selectedClientFolders.map((folder) => (
+                      <div key={folder.label} className="files-guideline-item">
+                        <div className="files-guideline-name">{folder.label}</div>
+                        <div className="files-guideline-note">{folder.note}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="files-surface files-guideline-card">
+                  <div className="files-card-title">Pastas padrão por processo</div>
+                  <div className="files-card-sub">Cada processo cadastrado pode nascer com esta divisão interna.</div>
+                  <div className="files-guideline-list">
+                    {processFolderBlueprint.map((folder) => (
+                      <div key={folder.label} className="files-guideline-item">
+                        <div className="files-guideline-name">{folder.label}</div>
+                        <div className="files-guideline-note">{folder.note}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function Finance() {
   const [entries, setEntries] = useState<FinanceEntry[]>(seedFinanceEntries);
+  const [isLoadingEntries, setIsLoadingEntries] = useState(true);
+  const [entriesError, setEntriesError] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
+  const [periodFilter, setPeriodFilter] = useState<FinancePeriodFilter>("this-month");
+  const [entryTypeFilter, setEntryTypeFilter] = useState<FinanceEntryType | "todos">("todos");
+  const [clientFilter, setClientFilter] = useState<string>("todos");
+  const [statusFilter, setStatusFilter] = useState<FinanceStatus | "todos">("todos");
+  const [chartView, setChartView] = useState<FinanceChartView>("year");
   const [showQuickMenu, setShowQuickMenu] = useState(false);
   const [showRevenueModal, setShowRevenueModal] = useState(false);
   const [showExpenseModal, setShowExpenseModal] = useState(false);
+  const [activeFinanceEntry, setActiveFinanceEntry] = useState<FinanceEntry | null>(null);
+  const [showDeleteFinanceConfirm, setShowDeleteFinanceConfirm] = useState(false);
   const [inlineMessage, setInlineMessage] = useState("");
+  const [registeredClients, setRegisteredClients] = useState<ApiClient[]>([]);
+  const [registeredCases, setRegisteredCases] = useState<ApiCase[]>([]);
+  const [isLoadingRevenueLinks, setIsLoadingRevenueLinks] = useState(true);
+  const [revenueLinksError, setRevenueLinksError] = useState("");
+  const [isSavingRevenue, setIsSavingRevenue] = useState(false);
+  const [isSavingExpense, setIsSavingExpense] = useState(false);
+  const [isSavingFinanceEntry, setIsSavingFinanceEntry] = useState(false);
+  const [isDeletingFinanceEntry, setIsDeletingFinanceEntry] = useState(false);
   const [revenueForm, setRevenueForm] = useState<RevenueForm>(emptyRevenueForm);
   const [expenseForm, setExpenseForm] = useState<ExpenseForm>(emptyExpenseForm);
+  const [financeSettlementForm, setFinanceSettlementForm] = useState<FinanceSettlementForm>(emptyFinanceSettlementForm);
 
   useEffect(() => {
     if (!inlineMessage) return;
@@ -1858,21 +2836,80 @@ function Finance() {
     return () => window.clearTimeout(timeout);
   }, [inlineMessage]);
 
+  useEffect(() => {
+    const loadFinanceLinks = async () => {
+      setIsLoadingRevenueLinks(true);
+      setRevenueLinksError("");
+      try {
+        const [clients, cases] = await Promise.all([apiListClients(), apiListCases()]);
+        setRegisteredClients(clients);
+        setRegisteredCases(cases);
+      } catch (err) {
+        setRevenueLinksError(extractApiErrorMessage(err, "Não foi possível carregar pessoas e processos para vincular a receita."));
+      } finally {
+        setIsLoadingRevenueLinks(false);
+      }
+    };
+    void loadFinanceLinks();
+  }, []);
+
+  useEffect(() => {
+    const loadEntries = async () => {
+      setIsLoadingEntries(true);
+      setEntriesError("");
+      try {
+        const data = await apiListFinanceEntries();
+        setEntries(data.map(toFinanceEntry));
+      } catch (err) {
+        setEntriesError(extractApiErrorMessage(err, "Não foi possível carregar os lançamentos financeiros da conta."));
+      } finally {
+        setIsLoadingEntries(false);
+      }
+    };
+    void loadEntries();
+  }, []);
+
   const revenueEntries = useMemo(() => entries.filter((entry) => entry.entryType === "receita"), [entries]);
   const expenseEntries = useMemo(() => entries.filter((entry) => entry.entryType === "despesa"), [entries]);
+  const clientsById = useMemo(() => {
+    return registeredClients.reduce<Record<number, ApiClient>>((acc, client) => {
+      acc[client.id] = client;
+      return acc;
+    }, {});
+  }, [registeredClients]);
+  const sortedRevenueClients = useMemo(() => {
+    return [...registeredClients].sort((a, b) => a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" }));
+  }, [registeredClients]);
+  const filteredRevenueCases = useMemo(() => {
+    const selectedClientId = Number(revenueForm.clientId);
+    const scopedCases =
+      selectedClientId > 0
+        ? registeredCases.filter((item) => item.client_id === selectedClientId)
+        : registeredCases;
+    return [...scopedCases].sort((a, b) => a.number.localeCompare(b.number, "pt-BR", { numeric: true, sensitivity: "base" }));
+  }, [registeredCases, revenueForm.clientId]);
+  const financeClientOptions = useMemo(() => {
+    const unique = Array.from(new Set(entries.map((entry) => entry.client.trim()).filter(Boolean)));
+    return unique.sort((a, b) => a.localeCompare(b, "pt-BR", { sensitivity: "base" }));
+  }, [entries]);
+  const now = useMemo(() => new Date(), []);
+  const currentMonthLabel = useMemo(
+    () => now.toLocaleDateString("pt-BR", { month: "long", year: "numeric" }),
+    [now]
+  );
 
   const expectedRevenue = useMemo(
     () => revenueEntries.reduce((sum, entry) => sum + entry.amount, 0),
     [revenueEntries]
   );
   const receivedRevenue = useMemo(
-    () => revenueEntries.reduce((sum, entry) => sum + (entry.paymentDate ? entry.amount : 0), 0),
+    () => revenueEntries.reduce((sum, entry) => sum + getFinanceSettledAmount(entry), 0),
     [revenueEntries]
   );
   const overdueRevenue = useMemo(
     () =>
       revenueEntries.reduce((sum, entry) => {
-        if (entry.paymentDate) return sum;
+        if (getFinanceStatus(entry) === "Pago" || getFinanceStatus(entry) === "Parcial") return sum;
         return getFinanceStatus(entry) === "Vencido" ? sum + entry.amount : sum;
       }, 0),
     [revenueEntries]
@@ -1884,7 +2921,7 @@ function Finance() {
 
   const dueThisWeekCount = useMemo(() => {
     return revenueEntries.filter((entry) => {
-      if (entry.paymentDate) return false;
+      if (getFinanceStatus(entry) === "Pago" || getFinanceStatus(entry) === "Parcial") return false;
       const days = daysFromToday(entry.dueDate);
       return days >= 0 && days <= 7;
     }).length;
@@ -1893,7 +2930,7 @@ function Finance() {
   const overdueClientsCount = useMemo(() => {
     const unique = new Set<string>();
     revenueEntries.forEach((entry) => {
-      if (entry.paymentDate) return;
+      if (getFinanceStatus(entry) === "Pago" || getFinanceStatus(entry) === "Parcial") return;
       if (getFinanceStatus(entry) === "Vencido" && entry.client.trim()) {
         unique.add(entry.client.trim().toLowerCase());
       }
@@ -1902,10 +2939,9 @@ function Finance() {
   }, [revenueEntries]);
 
   const receiptRate = expectedRevenue > 0 ? Math.round((receivedRevenue / expectedRevenue) * 100) : 0;
-  const annualResult = receivedRevenue - totalExpenses;
 
-  const chartData = useMemo(() => {
-    const currentYear = new Date().getFullYear();
+  const annualChartData = useMemo(() => {
+    const currentYear = now.getFullYear();
     const expectedByMonth = Array.from({ length: 12 }, () => 0);
     const receivedByMonth = Array.from({ length: 12 }, () => 0);
     const expenseByMonth = Array.from({ length: 12 }, () => 0);
@@ -1916,25 +2952,122 @@ function Finance() {
       const monthIndex = dueDate.getMonth();
       if (entry.entryType === "receita") {
         expectedByMonth[monthIndex] += entry.amount;
-        if (entry.paymentDate) receivedByMonth[monthIndex] += entry.amount;
+        receivedByMonth[monthIndex] += getFinanceSettledAmount(entry);
       } else {
         expenseByMonth[monthIndex] += entry.amount;
       }
     });
 
     return financeMonths.map((label, index) => ({
+      key: label,
       label,
       expected: expectedByMonth[index],
       received: receivedByMonth[index],
-      expense: expenseByMonth[index]
+      expense: expenseByMonth[index],
+      result: receivedByMonth[index] - expenseByMonth[index]
     }));
-  }, [entries]);
+  }, [entries, now]);
+  const monthlyChartData = useMemo(() => {
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+    const highlightedDays = new Set(
+      daysInMonth <= 7 ? Array.from({ length: daysInMonth }, (_, index) => index + 1) : [1, 5, 10, 15, 20, 25, daysInMonth]
+    );
+    const expectedByDay = Array.from({ length: daysInMonth }, () => 0);
+    const receivedByDay = Array.from({ length: daysInMonth }, () => 0);
+    const expenseByDay = Array.from({ length: daysInMonth }, () => 0);
 
-  const chartMax = useMemo(() => {
-    const values = chartData.flatMap((item) => [item.expected, item.received, item.expense]);
-    return Math.max(1, ...values);
-  }, [chartData]);
-  const toBarHeight = (value: number) => (value > 0 ? `${(value / chartMax) * 100}%` : "0%");
+    entries.forEach((entry) => {
+      const dueDate = toDateStart(entry.dueDate);
+      if (!dueDate || dueDate.getFullYear() !== currentYear || dueDate.getMonth() !== currentMonth) return;
+      const dayIndex = dueDate.getDate() - 1;
+      if (entry.entryType === "receita") {
+        expectedByDay[dayIndex] += entry.amount;
+        receivedByDay[dayIndex] += getFinanceSettledAmount(entry);
+      } else {
+        expenseByDay[dayIndex] += entry.amount;
+      }
+    });
+
+    return Array.from({ length: daysInMonth }, (_, index) => {
+      const day = index + 1;
+      const expected = expectedByDay[index];
+      const received = receivedByDay[index];
+      const expense = expenseByDay[index];
+      return {
+        key: `day-${day}`,
+        label: highlightedDays.has(day) ? String(day).padStart(2, "0") : "",
+        expected,
+        received,
+        expense,
+        result: received - expense
+      };
+    });
+  }, [entries, now]);
+  const annualResult = useMemo(
+    () => annualChartData.reduce((sum, item) => sum + item.result, 0),
+    [annualChartData]
+  );
+  const monthlyResult = useMemo(
+    () => monthlyChartData.reduce((sum, item) => sum + item.result, 0),
+    [monthlyChartData]
+  );
+  const comparisonChartData = chartView === "year" ? annualChartData : monthlyChartData;
+  const comparisonChartTitle = chartView === "year" ? "Previsão Anual" : "Previsão Mensal";
+  const comparisonChartCaption =
+    chartView === "year"
+      ? "Receita prevista, receita recebida, despesas e linha de resultado por mês."
+      : `Receita prevista, receita recebida, despesas e linha de resultado por dia em ${currentMonthLabel}.`;
+  const comparisonChartResultLabel = chartView === "year" ? "Resultado anual" : "Resultado do mês";
+  const comparisonChartResult = chartView === "year" ? annualResult : monthlyResult;
+  const comparisonChartPeriodLabel = chartView === "year" ? String(now.getFullYear()) : currentMonthLabel;
+  const comparisonChartScale = useMemo(() => {
+    const values = comparisonChartData.flatMap((item) => [item.expected, item.received, item.expense, item.result]);
+    return buildNiceChartScale(values, 5);
+  }, [comparisonChartData]);
+  const comparisonChartTicks = useMemo(() => {
+    return [...comparisonChartScale.ticks]
+      .reverse()
+      .map((tick) => ({
+        value: tick,
+        label: formatCurrencyAxis(tick),
+        top: `${((comparisonChartScale.max - tick) / comparisonChartScale.range) * 100}%`
+      }));
+  }, [comparisonChartScale]);
+  const buildComparisonPoints = (values: number[]) =>
+    values.map((value, index) => ({
+      value,
+      x: values.length === 1 ? 50 : (index / Math.max(1, values.length - 1)) * 100,
+      y: ((comparisonChartScale.max - value) / comparisonChartScale.range) * 100
+    }));
+  const comparisonChartResultPoints = useMemo(
+    () => buildComparisonPoints(comparisonChartData.map((item) => item.result)),
+    [comparisonChartData, comparisonChartScale]
+  );
+  const comparisonChartResultLine = useMemo(
+    () => buildRoundedStepChartPath(comparisonChartResultPoints),
+    [comparisonChartResultPoints]
+  );
+  const comparisonChartGridStyle = useMemo(
+    () => ({
+      gridTemplateColumns: `repeat(${comparisonChartData.length}, minmax(${chartView === "year" ? 42 : 18}px, 1fr))`
+    }),
+    [chartView, comparisonChartData.length]
+  );
+  const comparisonChartCanvasStyle = useMemo(
+    () => (chartView === "month" ? { minWidth: `${Math.max(860, comparisonChartData.length * 28 + 72)}px` } : undefined),
+    [chartView, comparisonChartData.length]
+  );
+  const toComparisonBarStyle = (value: number) => {
+    const safeValue = Number.isFinite(value) ? value : 0;
+    const startValue = Math.min(0, safeValue);
+    const endValue = Math.max(0, safeValue);
+    return {
+      height: `${((endValue - startValue) / comparisonChartScale.range) * 100}%`,
+      bottom: `${((startValue - comparisonChartScale.min) / comparisonChartScale.range) * 100}%`
+    };
+  };
 
   const filteredEntries = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -1952,22 +3085,53 @@ function Finance() {
     });
   }, [entries, searchTerm]);
 
+  const filteredOverviewEntries = useMemo(() => {
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+    return filteredEntries.filter((entry) => {
+      const status = getFinanceStatus(entry);
+      const dueDate = toDateStart(entry.dueDate);
+      const matchesType = entryTypeFilter === "todos" || entry.entryType === entryTypeFilter;
+      const matchesClient = clientFilter === "todos" || entry.client === clientFilter;
+      const matchesStatus = statusFilter === "todos" || status === statusFilter;
+      let matchesPeriod = true;
+
+      if (periodFilter === "this-month") {
+        matchesPeriod = Boolean(
+          dueDate && dueDate.getFullYear() === today.getFullYear() && dueDate.getMonth() === today.getMonth()
+        );
+      } else if (periodFilter === "this-week") {
+        const startOfWeek = new Date(today);
+        const day = startOfWeek.getDay();
+        const diffToMonday = day === 0 ? -6 : 1 - day;
+        startOfWeek.setDate(startOfWeek.getDate() + diffToMonday);
+        const endOfWeek = new Date(startOfWeek);
+        endOfWeek.setDate(endOfWeek.getDate() + 6);
+        matchesPeriod = Boolean(dueDate && dueDate >= startOfWeek && dueDate <= endOfWeek);
+      } else if (periodFilter === "overdue") {
+        matchesPeriod = status === "Vencido";
+      }
+
+      return matchesType && matchesClient && matchesStatus && matchesPeriod;
+    });
+  }, [clientFilter, entryTypeFilter, filteredEntries, now, periodFilter, statusFilter]);
+
   const periodRevenue = useMemo(
     () =>
-      filteredEntries.reduce((sum, entry) => {
+      filteredOverviewEntries.reduce((sum, entry) => {
         if (entry.entryType !== "receita") return sum;
         return sum + entry.amount;
       }, 0),
-    [filteredEntries]
+    [filteredOverviewEntries]
   );
 
   const periodExpense = useMemo(
     () =>
-      filteredEntries.reduce((sum, entry) => {
+      filteredOverviewEntries.reduce((sum, entry) => {
         if (entry.entryType !== "despesa") return sum;
         return sum + entry.amount;
       }, 0),
-    [filteredEntries]
+    [filteredOverviewEntries]
   );
 
   const openRevenueModal = () => {
@@ -1985,49 +3149,189 @@ function Finance() {
     setInlineMessage("Novo contrato ficará integrado ao módulo de Processos na próxima etapa.");
   };
 
-  const handleSaveRevenue = () => {
-    const amount = parseCurrencyBRL(revenueForm.amount);
-    if (!revenueForm.category || amount <= 0) return;
-    const newEntry: FinanceEntry = {
-      id: Date.now(),
-      entryType: "receita",
-      category: revenueForm.category,
-      client: revenueForm.client.trim() || "Não informado",
-      process: revenueForm.process.trim(),
-      amount,
-      dueDate: revenueForm.dueDate || toIsoDateWithOffset(0),
-      paymentDate: revenueForm.paymentDate || undefined,
-      paymentMethod: revenueForm.paymentMethod || undefined,
-      attachmentName: revenueForm.attachmentName || undefined
-    };
-    setEntries((prev) => [newEntry, ...prev]);
-    setRevenueForm(emptyRevenueForm);
-    setShowRevenueModal(false);
+  const openFinanceEntryModal = (entry: FinanceEntry) => {
+    setEntriesError("");
+    setActiveFinanceEntry(entry);
+    setFinanceSettlementForm({
+      paymentDate: entry.paymentDate || toIsoDateWithOffset(0),
+      paymentMethod: entry.paymentMethod || "",
+      paidAmount: formatCurrencyBRL(getFinanceSettledAmount(entry) || entry.amount)
+    });
   };
 
-  const handleSaveExpense = () => {
+  const closeFinanceEntryModal = () => {
+    if (isSavingFinanceEntry || isDeletingFinanceEntry) return;
+    setShowDeleteFinanceConfirm(false);
+    setActiveFinanceEntry(null);
+    setFinanceSettlementForm(emptyFinanceSettlementForm);
+  };
+
+  const handleSaveFinanceEntry = async () => {
+    if (!activeFinanceEntry) return;
+    const paidAmount = parseCurrencyBRL(financeSettlementForm.paidAmount);
+    if (!financeSettlementForm.paymentDate || paidAmount <= 0) return;
+    setIsSavingFinanceEntry(true);
+    setEntriesError("");
+    try {
+      const updated = await apiUpdateFinanceEntry(activeFinanceEntry.id, {
+        payment_date: financeSettlementForm.paymentDate,
+        payment_method: financeSettlementForm.paymentMethod || undefined,
+        paid_amount: paidAmount
+      });
+      setEntries((prev) => prev.map((entry) => (entry.id === updated.id ? toFinanceEntry(updated) : entry)));
+      setActiveFinanceEntry(null);
+      setFinanceSettlementForm(emptyFinanceSettlementForm);
+      setInlineMessage("Lançamento financeiro atualizado.");
+    } catch (err) {
+      setEntriesError(extractApiErrorMessage(err, "Não foi possível atualizar o lançamento financeiro."));
+    } finally {
+      setIsSavingFinanceEntry(false);
+    }
+  };
+
+  const handleRequestDeleteFinanceEntry = () => {
+    setEntriesError("");
+    setShowDeleteFinanceConfirm(true);
+  };
+
+  const handleDeleteFinanceEntry = async () => {
+    if (!activeFinanceEntry) return;
+    setIsDeletingFinanceEntry(true);
+    setEntriesError("");
+    try {
+      await apiDeleteFinanceEntry(activeFinanceEntry.id);
+      setEntries((prev) => prev.filter((entry) => entry.id !== activeFinanceEntry.id));
+      setShowDeleteFinanceConfirm(false);
+      setActiveFinanceEntry(null);
+      setFinanceSettlementForm(emptyFinanceSettlementForm);
+      setInlineMessage("Lançamento financeiro excluído.");
+    } catch (err) {
+      setEntriesError(extractApiErrorMessage(err, "Não foi possível excluir o lançamento financeiro."));
+    } finally {
+      setIsDeletingFinanceEntry(false);
+    }
+  };
+
+  const handleSaveRevenue = async () => {
+    const amount = parseCurrencyBRL(revenueForm.amount);
+    if (!revenueForm.category || amount <= 0) return;
+    const selectedCase = registeredCases.find((item) => item.id === Number(revenueForm.caseId));
+    const selectedClient =
+      registeredClients.find((item) => item.id === Number(revenueForm.clientId)) ||
+      registeredClients.find((item) => item.id === (selectedCase?.client_id ?? -1));
+    setIsSavingRevenue(true);
+    setEntriesError("");
+    try {
+      const created = await apiCreateFinanceEntry({
+        entry_type: "receita",
+        category: revenueForm.category,
+        client_id: selectedClient?.id,
+        case_id: selectedCase?.id,
+        client_name: selectedClient?.name || undefined,
+        case_number: selectedCase?.number || undefined,
+        amount,
+        due_date: revenueForm.dueDate || toIsoDateWithOffset(0),
+        payment_date: revenueForm.paymentDate || undefined,
+        payment_method: revenueForm.paymentMethod || undefined,
+        attachment_name: revenueForm.attachmentName || undefined
+      });
+      setEntries((prev) => [toFinanceEntry(created), ...prev]);
+      setRevenueForm(emptyRevenueForm);
+      setShowRevenueModal(false);
+      setInlineMessage("Receita salva na conta do escritório.");
+    } catch (err) {
+      setEntriesError(extractApiErrorMessage(err, "Não foi possível salvar a receita."));
+    } finally {
+      setIsSavingRevenue(false);
+    }
+  };
+
+  const handleSaveExpense = async () => {
     const amount = parseCurrencyBRL(expenseForm.amount);
     const paidAmount = parseCurrencyBRL(expenseForm.paidAmount);
     if (!expenseForm.expenseType || !expenseForm.category || amount <= 0) return;
     const installments = Number(expenseForm.installments) || 1;
-    const newEntry: FinanceEntry = {
-      id: Date.now(),
-      entryType: "despesa",
-      expenseType: expenseForm.expenseType,
-      category: expenseForm.category,
-      client: expenseForm.client.trim() || "Escritório",
-      process: expenseForm.process.trim(),
-      amount,
-      dueDate: expenseForm.dueDate || toIsoDateWithOffset(0),
-      recurring: expenseForm.recurring,
-      paidAmount: paidAmount > 0 ? paidAmount : undefined,
-      installments,
-      attachmentName: expenseForm.attachmentName || undefined
-    };
-    setEntries((prev) => [newEntry, ...prev]);
-    setExpenseForm(emptyExpenseForm);
-    setShowExpenseModal(false);
+    setIsSavingExpense(true);
+    setEntriesError("");
+    try {
+      const created = await apiCreateFinanceEntry({
+        entry_type: "despesa",
+        expense_type: expenseForm.expenseType,
+        category: expenseForm.category,
+        client_name: expenseForm.client.trim() || "Escritório",
+        case_number: expenseForm.process.trim() || undefined,
+        amount,
+        due_date: expenseForm.dueDate || toIsoDateWithOffset(0),
+        recurring: expenseForm.recurring,
+        paid_amount: paidAmount > 0 ? paidAmount : undefined,
+        installments,
+        attachment_name: expenseForm.attachmentName || undefined
+      });
+      setEntries((prev) => [toFinanceEntry(created), ...prev]);
+      setExpenseForm(emptyExpenseForm);
+      setShowExpenseModal(false);
+      setInlineMessage("Despesa salva na conta do escritório.");
+    } catch (err) {
+      setEntriesError(extractApiErrorMessage(err, "Não foi possível salvar a despesa."));
+    } finally {
+      setIsSavingExpense(false);
+    }
   };
+
+  const handleRevenueClientChange = (clientId: string) => {
+    setRevenueForm((prev) => {
+      const nextCaseId =
+        clientId && prev.caseId
+          ? registeredCases.some((item) => String(item.id) === prev.caseId && String(item.client_id ?? "") === clientId)
+            ? prev.caseId
+            : ""
+          : prev.caseId;
+      return {
+        ...prev,
+        clientId,
+        caseId: nextCaseId
+      };
+    });
+  };
+
+  const handleRevenueCaseChange = (caseId: string) => {
+    const selectedCase = registeredCases.find((item) => String(item.id) === caseId);
+    setRevenueForm((prev) => ({
+      ...prev,
+      caseId,
+      clientId: selectedCase?.client_id ? String(selectedCase.client_id) : prev.clientId
+    }));
+  };
+
+  const handleExportEntries = () => {
+    const header = ["Cliente", "Tipo", "Categoria", "Processo", "Vencimento", "Valor", "Status", "Forma de pagamento"];
+    const rows = filteredOverviewEntries.map((entry) => [
+      entry.client || "-",
+      entry.entryType === "receita" ? "Receita" : `Despesa${entry.expenseType ? ` - ${entry.expenseType}` : ""}`,
+      entry.category,
+      entry.process || "-",
+      formatDatePtBr(entry.dueDate),
+      formatCurrencyBRL(entry.amount),
+      getFinanceStatus(entry),
+      entry.paymentMethod && entry.paymentMethod !== ""
+        ? paymentMethodLabels[entry.paymentMethod as Exclude<FinancePaymentMethod, "">]
+        : "-"
+    ]);
+    const csv = [header, ...rows]
+      .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(";"))
+      .join("\n");
+    const blob = new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `newlaw-financeiro-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const displayedEntries = filteredOverviewEntries.slice(0, 25);
 
   return (
     <div className="content-card page-card finance-page">
@@ -2035,12 +3339,11 @@ function Finance() {
         <div className="page-header finance-header">
           <div>
             <div className="eyebrow">Financeiro</div>
-            <h1 className="page-title">Gerencie receitas, despesas, previsibilidade e inadimplência com visão estratégica.</h1>
           </div>
-          <div className="pill">Atualizado em tempo real</div>
         </div>
 
         {inlineMessage && <div className="finance-inline-note">{inlineMessage}</div>}
+        {entriesError && <div className="error">{entriesError}</div>}
 
         <div className="finance-kpi-grid">
           <article className="finance-kpi-card receita-prevista">
@@ -2080,55 +3383,166 @@ function Finance() {
           </article>
         </div>
 
-        <section className="finance-chart-card">
-          <div className="finance-chart-head">
-            <div className="finance-chart-title">Previsão anual</div>
-            <div className="finance-chart-result">
-              Resultado anual: <strong>{formatCurrencyBRL(annualResult)}</strong>
-            </div>
-          </div>
-
-          <div className="finance-chart-grid">
-            {chartData.map((item) => (
-              <div key={item.label} className="finance-chart-month">
-                <div className="finance-chart-bars">
-                  <span className="bar prevista" style={{ height: toBarHeight(item.expected) }} />
-                  <span className="bar recebida" style={{ height: toBarHeight(item.received) }} />
-                  <span className="bar despesa" style={{ height: toBarHeight(item.expense) }} />
-                </div>
-                <div className="finance-chart-label">{item.label}</div>
+        <div className="finance-charts-grid">
+          <section className="finance-chart-card finance-chart-card-primary">
+            <div className="finance-chart-head">
+              <div>
+                <div className="finance-chart-title">{comparisonChartTitle}</div>
+                <div className="finance-chart-caption">{comparisonChartCaption}</div>
               </div>
-            ))}
-          </div>
+              <div className="finance-chart-head-actions">
+                <div className="finance-chart-meta">
+                  <div className="finance-chart-toggle" aria-label="Selecionar período do gráfico">
+                    {financeChartViewOptions.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={chartView === option.value ? "active" : ""}
+                        aria-pressed={chartView === option.value}
+                        onClick={() => setChartView(option.value)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="finance-chart-period">{comparisonChartPeriodLabel}</span>
+                </div>
+                <div className="finance-chart-result finance-chart-result-strong">
+                  {comparisonChartResultLabel}: <strong>{formatCurrencyBRL(comparisonChartResult)}</strong>
+                </div>
+              </div>
+            </div>
 
-          <div className="finance-chart-legend">
-            <span>
-              <i className="legend-dot prevista" /> Receita prevista
-            </span>
-            <span>
-              <i className="legend-dot recebida" /> Receita recebida
-            </span>
-            <span>
-              <i className="legend-dot despesa" /> Despesas
-            </span>
-          </div>
-        </section>
+            <div className="finance-annual-chart">
+              <div className="finance-chart-scroll">
+                <div className="finance-chart-canvas" style={comparisonChartCanvasStyle}>
+                  <div className="finance-annual-axis">
+                    {comparisonChartTicks.map((tick) => (
+                      <div
+                        key={tick.value}
+                        className={`finance-annual-axis-row ${tick.value === 0 ? "zero" : ""}`}
+                        style={{ top: tick.top }}
+                      >
+                        <span>{tick.label}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <svg className="finance-chart-result-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                    {comparisonChartResultLine && (
+                      <path
+                        className="finance-chart-result-line"
+                        d={comparisonChartResultLine}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    )}
+                    {comparisonChartResultPoints.map((point, index) => (
+                      <circle
+                        key={`result-${comparisonChartData[index]?.key ?? index}`}
+                        className="finance-chart-result-point"
+                        cx={point.x}
+                        cy={point.y}
+                        r="0.56"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    ))}
+                  </svg>
+
+                  <div className="finance-chart-grid" style={comparisonChartGridStyle}>
+                    {comparisonChartData.map((item) => (
+                      <div key={item.key} className="finance-chart-month">
+                        <div className="finance-chart-bars">
+                          <span className="bar-wrap">
+                            <span className="bar prevista" style={toComparisonBarStyle(item.expected)} />
+                          </span>
+                          <span className="bar-wrap">
+                            <span className="bar recebida" style={toComparisonBarStyle(item.received)} />
+                          </span>
+                          <span className="bar-wrap">
+                            <span className="bar despesa" style={toComparisonBarStyle(item.expense)} />
+                          </span>
+                        </div>
+                        <div className="finance-chart-label">{item.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="finance-chart-legend">
+              <span>
+                <i className="legend-dot prevista" /> Receita prevista
+              </span>
+              <span>
+                <i className="legend-dot recebida" /> Receita recebida
+              </span>
+              <span>
+                <i className="legend-dot despesa" /> Despesas
+              </span>
+              <span>
+                <i className="legend-line result" /> Linha de resultado
+              </span>
+            </div>
+          </section>
+        </div>
 
         <section className="finance-table-card">
           <div className="finance-table-head">
             <div>
-              <div className="finance-table-title">Controle Financeiro</div>
-              <div className="finance-table-sub">Exibindo {Math.min(filteredEntries.length, 25)} de {entries.length} lançamentos</div>
+              <div className="finance-table-title">Visão Geral</div>
+              <div className="finance-table-sub">
+                {isLoadingEntries
+                  ? "Carregando lançamentos da conta..."
+                  : `Exibindo ${Math.min(filteredOverviewEntries.length, 25)} de ${filteredOverviewEntries.length} lançamentos`}
+              </div>
             </div>
-            <div className="finance-table-filters">
-              <input
-                placeholder="Pesquisar cliente, categoria, processo ou método"
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-              />
-              <button className="btn secondary small" type="button" onClick={() => setSearchTerm("")}>
-                Limpar
-              </button>
+            <div className="finance-overview-toolbar">
+              <div className="finance-table-filters">
+                <select value={periodFilter} onChange={(event) => setPeriodFilter(event.target.value as FinancePeriodFilter)}>
+                  {financePeriodOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      Período: {option.label}
+                    </option>
+                  ))}
+                </select>
+                <select value={entryTypeFilter} onChange={(event) => setEntryTypeFilter(event.target.value as FinanceEntryType | "todos")}>
+                  <option value="todos">Tipo: Todos</option>
+                  <option value="receita">Tipo: Receitas</option>
+                  <option value="despesa">Tipo: Despesas</option>
+                </select>
+                <select value={clientFilter} onChange={(event) => setClientFilter(event.target.value)}>
+                  <option value="todos">Cliente: Todos</option>
+                  {financeClientOptions.map((client) => (
+                    <option key={client} value={client}>
+                      Cliente: {client}
+                    </option>
+                  ))}
+                </select>
+                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as FinanceStatus | "todos")}>
+                  {financeStatusOptions.map((status) => (
+                    <option key={status} value={status}>
+                      Status: {status === "todos" ? "Todos" : status}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="finance-table-actions">
+                <button className="btn secondary small" type="button" onClick={handleExportEntries}>
+                  Exportar
+                </button>
+                <label className="finance-search-box" aria-label="Pesquisar lançamentos">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="11" cy="11" r="6" />
+                    <path d="M20 20l-4.2-4.2" />
+                  </svg>
+                  <input
+                    placeholder="Pesquisar cliente, categoria ou processo"
+                    value={searchTerm}
+                    onChange={(event) => setSearchTerm(event.target.value)}
+                  />
+                </label>
+              </div>
             </div>
           </div>
 
@@ -2154,12 +3568,16 @@ function Finance() {
                 </tr>
               </thead>
               <tbody>
-                {filteredEntries.length === 0 ? (
+                {isLoadingEntries ? (
+                  <tr>
+                    <td colSpan={9}>Carregando lançamentos...</td>
+                  </tr>
+                ) : displayedEntries.length === 0 ? (
                   <tr>
                     <td colSpan={9}>Nenhum lançamento encontrado.</td>
                   </tr>
                 ) : (
-                  filteredEntries.slice(0, 25).map((entry) => {
+                  displayedEntries.map((entry) => {
                     const status = getFinanceStatus(entry);
                     const statusClass = status
                       .toLowerCase()
@@ -2171,7 +3589,12 @@ function Finance() {
                         ? paymentMethodLabels[entry.paymentMethod as Exclude<FinancePaymentMethod, "">]
                         : "-";
                     return (
-                      <tr key={entry.id}>
+                      <tr
+                        key={entry.id}
+                        className="finance-table-row-actionable"
+                        onDoubleClick={() => openFinanceEntryModal(entry)}
+                        title="Clique duas vezes para editar o lançamento"
+                      >
                         <td>{entry.client || "-"}</td>
                         <td>{entry.entryType === "receita" ? "Receita" : `Despesa${entry.expenseType ? ` · ${entry.expenseType}` : ""}`}</td>
                         <td>{entry.category}</td>
@@ -2183,7 +3606,13 @@ function Finance() {
                         </td>
                         <td>{paymentLabel}</td>
                         <td>
-                          <button className="finance-row-action" type="button" aria-label="Ações do lançamento">
+                          <button
+                            className="finance-row-action"
+                            type="button"
+                            onClick={() => openFinanceEntryModal(entry)}
+                            aria-label="Abrir lançamento financeiro"
+                            title="Abrir lançamento"
+                          >
                             ...
                           </button>
                         </td>
@@ -2230,6 +3659,7 @@ function Finance() {
                 className="icon-btn"
                 type="button"
                 onClick={() => {
+                  if (isSavingRevenue) return;
                   setShowRevenueModal(false);
                   setRevenueForm(emptyRevenueForm);
                 }}
@@ -2238,7 +3668,8 @@ function Finance() {
                 ×
               </button>
             </div>
-            <div className="modal-note">Campos obrigatórios: Categoria e Valor.</div>
+            {revenueLinksError && <div className="error">{revenueLinksError}</div>}
+            {entriesError && <div className="error">{entriesError}</div>}
             <div className="modal-grid finance-form-grid">
               <div className="field">
                 <label>
@@ -2257,20 +3688,44 @@ function Finance() {
                 </select>
               </div>
               <div className="field">
-                <label>Cliente/pessoa</label>
-                <input
-                  value={revenueForm.client}
-                  onChange={(event) => setRevenueForm((prev) => ({ ...prev, client: event.target.value }))}
-                  placeholder="Campo pesquisável"
-                />
+                <label>Pessoa/cliente cadastrado</label>
+                <select
+                  value={revenueForm.clientId}
+                  onChange={(event) => handleRevenueClientChange(event.target.value)}
+                  disabled={isLoadingRevenueLinks}
+                >
+                  <option value="">{isLoadingRevenueLinks ? "Carregando..." : "Selecione"}</option>
+                  {sortedRevenueClients.map((client) => (
+                    <option key={client.id} value={client.id}>
+                      {client.name}
+                    </option>
+                  ))}
+                </select>
+                {!isLoadingRevenueLinks && sortedRevenueClients.length === 0 && (
+                  <div className="field-hint">Cadastre uma pessoa/cliente na aba Pessoas para vincular a receita.</div>
+                )}
               </div>
               <div className="field">
-                <label>Processo</label>
-                <input
-                  value={revenueForm.process}
-                  onChange={(event) => setRevenueForm((prev) => ({ ...prev, process: event.target.value }))}
-                  placeholder="Número do processo"
-                />
+                <label>Processo cadastrado</label>
+                <select
+                  value={revenueForm.caseId}
+                  onChange={(event) => handleRevenueCaseChange(event.target.value)}
+                  disabled={isLoadingRevenueLinks || filteredRevenueCases.length === 0}
+                >
+                  <option value="">
+                    {isLoadingRevenueLinks
+                      ? "Carregando..."
+                      : filteredRevenueCases.length === 0
+                        ? "Nenhum processo disponível"
+                        : "Selecione"}
+                  </option>
+                  {filteredRevenueCases.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.number}
+                      {item.client_id && clientsById[item.client_id] ? ` · ${clientsById[item.client_id].name}` : ""}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="field">
                 <label>
@@ -2334,9 +3789,11 @@ function Finance() {
                 className="btn ghost"
                 type="button"
                 onClick={() => {
+                  if (isSavingRevenue) return;
                   setShowRevenueModal(false);
                   setRevenueForm(emptyRevenueForm);
                 }}
+                disabled={isSavingRevenue}
               >
                 Cancelar
               </button>
@@ -2344,9 +3801,9 @@ function Finance() {
                 className="btn"
                 type="button"
                 onClick={handleSaveRevenue}
-                disabled={!revenueForm.category || parseCurrencyBRL(revenueForm.amount) <= 0}
+                disabled={!revenueForm.category || parseCurrencyBRL(revenueForm.amount) <= 0 || isSavingRevenue}
               >
-                Salvar receita
+                {isSavingRevenue ? "Salvando..." : "Salvar receita"}
               </button>
             </div>
           </div>
@@ -2362,6 +3819,7 @@ function Finance() {
                 className="icon-btn"
                 type="button"
                 onClick={() => {
+                  if (isSavingExpense) return;
                   setShowExpenseModal(false);
                   setExpenseForm(emptyExpenseForm);
                 }}
@@ -2370,6 +3828,7 @@ function Finance() {
                 ×
               </button>
             </div>
+            {entriesError && <div className="error">{entriesError}</div>}
             <div className="modal-note">Campos obrigatórios: Tipo, Categoria e Valor.</div>
             <div className="modal-grid finance-form-grid">
               <div className="field">
@@ -2497,9 +3956,11 @@ function Finance() {
                 className="btn ghost"
                 type="button"
                 onClick={() => {
+                  if (isSavingExpense) return;
                   setShowExpenseModal(false);
                   setExpenseForm(emptyExpenseForm);
                 }}
+                disabled={isSavingExpense}
               >
                 Cancelar
               </button>
@@ -2507,14 +3968,142 @@ function Finance() {
                 className="btn"
                 type="button"
                 onClick={handleSaveExpense}
-                disabled={!expenseForm.expenseType || !expenseForm.category || parseCurrencyBRL(expenseForm.amount) <= 0}
+                disabled={!expenseForm.expenseType || !expenseForm.category || parseCurrencyBRL(expenseForm.amount) <= 0 || isSavingExpense}
               >
-                Salvar despesa
+                {isSavingExpense ? "Salvando..." : "Salvar despesa"}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      {activeFinanceEntry && (
+        <div className="modal-backdrop">
+          <div className="modal-card finance-modal-card">
+            <div className="modal-head">
+              <h2 className="modal-title">
+                {activeFinanceEntry.entryType === "receita" ? "Atualizar recebimento" : "Atualizar pagamento"}
+              </h2>
+              <button
+                className="icon-btn"
+                type="button"
+                onClick={closeFinanceEntryModal}
+                aria-label="Fechar"
+              >
+                ×
+              </button>
+            </div>
+            {entriesError && <div className="error">{entriesError}</div>}
+            <div className="finance-entry-summary">
+              <div>
+                <strong>{activeFinanceEntry.client || "Sem cliente"}</strong>
+                <span>{activeFinanceEntry.category}</span>
+              </div>
+              <div>
+                <strong>{formatCurrencyBRL(activeFinanceEntry.amount)}</strong>
+                <span>Vencimento {formatDatePtBr(activeFinanceEntry.dueDate)}</span>
+              </div>
+            </div>
+            <div className="modal-grid finance-form-grid">
+              <div className="field">
+                <label>
+                  Valor pago <span className="required">*</span>
+                </label>
+                <input
+                  value={financeSettlementForm.paidAmount}
+                  onChange={(event) =>
+                    setFinanceSettlementForm((prev) => ({
+                      ...prev,
+                      paidAmount: formatCurrencyInputBRL(event.target.value)
+                    }))
+                  }
+                  inputMode="numeric"
+                  placeholder="R$ 0,00"
+                />
+              </div>
+              <div className="field">
+                <label>
+                  Data do pagamento <span className="required">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={financeSettlementForm.paymentDate}
+                  onChange={(event) =>
+                    setFinanceSettlementForm((prev) => ({
+                      ...prev,
+                      paymentDate: event.target.value
+                    }))
+                  }
+                />
+              </div>
+              <div className="field span-2">
+                <label>Forma de pagamento</label>
+                <select
+                  value={financeSettlementForm.paymentMethod}
+                  onChange={(event) =>
+                    setFinanceSettlementForm((prev) => ({
+                      ...prev,
+                      paymentMethod: event.target.value as FinancePaymentMethod
+                    }))
+                  }
+                >
+                  <option value="">Selecione</option>
+                  {paymentMethodOptions.map((method) => (
+                    <option key={method.value} value={method.value}>
+                      {method.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={closeFinanceEntryModal}
+                disabled={isSavingFinanceEntry || isDeletingFinanceEntry}
+              >
+                Cancelar
+              </button>
+              <button
+                className="btn danger"
+                type="button"
+                onClick={handleRequestDeleteFinanceEntry}
+                disabled={isSavingFinanceEntry || isDeletingFinanceEntry}
+              >
+                {isDeletingFinanceEntry ? "Excluindo..." : "Excluir"}
+              </button>
+              <button
+                className="btn"
+                type="button"
+                onClick={handleSaveFinanceEntry}
+                disabled={
+                  !financeSettlementForm.paymentDate ||
+                  parseCurrencyBRL(financeSettlementForm.paidAmount) <= 0 ||
+                  isSavingFinanceEntry ||
+                  isDeletingFinanceEntry
+                }
+              >
+                {isSavingFinanceEntry ? "Salvando..." : "Salvar atualização"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDeleteModal
+        open={showDeleteFinanceConfirm && activeFinanceEntry !== null}
+        title="Excluir lançamento financeiro"
+        message="Esse lançamento será removido do Financeiro para toda a equipe."
+        confirmLabel="Excluir lançamento"
+        busy={isDeletingFinanceEntry}
+        errorMessage={entriesError}
+        onCancel={() => {
+          if (isDeletingFinanceEntry) return;
+          setShowDeleteFinanceConfirm(false);
+        }}
+        onConfirm={handleDeleteFinanceEntry}
+      />
     </div>
   );
 }
@@ -3269,11 +4858,17 @@ function Cases() {
   const [detailKey, setDetailKey] = useState<ProcessDetailKey>("area");
   const [caseRows, setCaseRows] = useState<CaseRow[]>([]);
   const [clientsById, setClientsById] = useState<Map<number, string>>(new Map());
+  const [registeredClients, setRegisteredClients] = useState<ApiClient[]>([]);
   const [wallets, setWallets] = useState<ApiWallet[]>([]);
   const [isLoadingCases, setIsLoadingCases] = useState(true);
   const [casesError, setCasesError] = useState("");
+  const [createCaseForm, setCreateCaseForm] = useState<CaseForm>(emptyCaseForm);
+  const [createClientSearch, setCreateClientSearch] = useState("");
+  const [selectedCreateClientId, setSelectedCreateClientId] = useState<number | null>(null);
+  const [isSavingCase, setIsSavingCase] = useState(false);
+  const [saveCaseError, setSaveCaseError] = useState("");
   const [showEditCase, setShowEditCase] = useState(false);
-  const [editCaseForm, setEditCaseForm] = useState(emptyCaseForm);
+  const [editCaseForm, setEditCaseForm] = useState<CaseForm>(emptyCaseForm);
   const [editCaseId, setEditCaseId] = useState<number | null>(null);
   const [isUpdatingCase, setIsUpdatingCase] = useState(false);
   const [updateCaseError, setUpdateCaseError] = useState("");
@@ -3293,6 +4888,7 @@ function Cases() {
         clients.forEach((client) => {
           clientsById.set(client.id, client.name);
         });
+        setRegisteredClients(clients);
         setClientsById(clientsById);
         setWallets(walletData);
         const mapped = cases.map((entry) => toCaseRow(entry, clientsById));
@@ -3345,6 +4941,21 @@ function Cases() {
     });
   }, [searchTerm, caseRows]);
 
+  const selectedCreateClient =
+    registeredClients.find((client) => client.id === selectedCreateClientId) ?? null;
+  const filteredCreateClients = useMemo(() => {
+    const term = createClientSearch.trim().toLowerCase();
+    const source = !term
+      ? registeredClients
+      : registeredClients.filter((client) =>
+          `${client.name} ${client.document || ""}`.toLowerCase().includes(term)
+        );
+    return source.slice(0, 8);
+  }, [registeredClients, createClientSearch]);
+  const shouldShowCreateClientResults =
+    filteredCreateClients.length > 0 &&
+    (!selectedCreateClient ||
+      createClientSearch.trim().toLowerCase() !== selectedCreateClient.name.trim().toLowerCase());
   const selectedCase = caseRows.find((row) => row.id === activeCaseId) ?? caseRows[0] ?? null;
 
   const detailSections: { id: ProcessDetailKey; title: string; description?: string; items?: string[] }[] = [
@@ -3423,11 +5034,60 @@ function Cases() {
     setView("detail");
   };
 
+  const resetCreateCaseState = () => {
+    setCreateCaseForm(emptyCaseForm);
+    setCreateClientSearch("");
+    setSelectedCreateClientId(null);
+    setSaveCaseError("");
+  };
+
+  const handleSelectCreateClient = (client: ApiClient) => {
+    setSelectedCreateClientId(client.id);
+    setCreateClientSearch(client.name);
+    setSaveCaseError("");
+  };
+
+  const handleCreateCase = async () => {
+    if (!selectedCreateClient) {
+      setSaveCaseError("Selecione um cliente para cadastrar o processo.");
+      return;
+    }
+    const validationMessage = getCaseFormValidationMessage(createCaseForm);
+    if (validationMessage) {
+      setSaveCaseError(validationMessage);
+      return;
+    }
+    setIsSavingCase(true);
+    setSaveCaseError("");
+    try {
+      const counterparty = createCaseForm.counterparty.trim() || "Parte contrária";
+      const formattedProcess = formatCaseNumber(createCaseForm.process);
+      const created = await apiCreateCase({
+        number: formattedProcess,
+        title: `${selectedCreateClient.name} x ${counterparty}`,
+        client_id: selectedCreateClient.id,
+        wallet_id: createCaseForm.walletId ? Number(createCaseForm.walletId) : undefined,
+        status: "aberto",
+        forum: createCaseForm.region.trim() || undefined,
+        court: createCaseForm.court.trim() || undefined
+      });
+      const createdRow = toCaseRow(created, clientsById);
+      setCaseRows((prev) => [createdRow, ...prev]);
+      setActiveCaseId(createdRow.id);
+      resetCreateCaseState();
+      setView("detail");
+    } catch (err) {
+      setSaveCaseError(extractApiErrorMessage(err, "Não foi possível salvar o processo na API."));
+    } finally {
+      setIsSavingCase(false);
+    }
+  };
+
   const handleStartEditCase = () => {
     if (!selectedCase) return;
     setEditCaseId(selectedCase.id);
     setEditCaseForm({
-      process: selectedCase.number || "",
+      process: formatCaseNumber(selectedCase.number || ""),
       walletId: selectedCase.walletId ? String(selectedCase.walletId) : "",
       court: selectedCase.action === "Ação judicial" ? "" : selectedCase.action,
       region: selectedCase.forum === "-" ? "" : selectedCase.forum,
@@ -3443,12 +5103,18 @@ function Cases() {
   };
 
   const handleUpdateCase = async () => {
-    if (!selectedCase || !editCaseId || !editCaseForm.process.trim()) return;
+    if (!selectedCase || !editCaseId) return;
+    const validationMessage = getCaseFormValidationMessage(editCaseForm);
+    if (validationMessage) {
+      setUpdateCaseError(validationMessage);
+      return;
+    }
     setIsUpdatingCase(true);
     setUpdateCaseError("");
     try {
+      const formattedProcess = formatCaseNumber(editCaseForm.process);
       const payload = {
-        number: editCaseForm.process.trim(),
+        number: formattedProcess,
         title: `${selectedCase.client} x ${editCaseForm.counterparty.trim() || "Parte contrária"}`,
         client_id: selectedCase.clientId,
         wallet_id: editCaseForm.walletId ? Number(editCaseForm.walletId) : undefined,
@@ -3481,6 +5147,17 @@ function Cases() {
     setIsDeletingCase(true);
     setDeleteCaseError("");
     try {
+      if (selectedCase.walletId && !isLocalApiBaseUrl(baseURL)) {
+        await apiUpdateCase(selectedCase.id, {
+          number: selectedCase.number,
+          title: selectedCase.title,
+          client_id: selectedCase.clientId,
+          status: selectedCase.rawStatus || "aberto",
+          forum: selectedCase.forum === "-" ? undefined : selectedCase.forum,
+          court: selectedCase.action === "Ação judicial" ? undefined : selectedCase.action,
+          wallet_id: undefined
+        });
+      }
       await apiDeleteCase(selectedCase.id);
       setCaseRows((prev) => prev.filter((row) => row.id !== selectedCase.id));
       setShowDeleteCaseConfirm(false);
@@ -3682,12 +5359,114 @@ function Cases() {
           {view === "create" && (
             <div className="processes-create">
               <div className="processes-create-card">
-                <div className="processes-eyebrow">Cadastro</div>
-                <h2>Novo processo</h2>
-                <p>Escolha um cliente, informe dados basicos e salve para acompanhamento automatico.</p>
-                <button className="btn" type="button" onClick={() => setView("dashboard")}>
-                  Voltar ao resumo
-                </button>
+                <div className="processes-create-head">
+                  <div>
+                    <div className="processes-eyebrow">Cadastro</div>
+                    <h2>Novo processo</h2>
+                    <p>Busque o cliente, preencha os dados do processo e salve sem passar pela aba Pessoas.</p>
+                  </div>
+                  <button className="btn ghost small" type="button" onClick={() => setView("dashboard")}>
+                    Voltar ao resumo
+                  </button>
+                </div>
+
+                <div className="field span-2">
+                  <label>
+                    Buscar cliente <span className="required">*</span>
+                  </label>
+                  <input
+                    value={createClientSearch}
+                    onChange={(event) => {
+                      const nextValue = event.target.value;
+                      const selectedClientName = selectedCreateClient?.name.trim().toLowerCase() || "";
+                      if (selectedCreateClient && nextValue.trim().toLowerCase() !== selectedClientName) {
+                        setSelectedCreateClientId(null);
+                      }
+                      if (saveCaseError) setSaveCaseError("");
+                      setCreateClientSearch(nextValue);
+                    }}
+                    placeholder="Digite nome ou documento do cliente"
+                  />
+                </div>
+
+                {selectedCreateClient ? (
+                  <div className="processes-selected-client">
+                    <div>
+                      <strong>{selectedCreateClient.name}</strong>
+                      <span>{selectedCreateClient.document || "Sem documento cadastrado"}</span>
+                    </div>
+                    <button
+                      className="btn ghost small"
+                      type="button"
+                      onClick={() => {
+                        setSelectedCreateClientId(null);
+                        setCreateClientSearch("");
+                      }}
+                    >
+                      Trocar cliente
+                    </button>
+                  </div>
+                ) : (
+                  <div className="field-hint">Selecione um cliente antes de salvar o processo.</div>
+                )}
+
+                {shouldShowCreateClientResults && (
+                  <div className="processes-client-results" role="listbox" aria-label="Clientes encontrados">
+                    {filteredCreateClients.map((client) => (
+                      <button
+                        key={client.id}
+                        type="button"
+                        className="processes-client-option"
+                        onClick={() => handleSelectCreateClient(client)}
+                      >
+                        <strong>{client.name}</strong>
+                        <span>{client.document || "Documento não informado"}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!selectedCreateClient && !registeredClients.length && (
+                  <div className="field-hint">
+                    {isLoadingCases
+                      ? "Carregando clientes cadastrados..."
+                      : "Nenhum cliente cadastrado. Cadastre o cliente na aba Pessoas e volte aqui."}
+                  </div>
+                )}
+                {!!createClientSearch.trim() && !filteredCreateClients.length && (
+                  <div className="field-hint">Nenhum cliente encontrado para essa busca.</div>
+                )}
+
+                <ProcessFormFields
+                  form={createCaseForm}
+                  wallets={wallets}
+                  onChange={(key, value) => {
+                    if (saveCaseError) setSaveCaseError("");
+                    setCreateCaseForm((prev) => ({ ...prev, [key]: value }));
+                  }}
+                />
+
+                {saveCaseError && <div className="error">{saveCaseError}</div>}
+                <div className="modal-actions">
+                  <button
+                    className="btn ghost"
+                    type="button"
+                    onClick={() => {
+                      if (isSavingCase) return;
+                      resetCreateCaseState();
+                    }}
+                    disabled={isSavingCase}
+                  >
+                    Limpar
+                  </button>
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={handleCreateCase}
+                    disabled={isSavingCase || !selectedCreateClient || !!getCaseFormValidationMessage(createCaseForm)}
+                  >
+                    {isSavingCase ? "Salvando..." : "Salvar processo"}
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -4110,6 +5889,36 @@ const buildEmptyTeamForm = () => ({
   isActive: true
 });
 
+type TeamForm = ReturnType<typeof buildEmptyTeamForm>;
+
+const getTeamFormValidationMessage = (form: TeamForm) => {
+  if (!form.fullName.trim()) {
+    return "Informe o nome completo do membro.";
+  }
+  if (!form.email.trim()) {
+    return "Informe o email do membro.";
+  }
+  if (!form.cpf.trim()) {
+    return "Informe o CPF do membro.";
+  }
+  if (!isValidCpf(form.cpf)) {
+    return "Informe um CPF válido.";
+  }
+  if (!form.oab.trim()) {
+    return "Informe a OAB do membro.";
+  }
+  if (!form.roleTitle.trim()) {
+    return "Informe o cargo do membro.";
+  }
+  if (!form.teamName.trim()) {
+    return "Informe a equipe do membro.";
+  }
+  if (form.allowedNavKeys.length === 0) {
+    return "Selecione ao menos um acesso para o membro.";
+  }
+  return "";
+};
+
 function Team({ canManage }: { canManage: boolean }) {
   type TeamView = "dashboard" | "list" | "create";
   const [view, setView] = useState<TeamView>("dashboard");
@@ -4159,21 +5968,6 @@ function Team({ canManage }: { canManage: boolean }) {
     }
   }, [canManage, view]);
 
-  const normalizeCpfDigits = (value: string) => value.replace(/\D/g, "").slice(0, 11);
-
-  const formatCpf = (value: string) => {
-    const digits = normalizeCpfDigits(value);
-    const parts = [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6, 9), digits.slice(9, 11)];
-    if (digits.length <= 3) return parts[0];
-    if (digits.length <= 6) return `${parts[0]}.${parts[1]}`;
-    if (digits.length <= 9) return `${parts[0]}.${parts[1]}.${parts[2]}`;
-    return `${parts[0]}.${parts[1]}.${parts[2]}-${parts[3]}`;
-  };
-
-  const formatCpfFromDigits = (digitsValue: string) => {
-    return formatCpf(digitsValue.replace(/\D/g, ""));
-  };
-
   const formatPhone = (value: string) => {
     const digits = value.replace(/\D/g, "").slice(0, 11);
     if (digits.length <= 2) return digits;
@@ -4201,15 +5995,8 @@ function Team({ canManage }: { canManage: boolean }) {
   const userLimit = capacity?.user_limit ?? null;
   const availableSlots = capacity?.available_slots ?? null;
   const limitReached = typeof availableSlots === "number" && availableSlots <= 0;
-
-  const requiredMissing =
-    !form.fullName.trim() ||
-    !form.email.trim() ||
-    normalizeCpfDigits(form.cpf).length !== 11 ||
-    !form.oab.trim() ||
-    !form.roleTitle.trim() ||
-    !form.teamName.trim() ||
-    form.allowedNavKeys.length === 0;
+  const teamValidationMessage = getTeamFormValidationMessage(form);
+  const cpfInvalid = form.cpf.trim().length > 0 && !isValidCpf(form.cpf);
   const createBlockedByLimit = !editingId && form.isActive && limitReached;
 
   const refreshCapacity = async () => {
@@ -4264,7 +6051,11 @@ function Team({ canManage }: { canManage: boolean }) {
       setSaveError("Você não tem permissão para cadastrar membros.");
       return;
     }
-    if (requiredMissing || createBlockedByLimit) return;
+    if (teamValidationMessage) {
+      setSaveError(teamValidationMessage);
+      return;
+    }
+    if (createBlockedByLimit) return;
     setIsSaving(true);
     setSaveError("");
     setSaveSuccess("");
@@ -4525,6 +6316,7 @@ function Team({ canManage }: { canManage: boolean }) {
                   onChange={(event) => setForm((prev) => ({ ...prev, cpf: formatCpf(event.target.value) }))}
                   inputMode="numeric"
                 />
+                {cpfInvalid && <div className="error-inline">Informe um CPF válido.</div>}
               </div>
               <div className="field">
                 <label>OAB *</label>
@@ -4592,7 +6384,7 @@ function Team({ canManage }: { canManage: boolean }) {
               >
                 Cancelar
               </button>
-              <button className="btn" type="button" onClick={handleSaveMember} disabled={requiredMissing || isSaving || createBlockedByLimit}>
+              <button className="btn" type="button" onClick={handleSaveMember} disabled={!!teamValidationMessage || isSaving || createBlockedByLimit}>
                 {isSaving ? "Salvando..." : editingId ? "Salvar alterações" : "Salvar membro"}
               </button>
             </div>
@@ -4622,10 +6414,14 @@ function Team({ canManage }: { canManage: boolean }) {
 function Settings({
   theme,
   onThemeChange,
+  textScaleIndex,
+  onTextScaleChange,
   onLogout
 }: {
   theme: ThemeMode;
   onThemeChange: (value: ThemeMode) => void;
+  textScaleIndex: number;
+  onTextScaleChange: (value: number) => void;
   onLogout: () => void;
 }) {
   const runningInTauri = typeof window !== "undefined" && isTauri();
@@ -4643,6 +6439,7 @@ function Settings({
   const [syncingProvider, setSyncingProvider] = useState<CalendarProvider | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<CalendarProvider | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
+  const currentTextScale = textScaleOptions[clampTextScaleIndex(textScaleIndex)] ?? textScaleOptions[0];
 
   useEffect(() => {
     if (!runningInTauri) {
@@ -4928,6 +6725,42 @@ function Settings({
           <div className="settings-note">Paleta aplicada: branco + azul #0f1e3f.</div>
         </div>
         <div className="settings-card">
+          <div className="settings-row settings-row-scale">
+            <div>
+              <div className="settings-title">Tamanho do texto</div>
+              <div className="settings-sub">Ajuste a leitura do aplicativo sem reiniciar.</div>
+            </div>
+            <div className="settings-scale-box">
+              <div className="settings-scale-current">{currentTextScale.label}</div>
+              <input
+                className="settings-scale-range"
+                type="range"
+                min={0}
+                max={textScaleOptions.length - 1}
+                step={1}
+                value={textScaleIndex}
+                onChange={(event) => onTextScaleChange(clampTextScaleIndex(Number(event.target.value)))}
+                aria-label="Tamanho do texto"
+                style={{
+                  background: `linear-gradient(90deg, var(--accent) 0%, var(--accent) ${
+                    (textScaleIndex / (textScaleOptions.length - 1)) * 100
+                  }%, var(--panel-strong) ${(textScaleIndex / (textScaleOptions.length - 1)) * 100}%, var(--panel-strong) 100%)`
+                }}
+              />
+              <div className="settings-scale-markers" aria-hidden="true">
+                {textScaleOptions.map((option, index) => (
+                  <span key={option.label} className={`settings-scale-marker ${index <= textScaleIndex ? "active" : ""}`} />
+                ))}
+              </div>
+              <div className="settings-scale-labels">
+                <span>Normal</span>
+                <span>Grande</span>
+              </div>
+            </div>
+          </div>
+          <div className="settings-note">Preferência salva neste computador e aplicada em toda a interface.</div>
+        </div>
+        <div className="settings-card">
           <div className="settings-row">
             <div>
               <div className="settings-title">Sessão</div>
@@ -5053,6 +6886,14 @@ function App() {
     const stored = window.localStorage.getItem("newlaw-theme");
     return stored === "light" || stored === "dark" ? stored : "dark";
   });
+  const [textScaleIndex, setTextScaleIndex] = useState<number>(() => {
+    if (typeof window === "undefined") return 0;
+    const stored = Number(window.localStorage.getItem("newlaw-text-scale-index"));
+    return Number.isFinite(stored) ? clampTextScaleIndex(stored) : 0;
+  });
+  const textScale = textScaleOptions[clampTextScaleIndex(textScaleIndex)]?.value ?? 1;
+  const runningInTauri = typeof window !== "undefined" && isTauri();
+  const usesLocalDesktopApi = runningInTauri && baseURL === LOCAL_API_BASE_URL;
 
   useEffect(() => {
     const session = loadAuthSession();
@@ -5065,6 +6906,38 @@ function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("newlaw-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--newlaw-text-scale", String(textScale));
+    window.localStorage.setItem("newlaw-text-scale-index", String(clampTextScaleIndex(textScaleIndex)));
+  }, [textScale, textScaleIndex]);
+
+  useEffect(() => {
+    if (!usesLocalDesktopApi) return;
+    let cancelled = false;
+    const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+    const ensureLocalBackend = async () => {
+      try {
+        await invoke("start_backend");
+      } catch {
+        // If the backend is already running or startup fails, the ping loop below confirms connectivity.
+      }
+      for (let attempt = 0; attempt < 12 && !cancelled; attempt += 1) {
+        try {
+          await ping();
+          if (!cancelled) setApiStatus("ok");
+          return;
+        } catch {
+          if (attempt < 11) await wait(350);
+        }
+      }
+      if (!cancelled) setApiStatus("error");
+    };
+    void ensureLocalBackend();
+    return () => {
+      cancelled = true;
+    };
+  }, [usesLocalDesktopApi]);
 
   const navListRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLElement | null>(null);
@@ -5123,8 +6996,7 @@ function App() {
       setUser(data.user);
       saveAuthSession({ accessToken: data.access_token, refreshToken: data.refresh_token, user: data.user });
     } catch (err) {
-      const message = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setAuthError(message || "Login inválido.");
+      setAuthError(extractApiErrorMessage(err, "Login inválido."));
     } finally {
       setAuthBusy(false);
     }
@@ -5132,11 +7004,13 @@ function App() {
 
   const handlePing = async () => {
     setApiStatus("checking");
+    setAuthError("");
     try {
       await ping();
       setApiStatus("ok");
-    } catch {
+    } catch (err) {
       setApiStatus("error");
+      setAuthError(extractApiErrorMessage(err, "Não foi possível conectar à API."));
     }
   };
 
@@ -5198,7 +7072,15 @@ function App() {
       case "official":
         return <Publications />;
       case "settings":
-        return <Settings theme={theme} onThemeChange={setTheme} onLogout={handleLogout} />;
+        return (
+          <Settings
+            theme={theme}
+            onThemeChange={setTheme}
+            textScaleIndex={textScaleIndex}
+            onTextScaleChange={setTextScaleIndex}
+            onLogout={handleLogout}
+          />
+        );
       case "finance":
       case "billing":
         return <Finance />;
@@ -5208,9 +7090,10 @@ function App() {
       case "reports":
       case "stats":
       case "progress":
-      case "files":
       case "templates":
         return <Placeholder title={navItems.find((n) => n.key === activeNav)?.label || "Em breve"} />;
+      case "files":
+        return <Files />;
       default:
         return <Placeholder title="Dashboard" />;
     }

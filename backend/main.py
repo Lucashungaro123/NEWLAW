@@ -24,9 +24,9 @@ from urllib.request import urlopen
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -38,9 +38,11 @@ from .models import (
     AgendaDeadline,
     CalendarConnection,
     Case,
+    ClientDocument,
     CaseWallet,
     Client,
     ExternalCalendarEvent,
+    FinancialEntry,
     Invoice,
     Organization,
     Plan,
@@ -75,7 +77,7 @@ SMTP_PASSWORD = os.getenv("NEWLAW_SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.getenv("NEWLAW_SMTP_FROM_EMAIL", SMTP_USERNAME or "no-reply@newlaw.app.br")
 SMTP_FROM_NAME = os.getenv("NEWLAW_SMTP_FROM_NAME", "NEWLAW")
 SMTP_STARTTLS = os.getenv("NEWLAW_SMTP_STARTTLS", "1") == "1"
-CALENDAR_REDIRECT_URI = os.getenv("NEWLAW_CALENDAR_REDIRECT_URI", "http://127.0.0.1:8000/calendar/oauth/callback")
+CALENDAR_REDIRECT_URI = os.getenv("NEWLAW_CALENDAR_REDIRECT_URI", "").strip()
 CALENDAR_TOKEN_KEY = os.getenv("NEWLAW_CALENDAR_TOKEN_KEY", "")
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("NEWLAW_GOOGLE_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("NEWLAW_GOOGLE_CLIENT_SECRET", "")
@@ -107,6 +109,12 @@ NAV_PERMISSION_KEYS = (
 ADMIN_REQUIRED_NAV_KEYS = ("team", "wallets")
 ADMIN_ROLES = {"superadmin", "owner", "admin"}
 CALENDAR_PROVIDERS = ("google", "microsoft")
+FINANCE_ENTRY_TYPES = ("receita", "despesa")
+FINANCE_PAYMENT_METHODS = ("pix", "boleto", "cartao", "dinheiro", "transferencia")
+FINANCE_RECURRING_OPTIONS = ("nao-recorrente", "mensal", "anual", "personalizado")
+CASE_NUMBER_PATTERN = re.compile(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$")
+FILES_MAX_UPLOAD_BYTES = int(os.getenv("NEWLAW_FILES_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+FILES_ALLOWED_CONTENT_TYPES = ("application/pdf", "application/x-pdf", "application/octet-stream")
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -221,6 +229,12 @@ def get_effective_user_nav_keys(user: User) -> list[str]:
     if user.role in ADMIN_ROLES:
         return list(NAV_PERMISSION_KEYS)
     return normalize_nav_keys(parse_nav_keys(user.allowed_nav_keys), is_admin=bool(user.is_team_admin))
+
+
+def ensure_nav_access(user: User, nav_key: str) -> None:
+    if nav_key in get_effective_user_nav_keys(user):
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem acesso a este módulo")
 
 
 def serialize_auth_user(user: User) -> dict:
@@ -485,12 +499,25 @@ def get_calendar_provider_credentials(provider: str) -> tuple[str, str]:
     return client_id, client_secret
 
 
-def build_calendar_oauth_url(provider: str, state: str) -> str:
+def resolve_calendar_redirect_uri(request: Request) -> str:
+    if CALENDAR_REDIRECT_URI:
+        return CALENDAR_REDIRECT_URI
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
+    forwarded_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).split(",")[0].strip()
+    if not forwarded_proto or not forwarded_host:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível determinar a URL de retorno do calendário.",
+        )
+    return f"{forwarded_proto}://{forwarded_host}/calendar/oauth/callback"
+
+
+def build_calendar_oauth_url(provider: str, state: str, redirect_uri: str) -> str:
     client_id, _ = get_calendar_provider_credentials(provider)
     if provider == "google":
         params = {
             "client_id": client_id,
-            "redirect_uri": CALENDAR_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email openid",
             "access_type": "offline",
@@ -500,7 +527,7 @@ def build_calendar_oauth_url(provider: str, state: str) -> str:
         return f"{GOOGLE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
     params = {
         "client_id": client_id,
-        "redirect_uri": CALENDAR_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
         "response_mode": "query",
         "scope": "offline_access Calendars.Read User.Read",
@@ -510,7 +537,7 @@ def build_calendar_oauth_url(provider: str, state: str) -> str:
     return f"{MICROSOFT_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
 
 
-def register_calendar_oauth_state(user: User, provider: str) -> tuple[str, int]:
+def register_calendar_oauth_state(user: User, provider: str, redirect_uri: str) -> tuple[str, int]:
     if user.id is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
     cleanup_expired_oauth_states()
@@ -519,6 +546,7 @@ def register_calendar_oauth_state(user: User, provider: str) -> tuple[str, int]:
     PENDING_OAUTH_STATES[state] = {
         "user_id": user.id,
         "provider": provider,
+        "redirect_uri": redirect_uri,
         "expires_at": expires_at,
     }
     return state, OAUTH_STATE_TTL_MINUTES * 60
@@ -637,12 +665,12 @@ def get_meeting_url(*candidates: str | None) -> str | None:
     return None
 
 
-def exchange_calendar_oauth_code(provider: str, code: str) -> dict[str, Any]:
+def exchange_calendar_oauth_code(provider: str, code: str, redirect_uri: str) -> dict[str, Any]:
     client_id, client_secret = get_calendar_provider_credentials(provider)
     payload = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": CALENDAR_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "client_id": client_id,
         "client_secret": client_secret,
     }
@@ -1484,10 +1512,16 @@ def ensure_schema_columns() -> None:
                 )
 
 
+def ensure_finance_schema() -> None:
+    """Create finance storage for installations that predate the shared finance table."""
+    SQLModel.metadata.create_all(engine, tables=[FinancialEntry.__table__])
+
+
 def init_db() -> None:
     os.makedirs(STORAGE_PATH, exist_ok=True)
     SQLModel.metadata.create_all(engine)
     ensure_schema_columns()
+    ensure_finance_schema()
     with Session(engine) as session:
         seed_plans(session)
         seed_master_admin(session)
@@ -1696,6 +1730,66 @@ class AgendaSyncResponse(BaseModel):
     provider: str
     synced_events: int
     last_synced_at: datetime
+
+
+class FinanceEntryCreateRequest(BaseModel):
+    entry_type: str
+    category: str
+    amount: float
+    due_date: str
+    client_id: int | None = None
+    case_id: int | None = None
+    client_name: str | None = None
+    case_number: str | None = None
+    payment_date: str | None = None
+    payment_method: str | None = None
+    expense_type: str | None = None
+    recurring: str | None = None
+    paid_amount: float | None = None
+    installments: int | None = None
+    attachment_name: str | None = None
+    organization_id: int | None = None
+
+
+class FinanceEntryUpdateRequest(BaseModel):
+    payment_date: str | None = None
+    payment_method: str | None = None
+    paid_amount: float | None = None
+    organization_id: int | None = None
+
+
+class FinanceEntryResponse(BaseModel):
+    id: int
+    organization_id: int
+    created_by_user_id: int | None = None
+    entry_type: str
+    category: str
+    client_id: int | None = None
+    case_id: int | None = None
+    client_name: str | None = None
+    case_number: str | None = None
+    amount: float
+    due_date: str
+    payment_date: str | None = None
+    payment_method: str | None = None
+    expense_type: str | None = None
+    recurring: str | None = None
+    paid_amount: float | None = None
+    installments: int | None = None
+    attachment_name: str | None = None
+
+
+class ClientDocumentResponse(BaseModel):
+    id: int
+    organization_id: int | None = None
+    client_id: int
+    case_id: int | None = None
+    folder_label: str
+    original_name: str
+    content_type: str
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
 
 
 def resolve_organization_scope(
@@ -1937,15 +2031,19 @@ def resolve_wallet_for_case(
 
 
 def sync_case_wallet_assignment(session: Session, case_id: int, wallet_id: int | None) -> None:
-    existing = session.exec(select(CaseWallet).where(CaseWallet.case_id == case_id)).first()
+    existing_links = session.exec(select(CaseWallet).where(CaseWallet.case_id == case_id)).all()
     if wallet_id is None:
-        if existing:
-            session.delete(existing)
+        for existing_link in existing_links:
+            session.delete(existing_link)
+        session.flush()
         return
+    existing = existing_links[0] if existing_links else None
     if existing:
         existing.wallet_id = wallet_id
         existing.updated_at = datetime.utcnow()
         session.add(existing)
+        for duplicate_link in existing_links[1:]:
+            session.delete(duplicate_link)
         return
     session.add(CaseWallet(case_id=case_id, wallet_id=wallet_id))
 
@@ -1995,10 +2093,294 @@ def serialize_case_list(session: Session, cases: list[Case], wallet_lookup: dict
     return output
 
 
+def validate_case_payload(payload: CreateCaseRequest | UpdateCaseRequest) -> dict[str, Any]:
+    number = (payload.number or "").strip()
+    if not CASE_NUMBER_PATTERN.fullmatch(number):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Informe o número completo do processo no padrão 0000000-00.0000.0.00.0000",
+        )
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título é obrigatório")
+    if payload.client_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cliente é obrigatório")
+    if payload.wallet_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Carteira é obrigatória")
+    forum = (payload.forum or "").strip()
+    if not forum:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Comarca é obrigatória")
+    court = (payload.court or "").strip()
+    if not court:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Vara é obrigatória")
+    status_value = (payload.status or "aberto").strip() or "aberto"
+    return {
+        "number": number,
+        "title": title,
+        "forum": forum,
+        "court": court,
+        "status": status_value,
+    }
+
+
+def parse_finance_date(raw_value: str | None, field_name: str, *, required: bool = False) -> datetime | None:
+    if raw_value is None:
+        if required:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} é obrigatório")
+        return None
+    value = raw_value.strip()
+    if not value:
+        if required:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} é obrigatório")
+        return None
+    if len(value) == 10:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} inválido") from exc
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} inválido")
+    return parsed
+
+
+def resolve_finance_client(session: Session, organization_id: int, client_id: int | None) -> Client | None:
+    if client_id is None:
+        return None
+    client = session.get(Client, client_id)
+    if not client or client.organization_id != organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pessoa/cliente inválido para este lançamento")
+    return client
+
+
+def resolve_finance_case(session: Session, organization_id: int, case_id: int | None) -> Case | None:
+    if case_id is None:
+        return None
+    case = session.get(Case, case_id)
+    if not case or case.organization_id != organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processo inválido para este lançamento")
+    return case
+
+
+def serialize_financial_entry(entry: FinancialEntry, client: Client | None = None, case: Case | None = None) -> dict[str, Any]:
+    client_name = entry.client_name_snapshot or (client.name if client else None)
+    case_number = entry.case_number_snapshot or (case.number if case else None)
+    return {
+        "id": entry.id,
+        "organization_id": entry.organization_id,
+        "created_by_user_id": entry.created_by_user_id,
+        "entry_type": entry.entry_type,
+        "category": entry.category,
+        "client_id": entry.client_id,
+        "case_id": entry.case_id,
+        "client_name": client_name,
+        "case_number": case_number,
+        "amount": entry.amount,
+        "due_date": entry.due_date.date().isoformat(),
+        "payment_date": entry.payment_date.date().isoformat() if entry.payment_date else None,
+        "payment_method": entry.payment_method,
+        "expense_type": entry.expense_type,
+        "recurring": entry.recurring,
+        "paid_amount": entry.paid_amount,
+        "installments": entry.installments,
+        "attachment_name": entry.attachment_name,
+    }
+
+
+def normalize_document_folder_label(raw_value: str) -> str:
+    label = (raw_value or "").strip()
+    if not label:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selecione a pasta de destino")
+    if len(label) > 80:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome da pasta muito longo")
+    if "/" in label or "\\" in label:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome da pasta inválido")
+    return label
+
+
+def slugify_storage_segment(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+    return cleaned.strip("-") or "arquivo"
+
+
+def resolve_client_for_documents(session: Session, user: User, client_id: int) -> Client:
+    client = session.get(Client, client_id)
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente não encontrado")
+    resolve_existing_record_scope(user, session, client.organization_id)
+    return client
+
+
+def resolve_case_for_documents(session: Session, user: User, case_id: int | None) -> Case | None:
+    if case_id is None:
+        return None
+    case = session.get(Case, case_id)
+    if not case:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processo não encontrado")
+    resolve_existing_record_scope(user, session, case.organization_id)
+    return case
+
+
+def serialize_client_document(document: ClientDocument) -> dict[str, Any]:
+    return {
+        "id": document.id,
+        "organization_id": document.organization_id,
+        "client_id": document.client_id,
+        "case_id": document.case_id,
+        "folder_label": document.folder_label,
+        "original_name": document.original_name,
+        "content_type": document.content_type,
+        "size_bytes": document.size_bytes,
+        "created_at": document.created_at,
+        "updated_at": document.updated_at,
+    }
+
+
+def get_documents_root_path() -> str:
+    root = os.path.join(STORAGE_PATH, "documents")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def build_document_storage_relative_path(client: Client, case: Case | None, folder_label: str) -> tuple[str, str]:
+    if client.id is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cliente sem identificador")
+    organization_segment = f"org_{client.organization_id}" if client.organization_id is not None else "org_shared"
+    folder_segment = slugify_storage_segment(folder_label)
+    stored_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(8)}.pdf"
+    relative_path = os.path.join(
+        organization_segment,
+        f"client_{client.id}",
+        f"case_{case.id}" if case and case.id is not None else "client_root",
+        folder_segment,
+        stored_name,
+    )
+    absolute_directory = os.path.dirname(os.path.join(get_documents_root_path(), relative_path))
+    os.makedirs(absolute_directory, exist_ok=True)
+    return stored_name, relative_path
+
+
+def get_document_absolute_path(storage_relative_path: str) -> str:
+    documents_root = os.path.abspath(get_documents_root_path())
+    absolute_path = os.path.abspath(os.path.join(documents_root, storage_relative_path))
+    if absolute_path != documents_root and not absolute_path.startswith(f"{documents_root}{os.sep}"):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Caminho de arquivo inválido")
+    return absolute_path
+
+
+def remove_document_file(storage_relative_path: str) -> None:
+    absolute_path = get_document_absolute_path(storage_relative_path)
+    if os.path.exists(absolute_path):
+        os.remove(absolute_path)
+    stop_path = os.path.abspath(get_documents_root_path())
+    current_dir = os.path.dirname(absolute_path)
+    while current_dir.startswith(stop_path) and current_dir != stop_path:
+        try:
+            os.rmdir(current_dir)
+        except OSError:
+            break
+        current_dir = os.path.dirname(current_dir)
+
+
+def purge_documents(session: Session, documents: list[ClientDocument]) -> None:
+    for document in documents:
+        remove_document_file(document.storage_path)
+        session.delete(document)
+
+
+def normalize_cpf_digits(value: str | None) -> str:
+    return "".join(char for char in (value or "") if char.isdigit())
+
+
+def is_valid_cpf_digits(value: str | None) -> bool:
+    cpf = normalize_cpf_digits(value)
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+
+    def calculate_check_digit(digits: str, factor: int) -> int:
+        total = sum(int(digit) * (factor - index) for index, digit in enumerate(digits))
+        remainder = total % 11
+        return 0 if remainder < 2 else 11 - remainder
+
+    first_digit = calculate_check_digit(cpf[:9], 10)
+    second_digit = calculate_check_digit(cpf[:10], 11)
+    return cpf == f"{cpf[:9]}{first_digit}{second_digit}"
+
+
+def normalize_cnpj_digits(value: str | None) -> str:
+    return "".join(char for char in (value or "") if char.isdigit())
+
+
+def is_valid_cnpj_digits(value: str | None) -> bool:
+    cnpj = normalize_cnpj_digits(value)
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+
+    def calculate_check_digit(digits: str) -> int:
+        weights = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2] if len(digits) == 12 else [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+        total = sum(int(digit) * weights[index] for index, digit in enumerate(digits))
+        remainder = total % 11
+        return 0 if remainder < 2 else 11 - remainder
+
+    first_digit = calculate_check_digit(cnpj[:12])
+    second_digit = calculate_check_digit(f"{cnpj[:12]}{first_digit}")
+    return cnpj == f"{cnpj[:12]}{first_digit}{second_digit}"
+
+
+def extract_client_kind(notes: str | None) -> str | None:
+    if not notes:
+        return None
+    try:
+        parsed = json.loads(notes)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    kind = parsed.get("kind")
+    return kind if kind in {"PF", "PJ"} else None
+
+
+def sanitize_client_payload(payload: CreateClientRequest | UpdateClientRequest) -> dict[str, Any]:
+    name = (payload.name or "").strip()
+    document = (payload.document or "").strip() or None
+    email = (payload.email or "").strip().lower() or None
+    phone = (payload.phone or "").strip() or None
+    notes = (payload.notes or "").strip() or None
+
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome é obrigatório")
+
+    client_kind = extract_client_kind(notes)
+    if client_kind == "PF":
+        if not document:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF é obrigatório")
+        if not is_valid_cpf_digits(document):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CPF válido")
+    elif client_kind == "PJ":
+        if not document:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CNPJ é obrigatório")
+        if not is_valid_cnpj_digits(document):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CNPJ válido")
+    elif document:
+        document_digits = "".join(char for char in document if char.isdigit())
+        if len(document_digits) == 11 and not is_valid_cpf_digits(document_digits):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CPF válido")
+        if len(document_digits) == 14 and not is_valid_cnpj_digits(document_digits):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CNPJ válido")
+
+    return {
+        "name": name,
+        "document": document,
+        "email": email,
+        "phone": phone,
+        "notes": notes,
+    }
+
+
 def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMemberRequest) -> dict:
     full_name = payload.full_name.strip()
     email = payload.email.strip().lower()
-    cpf = "".join(char for char in payload.cpf if char.isdigit())
+    cpf = normalize_cpf_digits(payload.cpf)
     oab = payload.oab.strip().upper()
     role_title = payload.role_title.strip()
     team_name = payload.team_name.strip()
@@ -2011,8 +2393,10 @@ def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMe
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome é obrigatório")
     if not email or "@" not in email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email é obrigatório")
-    if len(cpf) != 11:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF deve conter 11 dígitos")
+    if not cpf:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF é obrigatório")
+    if not is_valid_cpf_digits(cpf):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CPF válido")
     if not oab:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAB é obrigatória")
     if not role_title:
@@ -2375,11 +2759,13 @@ def list_calendar_connections(
 @app.post("/calendar/connections/{provider}/start", response_model=CalendarConnectionStartResponse)
 def start_calendar_connection(
     provider: str,
+    request: Request,
     user: Annotated[User, Depends(get_current_user)],
 ) -> CalendarConnectionStartResponse:
     provider_name = normalize_calendar_provider(provider)
-    state, expires_in_seconds = register_calendar_oauth_state(user, provider_name)
-    auth_url = build_calendar_oauth_url(provider_name, state)
+    redirect_uri = resolve_calendar_redirect_uri(request)
+    state, expires_in_seconds = register_calendar_oauth_state(user, provider_name, redirect_uri)
+    auth_url = build_calendar_oauth_url(provider_name, state, redirect_uri)
     return CalendarConnectionStartResponse(
         provider=provider_name,
         auth_url=auth_url,
@@ -2416,9 +2802,15 @@ def complete_calendar_connection(
         )
     user_id = oauth_state.get("user_id")
     provider_name = normalize_calendar_provider(str(oauth_state.get("provider", "")))
+    redirect_uri = str(oauth_state.get("redirect_uri") or "").strip()
     if not isinstance(user_id, int):
         return HTMLResponse(
             render_calendar_callback_page(False, "Sessão inválida para concluir a conexão."),
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if not redirect_uri:
+        return HTMLResponse(
+            render_calendar_callback_page(False, "URL de retorno ausente para concluir a conexão."),
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     user = session.get(User, user_id)
@@ -2440,7 +2832,7 @@ def complete_calendar_connection(
         )
 
     try:
-        token_payload = exchange_calendar_oauth_code(provider_name, code)
+        token_payload = exchange_calendar_oauth_code(provider_name, code, redirect_uri)
         access_token = token_payload.get("access_token")
         provider_email = fetch_provider_profile_email(provider_name, access_token) if isinstance(access_token, str) else None
         if user.id is None:
@@ -3014,13 +3406,14 @@ def create_client(
     user: Annotated[User, Depends(get_current_user)],
 ) -> Client:
     scope_organization_id = resolve_organization_scope(user, session, payload.organization_id)
+    clean = sanitize_client_payload(payload)
     client = Client(
         organization_id=scope_organization_id,
-        name=payload.name,
-        document=payload.document,
-        email=payload.email,
-        phone=payload.phone,
-        notes=payload.notes,
+        name=clean["name"],
+        document=clean["document"],
+        email=clean["email"],
+        phone=clean["phone"],
+        notes=clean["notes"],
     )
     session.add(client)
     session.commit()
@@ -3045,13 +3438,14 @@ def update_client(
     target_organization_id = client.organization_id
     if payload.organization_id is not None:
         target_organization_id = resolve_organization_scope(user, session, payload.organization_id)
+    clean = sanitize_client_payload(payload)
 
     client.organization_id = target_organization_id
-    client.name = payload.name
-    client.document = payload.document
-    client.email = payload.email
-    client.phone = payload.phone
-    client.notes = payload.notes
+    client.name = clean["name"]
+    client.document = clean["document"]
+    client.email = clean["email"]
+    client.phone = clean["phone"]
+    client.notes = clean["notes"]
     client.updated_at = datetime.utcnow()
     session.add(client)
     session.commit()
@@ -3079,6 +3473,8 @@ def delete_client(
             detail="Cliente possui processos vinculados. Exclua os processos antes de remover o cliente.",
         )
 
+    documents = session.exec(select(ClientDocument).where(ClientDocument.client_id == client.id)).all()
+    purge_documents(session, documents)
     session.delete(client)
     session.commit()
     return {"status": "ok", "id": client_id}
@@ -3115,22 +3511,22 @@ def create_case(
     user: Annotated[User, Depends(get_current_user)],
 ) -> dict:
     scope_organization_id = resolve_organization_scope(user, session, payload.organization_id)
-    if payload.client_id:
-        client_query = select(Client).where(Client.id == payload.client_id)
-        if scope_organization_id is not None:
-            client_query = client_query.where(Client.organization_id == scope_organization_id)
-        client = session.exec(client_query).first()
-        if not client:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente inválido")
+    validated_payload = validate_case_payload(payload)
+    client_query = select(Client).where(Client.id == payload.client_id)
+    if scope_organization_id is not None:
+        client_query = client_query.where(Client.organization_id == scope_organization_id)
+    client = session.exec(client_query).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente inválido")
 
     case = Case(
         organization_id=scope_organization_id,
-        number=payload.number,
-        title=payload.title,
+        number=validated_payload["number"],
+        title=validated_payload["title"],
         client_id=payload.client_id,
-        status=payload.status,
-        forum=payload.forum,
-        court=payload.court,
+        status=validated_payload["status"],
+        forum=validated_payload["forum"],
+        court=validated_payload["court"],
         value=payload.value,
     )
     session.add(case)
@@ -3149,6 +3545,7 @@ def update_case(
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
 ) -> dict:
+    validated_payload = validate_case_payload(payload)
     case = session.get(Case, case_id)
     if not case:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processo não encontrado")
@@ -3163,21 +3560,20 @@ def update_case(
     if payload.organization_id is not None:
         target_organization_id = resolve_organization_scope(user, session, payload.organization_id)
 
-    if payload.client_id is not None:
-        client_query = select(Client).where(Client.id == payload.client_id)
-        if target_organization_id is not None:
-            client_query = client_query.where(Client.organization_id == target_organization_id)
-        client = session.exec(client_query).first()
-        if not client:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente inválido")
+    client_query = select(Client).where(Client.id == payload.client_id)
+    if target_organization_id is not None:
+        client_query = client_query.where(Client.organization_id == target_organization_id)
+    client = session.exec(client_query).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente inválido")
 
     case.organization_id = target_organization_id
-    case.number = payload.number
-    case.title = payload.title
+    case.number = validated_payload["number"]
+    case.title = validated_payload["title"]
     case.client_id = payload.client_id
-    case.status = payload.status
-    case.forum = payload.forum
-    case.court = payload.court
+    case.status = validated_payload["status"]
+    case.forum = validated_payload["forum"]
+    case.court = validated_payload["court"]
     case.value = payload.value
     case.updated_at = datetime.utcnow()
     session.add(case)
@@ -3205,12 +3601,303 @@ def delete_case(
     if current_wallet is not None:
         ensure_user_can_access_wallet(session, user, current_wallet)
 
-    link = session.exec(select(CaseWallet).where(CaseWallet.case_id == case.id)).first()
-    if link:
+    links = session.exec(select(CaseWallet).where(CaseWallet.case_id == case.id)).all()
+    for link in links:
         session.delete(link)
+    documents = session.exec(select(ClientDocument).where(ClientDocument.case_id == case.id)).all()
+    purge_documents(session, documents)
+    session.flush()
     session.delete(case)
     session.commit()
     return {"status": "ok", "id": case_id}
+
+
+@app.get("/finance/entries", response_model=list[FinanceEntryResponse])
+def list_finance_entries(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    organization_id: int | None = None,
+) -> list[dict[str, Any]]:
+    ensure_finance_schema()
+    ensure_nav_access(user, "finance")
+    organization = resolve_organization_entity(user, session, organization_id)
+    organization_pk = get_organization_pk(organization)
+    entries = session.exec(
+        select(FinancialEntry)
+        .where(FinancialEntry.organization_id == organization_pk)
+        .order_by(FinancialEntry.due_date.desc(), FinancialEntry.created_at.desc())
+    ).all()
+    client_ids = {entry.client_id for entry in entries if entry.client_id is not None}
+    case_ids = {entry.case_id for entry in entries if entry.case_id is not None}
+    client_lookup = {
+        client.id: client
+        for client in session.exec(select(Client).where(Client.id.in_(client_ids))).all()
+        if client.id is not None
+    } if client_ids else {}
+    case_lookup = {
+        case.id: case
+        for case in session.exec(select(Case).where(Case.id.in_(case_ids))).all()
+        if case.id is not None
+    } if case_ids else {}
+    return [
+        serialize_financial_entry(
+            entry,
+            client_lookup.get(entry.client_id) if entry.client_id is not None else None,
+            case_lookup.get(entry.case_id) if entry.case_id is not None else None,
+        )
+        for entry in entries
+    ]
+
+
+@app.post("/finance/entries", response_model=FinanceEntryResponse)
+def create_finance_entry(
+    payload: FinanceEntryCreateRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_finance_schema()
+    ensure_nav_access(user, "finance")
+    organization = resolve_organization_entity(user, session, payload.organization_id)
+    organization_pk = get_organization_pk(organization)
+    entry_type = payload.entry_type.strip().lower()
+    if entry_type not in FINANCE_ENTRY_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de lançamento inválido")
+    category = payload.category.strip()
+    if not category:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Categoria é obrigatória")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Valor deve ser maior que zero")
+    if payload.payment_method and payload.payment_method not in FINANCE_PAYMENT_METHODS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Forma de pagamento inválida")
+    if payload.recurring and payload.recurring not in FINANCE_RECURRING_OPTIONS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Recorrência inválida")
+    if payload.installments is not None and payload.installments < 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Parcelamento inválido")
+    if payload.paid_amount is not None and payload.paid_amount < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Valor pago inválido")
+
+    due_date = parse_finance_date(payload.due_date, "Data de vencimento", required=True)
+    payment_date = parse_finance_date(payload.payment_date, "Data do pagamento")
+    client = resolve_finance_client(session, organization_pk, payload.client_id)
+    case = resolve_finance_case(session, organization_pk, payload.case_id)
+    if case and client is None and case.client_id is not None:
+        client = resolve_finance_client(session, organization_pk, case.client_id)
+    if case and client and case.client_id and case.client_id != client.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Processo não pertence à pessoa selecionada")
+
+    client_name = (payload.client_name or "").strip() or (client.name if client else None)
+    case_number = (payload.case_number or "").strip() or (case.number if case else None)
+    expense_type = (payload.expense_type or "").strip() or None
+    recurring = (payload.recurring or "").strip() or None
+    attachment_name = (payload.attachment_name or "").strip() or None
+
+    entry = FinancialEntry(
+        organization_id=organization_pk,
+        created_by_user_id=user.id,
+        entry_type=entry_type,
+        category=category,
+        client_id=client.id if client and client.id is not None else None,
+        case_id=case.id if case and case.id is not None else None,
+        client_name_snapshot=client_name,
+        case_number_snapshot=case_number,
+        amount=payload.amount,
+        due_date=due_date,
+        payment_date=payment_date,
+        payment_method=payload.payment_method or None,
+        expense_type=expense_type,
+        recurring=recurring,
+        paid_amount=payload.paid_amount,
+        installments=payload.installments,
+        attachment_name=attachment_name,
+    )
+    session.add(entry)
+    session.commit()
+    session.refresh(entry)
+    return serialize_financial_entry(entry, client, case)
+
+
+@app.patch("/finance/entries/{entry_id}", response_model=FinanceEntryResponse)
+def update_finance_entry(
+    entry_id: int,
+    payload: FinanceEntryUpdateRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_finance_schema()
+    ensure_nav_access(user, "finance")
+
+    entry = session.get(FinancialEntry, entry_id)
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lançamento financeiro não encontrado")
+
+    record_organization_id = resolve_existing_record_scope(user, session, entry.organization_id)
+    if payload.organization_id is not None and record_organization_id != payload.organization_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lançamento inválido para esta organização")
+
+    if payload.payment_method and payload.payment_method not in FINANCE_PAYMENT_METHODS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Forma de pagamento inválida")
+    if payload.paid_amount is not None and payload.paid_amount < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Valor pago inválido")
+    if payload.payment_date is None and payload.payment_method is None and payload.paid_amount is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe ao menos um campo para atualizar")
+
+    if payload.payment_date is not None:
+        entry.payment_date = parse_finance_date(payload.payment_date, "Data do pagamento", required=True)
+    if payload.payment_method is not None:
+        entry.payment_method = payload.payment_method.strip() or None
+    if payload.paid_amount is not None:
+        entry.paid_amount = payload.paid_amount
+
+    entry.updated_at = datetime.utcnow()
+    session.add(entry)
+    session.commit()
+    session.refresh(entry)
+
+    client = session.get(Client, entry.client_id) if entry.client_id is not None else None
+    case = session.get(Case, entry.case_id) if entry.case_id is not None else None
+    return serialize_financial_entry(entry, client, case)
+
+
+@app.delete("/finance/entries/{entry_id}")
+def delete_finance_entry(
+    entry_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_finance_schema()
+    ensure_nav_access(user, "finance")
+
+    entry = session.get(FinancialEntry, entry_id)
+    if not entry:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lançamento financeiro não encontrado")
+
+    resolve_existing_record_scope(user, session, entry.organization_id)
+    session.delete(entry)
+    session.commit()
+    return {"status": "ok", "id": entry_id}
+
+
+@app.get("/files/documents", response_model=list[ClientDocumentResponse])
+def list_client_documents(
+    client_id: int,
+    case_id: int | None = None,
+    *,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> list[dict[str, Any]]:
+    ensure_nav_access(user, "files")
+    client = resolve_client_for_documents(session, user, client_id)
+    case = resolve_case_for_documents(session, user, case_id)
+    if case and case.client_id != client.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Processo não pertence ao cliente selecionado")
+
+    query = select(ClientDocument).where(ClientDocument.client_id == client.id)
+    if case and case.id is not None:
+        query = query.where(ClientDocument.case_id == case.id)
+    documents = session.exec(query.order_by(ClientDocument.created_at.desc())).all()
+    return [serialize_client_document(document) for document in documents]
+
+
+@app.post("/files/documents", response_model=ClientDocumentResponse)
+async def upload_client_document(
+    client_id: Annotated[int, Form()],
+    folder_label: Annotated[str, Form()],
+    case_id: Annotated[int | None, Form()] = None,
+    file: UploadFile = File(...),
+    *,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "files")
+    client = resolve_client_for_documents(session, user, client_id)
+    case = resolve_case_for_documents(session, user, case_id)
+    if case and case.client_id != client.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Processo não pertence ao cliente selecionado")
+
+    original_name = os.path.basename((file.filename or "").strip())
+    if not original_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selecione um arquivo PDF")
+    if not original_name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Somente arquivos PDF são aceitos")
+    if file.content_type and file.content_type.lower() not in FILES_ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de arquivo inválido. Envie um PDF")
+
+    label = normalize_document_folder_label(folder_label)
+    content = await file.read(FILES_MAX_UPLOAD_BYTES + 1)
+    await file.close()
+    if not content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo vazio")
+    if len(content) > FILES_MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Arquivo excede o limite de {FILES_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um PDF válido")
+
+    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label)
+    absolute_path = get_document_absolute_path(storage_relative_path)
+    with open(absolute_path, "wb") as buffer:
+        buffer.write(content)
+
+    document = ClientDocument(
+        organization_id=client.organization_id,
+        uploaded_by_user_id=user.id,
+        client_id=client.id,
+        case_id=case.id if case and case.id is not None else None,
+        folder_label=label,
+        original_name=original_name,
+        stored_name=stored_name,
+        storage_path=storage_relative_path,
+        content_type="application/pdf",
+        size_bytes=len(content),
+    )
+    session.add(document)
+    session.commit()
+    session.refresh(document)
+    return serialize_client_document(document)
+
+
+@app.get("/files/documents/{document_id}/download")
+def download_client_document(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> FileResponse:
+    ensure_nav_access(user, "files")
+    document = session.get(ClientDocument, document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento não encontrado")
+    client = resolve_client_for_documents(session, user, document.client_id)
+    case = resolve_case_for_documents(session, user, document.case_id)
+    if case and case.client_id != client.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Documento vinculado a cliente inválido")
+
+    absolute_path = get_document_absolute_path(document.storage_path)
+    if not os.path.exists(absolute_path):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Arquivo não encontrado no armazenamento")
+    return FileResponse(absolute_path, media_type=document.content_type, filename=document.original_name)
+
+
+@app.delete("/files/documents/{document_id}")
+def delete_client_document(
+    document_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "files")
+    document = session.get(ClientDocument, document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento não encontrado")
+    client = resolve_client_for_documents(session, user, document.client_id)
+    case = resolve_case_for_documents(session, user, document.case_id)
+    if case and case.client_id != client.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Documento vinculado a cliente inválido")
+
+    remove_document_file(document.storage_path)
+    session.delete(document)
+    session.commit()
+    return {"status": "ok", "id": document_id}
 
 
 @app.get("/invoices")

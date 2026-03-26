@@ -133,6 +133,41 @@ class Invoice(TimestampMixin, table=True):
     payment_date: Optional[datetime] = None
 
 
+class FinancialEntry(TimestampMixin, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: int = Field(foreign_key="organization.id", index=True)
+    created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    entry_type: str = Field(index=True, description="receita|despesa")
+    category: str = Field(index=True)
+    client_id: Optional[int] = Field(default=None, foreign_key="client.id", index=True)
+    case_id: Optional[int] = Field(default=None, foreign_key="case.id", index=True)
+    client_name_snapshot: Optional[str] = None
+    case_number_snapshot: Optional[str] = None
+    amount: float
+    due_date: datetime = Field(index=True)
+    payment_date: Optional[datetime] = Field(default=None, index=True)
+    payment_method: Optional[str] = Field(default=None, index=True)
+    expense_type: Optional[str] = Field(default=None, index=True)
+    recurring: Optional[str] = Field(default=None, index=True)
+    paid_amount: Optional[float] = None
+    installments: Optional[int] = None
+    attachment_name: Optional[str] = None
+
+
+class ClientDocument(TimestampMixin, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: Optional[int] = Field(default=None, index=True)
+    uploaded_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    client_id: int = Field(index=True)
+    case_id: Optional[int] = Field(default=None, index=True)
+    folder_label: str = Field(index=True)
+    original_name: str
+    stored_name: str
+    storage_path: str = Field(index=True)
+    content_type: str
+    size_bytes: int
+
+
 class Template(TimestampMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: Optional[int] = Field(default=None, foreign_key="organization.id")
