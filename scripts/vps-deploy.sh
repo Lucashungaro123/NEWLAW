@@ -78,8 +78,15 @@ if [[ "$DO_CHECK" -eq 1 ]]; then
   trap 'rm -rf "$TMP_DIR"' EXIT
 
   echo "Validando endpoints..."
+  health_code=""
+  for _ in {1..12}; do
+    health_code="$(curl -sS -o "$TMP_DIR/health.out" -w '%{http_code}' "${API_BASE_URL}/health" || true)"
+    if [[ "$health_code" == "200" ]]; then
+      break
+    fi
+    sleep 2
+  done
 
-  health_code="$(curl -sS -o "$TMP_DIR/health.out" -w '%{http_code}' "${API_BASE_URL}/health" || true)"
   invite_code="$(curl -sS -o "$TMP_DIR/invite.out" -w '%{http_code}' "${API_BASE_URL}/invite" || true)"
   capacity_code="$(curl -sS -o "$TMP_DIR/capacity.out" -w '%{http_code}' "${API_BASE_URL}/team-members/capacity" || true)"
 

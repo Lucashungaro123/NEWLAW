@@ -85,6 +85,9 @@ type ClientFileTree = {
   totalFolders: number;
   searchText: string;
 };
+type FilesFolderTarget =
+  | { scope: "client"; folderLabel: string }
+  | { scope: "case"; caseId: number; folderLabel: string };
 
 const textScaleOptions = [
   { label: "Normal", value: 1 },
@@ -1070,11 +1073,7 @@ const buildClientFileTree = (client: ApiClient, clientCases: ApiCase[]): ClientF
     nodes,
     totalFolders: countFileNodes(nodes),
     searchText: normalizeSearchText(
-      [
-        client.name,
-        client.document || "",
-        ...sortedCases.flatMap((caseItem) => [caseItem.number || "", caseItem.title || "", caseItem.status || ""])
-      ]
+      [client.name, client.document || ""]
         .filter(Boolean)
         .join(" ")
     )
@@ -2205,38 +2204,117 @@ function Placeholder({ title }: { title: string }) {
   );
 }
 
-function FolderNodeIcon({ kind }: { kind: FileFolderNodeKind | "client-root" }) {
-  return (
-    <span className={`files-tree-icon ${kind}`} aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M3 7.5h6l2 2h10v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
-        <path d="M3 7.5V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1.5" />
-        {kind === "case-folder" && <path d="M9 13h6" />}
-      </svg>
-    </span>
-  );
-}
+function FilesUploadModal({
+  open,
+  clientName,
+  cases,
+  folderOptions,
+  selectedCaseId,
+  selectedFolder,
+  selectedFile,
+  inputKey,
+  errorMessage,
+  saving,
+  onClose,
+  onCaseChange,
+  onFolderChange,
+  onFileChange,
+  onSave
+}: {
+  open: boolean;
+  clientName: string;
+  cases: ApiCase[];
+  folderOptions: { label: string; note: string }[];
+  selectedCaseId: string;
+  selectedFolder: string;
+  selectedFile: File | null;
+  inputKey: number;
+  errorMessage?: string;
+  saving?: boolean;
+  onClose: () => void;
+  onCaseChange: (value: string) => void;
+  onFolderChange: (value: string) => void;
+  onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onSave: () => void;
+}) {
+  if (!open) return null;
 
-function FileTreeNode({ node }: { node: FileFolderNode }) {
-  const hasChildren = Boolean(node.children?.length);
+  const selectedCase = cases.find((item) => String(item.id) === selectedCaseId) ?? null;
+  const destinationLabel = selectedCase
+    ? `${selectedCase.number ? `Processo ${selectedCase.number}` : `Processo #${selectedCase.id}`} / ${selectedFolder}`
+    : `${clientName} / ${selectedFolder}`;
 
   return (
-    <li className={`files-tree-node ${hasChildren ? "has-children" : "leaf"}`}>
-      <div className={`files-tree-item ${node.kind}`}>
-        <FolderNodeIcon kind={node.kind} />
-        <div className="files-tree-copy">
-          <div className="files-tree-name">{node.label}</div>
-          {node.note && <div className="files-tree-note">{node.note}</div>}
+    <div className="modal-backdrop">
+      <div className="modal-card files-modal-card">
+        <div className="modal-head">
+          <h2 className="modal-title">Novo arquivo</h2>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={saving}>
+            ×
+          </button>
+        </div>
+
+        <div className="modal-note">Envie documentos em PDF com até 10 MB e escolha exatamente em qual pasta eles devem cair.</div>
+
+        <div className="modal-grid files-modal-grid">
+          <div className="field span-2">
+            <label>Cliente</label>
+            <input value={clientName} readOnly />
+          </div>
+
+          <div className="field">
+            <label>Destino</label>
+            <select value={selectedCaseId} onChange={(event) => onCaseChange(event.target.value)}>
+              <option value="">Pasta principal do cliente</option>
+              {cases.map((caseItem) => (
+                <option key={caseItem.id} value={String(caseItem.id)}>
+                  {caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="field">
+            <label>Subpasta</label>
+            <select value={selectedFolder} onChange={(event) => onFolderChange(event.target.value)}>
+              {folderOptions.map((folder) => (
+                <option key={folder.label} value={folder.label}>
+                  {folder.label}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="field span-2">
+            <label>Arquivo PDF</label>
+            <input key={inputKey} type="file" accept=".pdf,application/pdf" onChange={onFileChange} />
+          </div>
+        </div>
+
+        <div className="files-modal-destination">
+          <div className="files-modal-destination-label">Destino atual</div>
+          <div className="files-modal-destination-path">{destinationLabel}</div>
+        </div>
+
+        {selectedFile && (
+          <div className="files-upload-selected">
+            <strong>{selectedFile.name}</strong>
+            <span>{formatFileSize(selectedFile.size)}</span>
+          </div>
+        )}
+
+        {errorMessage && <div className="error">{errorMessage}</div>}
+
+        <div className="modal-actions">
+          <button className="btn ghost" type="button" onClick={onClose} disabled={saving}>
+            Cancelar
+          </button>
+          <button className="btn" type="button" onClick={onSave} disabled={!selectedFile || saving}>
+            {saving ? "Enviando..." : "Enviar PDF"}
+          </button>
         </div>
       </div>
-      {hasChildren && (
-        <ul className="files-tree-list">
-          {node.children?.map((child) => (
-            <FileTreeNode key={child.id} node={child} />
-          ))}
-        </ul>
-      )}
-    </li>
+    </div>
   );
 }
 
@@ -2246,10 +2324,13 @@ function Files() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
+  const [isClientSearchOpen, setIsClientSearchOpen] = useState(false);
   const [selectedClientId, setSelectedClientId] = useState<number | null>(null);
+  const [selectedFolderTarget, setSelectedFolderTarget] = useState<FilesFolderTarget | null>(null);
   const [documents, setDocuments] = useState<ApiClientDocument[]>([]);
   const [isLoadingDocuments, setIsLoadingDocuments] = useState(false);
   const [documentsError, setDocumentsError] = useState("");
+  const [showUploadModal, setShowUploadModal] = useState(false);
   const [selectedUploadCaseId, setSelectedUploadCaseId] = useState("");
   const [selectedUploadFolder, setSelectedUploadFolder] = useState("");
   const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(null);
@@ -2258,7 +2339,7 @@ function Files() {
   const [deletingDocumentId, setDeletingDocumentId] = useState<number | null>(null);
   const [documentMessage, setDocumentMessage] = useState("");
   const [documentsRefreshKey, setDocumentsRefreshKey] = useState(0);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [uploadInputKey, setUploadInputKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -2306,25 +2387,24 @@ function Files() {
       .map((client) => buildClientFileTree(client, casesByClientId.get(client.id) || []));
   }, [cases, clients]);
 
-  const filteredClientTrees = useMemo(() => {
+  const clientSearchResults = useMemo(() => {
     const normalizedTerm = normalizeSearchText(searchTerm.trim());
-    if (!normalizedTerm) return allClientTrees;
-    return allClientTrees.filter((tree) => tree.searchText.includes(normalizedTerm));
+    const matches = !normalizedTerm
+      ? allClientTrees
+      : allClientTrees.filter((tree) => tree.searchText.includes(normalizedTerm));
+    return matches.slice(0, 8);
   }, [allClientTrees, searchTerm]);
 
   useEffect(() => {
-    if (!filteredClientTrees.length) {
-      if (selectedClientId !== null) setSelectedClientId(null);
-      return;
+    if (selectedClientId !== null && !allClientTrees.some((tree) => tree.client.id === selectedClientId)) {
+      setSelectedClientId(null);
+      setSearchTerm("");
     }
-    if (selectedClientId === null || !filteredClientTrees.some((tree) => tree.client.id === selectedClientId)) {
-      setSelectedClientId(filteredClientTrees[0].client.id);
-    }
-  }, [filteredClientTrees, selectedClientId]);
+  }, [allClientTrees, selectedClientId]);
 
   const selectedClientTree = useMemo(
-    () => filteredClientTrees.find((tree) => tree.client.id === selectedClientId) ?? null,
-    [filteredClientTrees, selectedClientId]
+    () => allClientTrees.find((tree) => tree.client.id === selectedClientId) ?? null,
+    [allClientTrees, selectedClientId]
   );
 
   useEffect(() => {
@@ -2358,11 +2438,11 @@ function Files() {
 
   useEffect(() => {
     setSelectedUploadCaseId("");
+    setSelectedUploadFolder("");
     setSelectedUploadFile(null);
     setUploadError("");
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
+    setUploadInputKey((value) => value + 1);
+    setShowUploadModal(false);
   }, [selectedClientId]);
 
   useEffect(() => {
@@ -2384,6 +2464,26 @@ function Files() {
     () => (selectedClientTree ? getClientFolderBlueprint(selectedClientTree.kind) : getClientFolderBlueprint("PF")),
     [selectedClientTree]
   );
+  useEffect(() => {
+    if (!selectedClientTree) {
+      setSelectedFolderTarget(null);
+      return;
+    }
+    setSelectedFolderTarget((current) => {
+      if (current?.scope === "client" && selectedClientFolders.some((folder) => folder.label === current.folderLabel)) {
+        return current;
+      }
+      if (
+        current?.scope === "case" &&
+        selectedClientTree.cases.some((caseItem) => caseItem.id === current.caseId) &&
+        processFolderBlueprint.some((folder) => folder.label === current.folderLabel)
+      ) {
+        return current;
+      }
+      const defaultFolder = selectedClientFolders[0]?.label;
+      return defaultFolder ? { scope: "client", folderLabel: defaultFolder } : null;
+    });
+  }, [selectedClientFolders, selectedClientTree]);
   const selectedUploadCase = useMemo(
     () => selectedClientTree?.cases.find((item) => String(item.id) === selectedUploadCaseId) ?? null,
     [selectedClientTree, selectedUploadCaseId]
@@ -2392,6 +2492,32 @@ function Files() {
     () => (selectedUploadCase ? [...processFolderBlueprint] : selectedClientFolders),
     [selectedClientFolders, selectedUploadCase]
   );
+  const rootFolderCards = useMemo(() => {
+    return selectedClientFolders.map((folder) => {
+      const items = documents.filter((record) => !record.case_id && record.folder_label === folder.label);
+      const latestRecord = [...items].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+      return {
+        ...folder,
+        count: items.length,
+        latestRecord
+      };
+    });
+  }, [documents, selectedClientFolders]);
+  const processCards = useMemo(() => {
+    return (selectedClientTree?.cases || []).map((caseItem) => {
+      const caseDocuments = documents.filter((record) => record.case_id === caseItem.id);
+      const latestRecord = [...caseDocuments].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+      return {
+        caseItem,
+        latestRecord,
+        totalDocuments: caseDocuments.length,
+        sections: processFolderBlueprint.map((folder) => ({
+          ...folder,
+          count: caseDocuments.filter((record) => record.folder_label === folder.label).length
+        }))
+      };
+    });
+  }, [documents, selectedClientTree]);
   const caseLabelById = useMemo(() => {
     const map = new Map<number, string>();
     selectedClientTree?.cases.forEach((caseItem) => {
@@ -2399,6 +2525,24 @@ function Files() {
     });
     return map;
   }, [selectedClientTree]);
+  const selectedFolderDocuments = useMemo(() => {
+    if (!selectedFolderTarget) return [];
+    return documents.filter((record) =>
+      selectedFolderTarget.scope === "client"
+        ? !record.case_id && record.folder_label === selectedFolderTarget.folderLabel
+        : record.case_id === selectedFolderTarget.caseId && record.folder_label === selectedFolderTarget.folderLabel
+    );
+  }, [documents, selectedFolderTarget]);
+  const selectedFolderTitle = useMemo(() => {
+    if (!selectedFolderTarget) return "Documentos enviados";
+    if (selectedFolderTarget.scope === "client") return selectedFolderTarget.folderLabel;
+    return `${caseLabelById.get(selectedFolderTarget.caseId) || "Processo"} / ${selectedFolderTarget.folderLabel}`;
+  }, [caseLabelById, selectedFolderTarget]);
+  const selectedFolderDescription = useMemo(() => {
+    if (!selectedFolderTarget) return "Selecione uma pasta acima para visualizar apenas os arquivos dela.";
+    if (selectedFolderTarget.scope === "client") return "Arquivos armazenados na pasta principal selecionada do cliente.";
+    return "Arquivos armazenados apenas nesta subpasta do processo selecionado.";
+  }, [selectedFolderTarget]);
 
   useEffect(() => {
     if (!uploadFolderOptions.length) {
@@ -2409,13 +2553,6 @@ function Files() {
       setSelectedUploadFolder(uploadFolderOptions[0].label);
     }
   }, [selectedUploadFolder, uploadFolderOptions]);
-
-  const firstProcessExample = selectedClientTree?.cases[0] ?? null;
-  const processExamplePath = firstProcessExample
-    ? `${selectedClientTree?.client.name} / ${firstProcessExample.number ? `Processo ${firstProcessExample.number}` : `Processo #${firstProcessExample.id}`} / Petições`
-    : selectedClientTree
-      ? `${selectedClientTree.client.name} / Contratos e Procurações`
-      : "Cliente / Processo / Petições";
 
   const handleSelectUploadFile = (event: ChangeEvent<HTMLInputElement>) => {
     const nextFile = event.target.files?.[0] || null;
@@ -2441,6 +2578,47 @@ function Files() {
     setSelectedUploadFile(nextFile);
   };
 
+  const handleSearchClient = (event: ChangeEvent<HTMLInputElement>) => {
+    const nextValue = event.target.value;
+    setSearchTerm(nextValue);
+    setIsClientSearchOpen(true);
+    if (!selectedClientTree || nextValue.trim() !== selectedClientTree.client.name) {
+      setSelectedClientId(null);
+    }
+  };
+
+  const handleSelectClientTree = (tree: ClientFileTree) => {
+    setSelectedClientId(tree.client.id);
+    setSearchTerm(tree.client.name);
+    setIsClientSearchOpen(false);
+  };
+
+  const resetUploadForm = () => {
+    setSelectedUploadCaseId("");
+    setSelectedUploadFolder("");
+    setSelectedUploadFile(null);
+    setUploadError("");
+    setUploadInputKey((value) => value + 1);
+  };
+
+  const handleOpenUploadModal = () => {
+    if (!selectedClientTree) return;
+    resetUploadForm();
+    if (selectedFolderTarget?.scope === "case") {
+      setSelectedUploadCaseId(String(selectedFolderTarget.caseId));
+      setSelectedUploadFolder(selectedFolderTarget.folderLabel);
+    } else if (selectedFolderTarget?.scope === "client") {
+      setSelectedUploadFolder(selectedFolderTarget.folderLabel);
+    }
+    setShowUploadModal(true);
+  };
+
+  const handleCloseUploadModal = () => {
+    if (isUploadingDocument) return;
+    setShowUploadModal(false);
+    resetUploadForm();
+  };
+
   const handleUploadDocument = async () => {
     if (!selectedClientTree) return;
     if (!selectedUploadFolder) {
@@ -2463,9 +2641,8 @@ function Files() {
       setSelectedUploadFile(null);
       setDocumentMessage("Documento enviado com sucesso.");
       setDocumentsRefreshKey((value) => value + 1);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      setShowUploadModal(false);
+      resetUploadForm();
     } catch (err) {
       setUploadError(extractApiErrorMessage(err, "Não foi possível enviar o documento."));
     } finally {
@@ -2515,7 +2692,24 @@ function Files() {
             Cada cliente vira uma pasta raiz, com subpastas fixas e novas pastas de processo conforme o cadastro cresce.
           </div>
         </div>
-        <div className="pill">Estrutura automática</div>
+        <div className="files-page-actions">
+          <button
+            type="button"
+            className="files-new-btn"
+            onClick={handleOpenUploadModal}
+            disabled={!selectedClientTree}
+            aria-label="Novo arquivo"
+          >
+            <span className="files-new-btn-plus" aria-hidden="true">
+              +
+            </span>
+            <span>Novo</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+          <div className="pill">PDF até 10 MB</div>
+        </div>
       </div>
 
       <div className="stats-grid">
@@ -2539,265 +2733,256 @@ function Files() {
         />
       </div>
 
-      <div className="files-shell">
-        <aside className="files-sidebar-card">
-          <div className="files-panel-head">
-            <div>
-              <div className="files-panel-title">Pastas de clientes</div>
-              <div className="files-panel-sub">Selecione um cliente para visualizar a árvore de documentos.</div>
+      <section className="files-workspace">
+        <div className="files-surface files-overview-card">
+          <div className="files-overview-main">
+            <div className="eyebrow">Explorer de arquivos</div>
+            <h2 className="files-overview-title">{selectedClientTree ? selectedClientTree.client.name : "Selecione um cliente"}</h2>
+            <div className="files-overview-sub">
+              {selectedClientTree
+                ? selectedClientTree.cases.length
+                  ? "Use os cards abaixo para navegar pelas pastas fixas do cliente e pelas subpastas de cada processo."
+                  : "As pastas fixas do cliente já estão prontas. Quando um processo for cadastrado, ele aparece abaixo em blocos próprios."
+                : "Use a barra abaixo para localizar o cliente e abrir a estrutura de documentos sem uma lista lateral fixa."}
             </div>
-            <div className="files-panel-badge">{filteredClientTrees.length}</div>
-          </div>
-
-          <div className="search-input files-search">
-            <input
-              placeholder="Pesquisar cliente ou número do processo"
-              value={searchTerm}
-              onChange={(event) => setSearchTerm(event.target.value)}
-            />
-          </div>
-
-          {error && <div className="error">{error}</div>}
-
-          {!error && isLoading ? (
-            <div className="files-empty">Carregando estrutura de pastas...</div>
-          ) : !error && filteredClientTrees.length === 0 ? (
-            <div className="files-empty">
-              {allClientTrees.length === 0
-                ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
-                : "Nenhuma pasta encontrada para a busca informada."}
-            </div>
-          ) : (
-            <div className="files-client-list scroll-area">
-              {filteredClientTrees.map((tree) => (
-                <button
-                  key={tree.client.id}
-                  type="button"
-                  className={`files-client-item ${tree.client.id === selectedClientId ? "active" : ""}`}
-                  onClick={() => setSelectedClientId(tree.client.id)}
-                >
-                  <div className="files-client-avatar">{tree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
-                  <div className="files-client-copy">
-                    <div className="files-client-row">
-                      <div className="files-client-name">{tree.client.name}</div>
-                      <div className="files-client-folder-count">{tree.totalFolders}</div>
-                    </div>
-                    <div className="files-client-sub">
-                      {tree.cases.length
-                        ? `${tree.cases.length} processo${tree.cases.length > 1 ? "s" : ""} com subpastas`
-                        : "Estrutura pronta para receber o primeiro processo"}
-                    </div>
-                    <div className="files-client-tags">
-                      <span className="files-chip">{tree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
-                      {tree.client.document && <span className="files-chip muted">{tree.client.document}</span>}
-                    </div>
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-        </aside>
-
-        <section className="files-workspace">
-          {!selectedClientTree ? (
-            <div className="files-surface files-empty-workspace">
-              Selecione um cliente para visualizar a estrutura sugerida ou cadastre um novo cliente para criar a primeira pasta.
-            </div>
-          ) : (
-            <>
-              <div className="files-surface files-overview-card">
-                <div className="files-overview-main">
-                  <div className="eyebrow">Pasta principal</div>
-                  <h2 className="files-overview-title">{selectedClientTree.client.name}</h2>
-                  <div className="files-overview-sub">
-                    {selectedClientTree.cases.length
-                      ? "A pasta do cliente já está dividida entre dados fixos e processos vinculados."
-                      : "A pasta raiz já está pronta. Quando um processo for cadastrado para este cliente, ele aparecerá abaixo automaticamente."}
-                  </div>
-                </div>
-                <div className="files-overview-side">
-                  <div className="files-client-avatar large">{selectedClientTree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
-                  <div className="files-client-tags">
-                    <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
-                    <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
-                    <span className="files-chip">{selectedClientTree.totalFolders} pastas</span>
-                  </div>
-                </div>
+            <div className="files-overview-search-wrap">
+              <div className="search-input files-overview-search">
+                <input
+                  placeholder="Buscar cliente"
+                  value={searchTerm}
+                  onChange={handleSearchClient}
+                  onFocus={() => setIsClientSearchOpen(true)}
+                  onBlur={() => window.setTimeout(() => setIsClientSearchOpen(false), 120)}
+                />
               </div>
-
-              <div className="files-example-grid">
-                <div className="files-surface files-example-card">
-                  <div className="files-example-label">Exemplo de pasta fixa</div>
-                  <div className="files-example-path">{selectedClientTree.client.name} / Dados</div>
-                </div>
-                <div className="files-surface files-example-card">
-                  <div className="files-example-label">Exemplo de pasta por processo</div>
-                  <div className="files-example-path">{processExamplePath}</div>
-                </div>
-              </div>
-
-              <div className="files-operations-grid">
-                <div className="files-surface files-upload-card">
-                  <div className="files-card-head">
-                    <div>
-                      <div className="files-card-title">Upload de documentos</div>
-                      <div className="files-card-sub">Somente PDF, com tamanho máximo de 10 MB por arquivo.</div>
+              {isClientSearchOpen && (
+                <div className="files-client-picker">
+                  {isLoading ? (
+                    <div className="files-picker-empty">Carregando clientes...</div>
+                  ) : error ? (
+                    <div className="files-picker-empty">{error}</div>
+                  ) : clientSearchResults.length === 0 ? (
+                    <div className="files-picker-empty">
+                      {allClientTrees.length === 0
+                        ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
+                        : "Nenhum cliente encontrado para a busca informada."}
                     </div>
-                  </div>
-
-                  <div className="files-form-grid">
-                    <label className="files-form-field">
-                      <span>Destino</span>
-                      <select value={selectedUploadCaseId} onChange={(event) => setSelectedUploadCaseId(event.target.value)}>
-                        <option value="">Pasta principal do cliente</option>
-                        {selectedClientTree.cases.map((caseItem) => (
-                          <option key={caseItem.id} value={String(caseItem.id)}>
-                            {caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-
-                    <label className="files-form-field">
-                      <span>Subpasta</span>
-                      <select value={selectedUploadFolder} onChange={(event) => setSelectedUploadFolder(event.target.value)}>
-                        {uploadFolderOptions.map((folder) => (
-                          <option key={folder.label} value={folder.label}>
-                            {folder.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-
-                  <label className="files-upload-input">
-                    <span>Arquivo PDF</span>
-                    <input ref={fileInputRef} type="file" accept=".pdf,application/pdf" onChange={handleSelectUploadFile} />
-                  </label>
-
-                  {selectedUploadFile && (
-                    <div className="files-upload-selected">
-                      <strong>{selectedUploadFile.name}</strong>
-                      <span>{formatFileSize(selectedUploadFile.size)}</span>
-                    </div>
-                  )}
-
-                  {uploadError && <div className="error">{uploadError}</div>}
-                  {documentMessage && <div className="files-status-message">{documentMessage}</div>}
-
-                  <div className="files-upload-actions">
-                    <div className="files-upload-hint">
-                      {selectedUploadCase
-                        ? `Destino atual: ${caseLabelById.get(selectedUploadCase.id) || "Processo"} / ${selectedUploadFolder}`
-                        : `Destino atual: ${selectedClientTree.client.name} / ${selectedUploadFolder}`}
-                    </div>
-                    <button className="btn" type="button" disabled={!selectedUploadFile || isUploadingDocument} onClick={handleUploadDocument}>
-                      {isUploadingDocument ? "Enviando..." : "Enviar PDF"}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="files-surface files-documents-card">
-                  <div className="files-card-head">
-                    <div>
-                      <div className="files-card-title">Documentos enviados</div>
-                      <div className="files-card-sub">Arquivos já armazenados para este cliente e seus processos.</div>
-                    </div>
-                    <div className="files-panel-badge">{documents.length}</div>
-                  </div>
-
-                  {documentsError && <div className="error">{documentsError}</div>}
-
-                  {isLoadingDocuments ? (
-                    <div className="files-empty">Carregando documentos...</div>
-                  ) : documents.length === 0 ? (
-                    <div className="files-empty">Nenhum documento enviado ainda para este cliente.</div>
                   ) : (
-                    <div className="files-document-list">
-                      {documents.map((record) => (
-                        <div key={record.id} className="files-document-item">
-                          <div className="files-document-main">
-                            <div className="files-document-name">{record.original_name}</div>
-                            <div className="files-document-meta">
-                              <span>{record.case_id ? `${caseLabelById.get(record.case_id) || "Processo"} / ${record.folder_label}` : `${selectedClientTree.client.name} / ${record.folder_label}`}</span>
-                              <span>{formatFileSize(record.size_bytes)}</span>
-                              <span>{formatDateTimePtBr(record.created_at)}</span>
+                    <>
+                      {clientSearchResults.map((tree) => (
+                        <button
+                          key={tree.client.id}
+                          type="button"
+                          className={`files-picker-item ${tree.client.id === selectedClientId ? "active" : ""}`}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => handleSelectClientTree(tree)}
+                        >
+                          <div className="files-client-avatar">{tree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                          <div className="files-picker-copy">
+                            <div className="files-client-row">
+                              <div className="files-client-name">{tree.client.name}</div>
+                              <div className="files-client-folder-count">{tree.totalFolders}</div>
+                            </div>
+                            <div className="files-client-sub">
+                              {tree.cases.length
+                                ? `${tree.cases.length} processo${tree.cases.length > 1 ? "s" : ""} com subpastas`
+                                : "Estrutura pronta para receber o primeiro processo"}
+                            </div>
+                            <div className="files-client-tags">
+                              <span className="files-chip">{tree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                              {tree.client.document && <span className="files-chip muted">{tree.client.document}</span>}
                             </div>
                           </div>
-                          <div className="files-document-actions">
-                            <button className="btn ghost small" type="button" onClick={() => handleDownloadStoredDocument(record)}>
-                              Baixar
-                            </button>
-                            <button
-                              className="btn ghost small danger"
-                              type="button"
-                              disabled={deletingDocumentId === record.id}
-                              onClick={() => handleDeleteStoredDocument(record)}
-                            >
-                              {deletingDocumentId === record.id ? "Removendo..." : "Excluir"}
-                            </button>
-                          </div>
-                        </div>
+                        </button>
                       ))}
-                    </div>
+                      {!searchTerm.trim() && allClientTrees.length > clientSearchResults.length && (
+                        <div className="files-picker-footer">Mostrando os primeiros 8 clientes. Digite para refinar.</div>
+                      )}
+                    </>
                   )}
                 </div>
+              )}
+            </div>
+            {error && !isClientSearchOpen && <div className="error">{error}</div>}
+          </div>
+          <div className="files-overview-side">
+            {selectedClientTree ? (
+              <>
+                <div className="files-client-avatar large">{selectedClientTree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                <div className="files-client-tags">
+                  <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                  <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
+                  <span className="files-chip">{documents.length} PDF{documents.length === 1 ? "" : "s"}</span>
+                </div>
+              </>
+            ) : (
+              <div className="files-client-tags">
+                <span className="files-chip">{allClientTrees.length} cliente{allClientTrees.length === 1 ? "" : "s"} com pasta</span>
+                <span className="files-chip">{linkedCaseCount} processo{linkedCaseCount === 1 ? "" : "s"}</span>
               </div>
+            )}
+          </div>
+        </div>
 
-              <div className="files-surface files-tree-card">
+        {!selectedClientTree ? (
+          <div className="files-surface files-empty-workspace">
+            {isLoading
+              ? "Carregando estrutura de pastas..."
+              : allClientTrees.length === 0
+                ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
+                : "Busque um cliente e selecione-o na barra acima para visualizar a estrutura de arquivos."}
+          </div>
+        ) : (
+          <>
+            <div className="files-surface files-browser-card">
                 <div className="files-card-head">
                   <div>
-                    <div className="files-card-title">Árvore sugerida</div>
-                    <div className="files-card-sub">Modelo para organizar os documentos do cliente e dos processos.</div>
+                    <div className="files-card-title">Pastas do cliente</div>
+                    <div className="files-card-sub">Visão direta das áreas principais, com contagem de PDFs em cada uma.</div>
                   </div>
                 </div>
-
-                <div className="files-tree-root">
-                  <FolderNodeIcon kind="client-root" />
-                  <div className="files-tree-copy">
-                    <div className="files-tree-name">{selectedClientTree.client.name}</div>
-                    <div className="files-tree-note">{selectedClientTree.client.document || "Cliente sem documento cadastrado"}</div>
-                  </div>
-                </div>
-
-                <ul className="files-tree-list root">
-                  {selectedClientTree.nodes.map((node) => (
-                    <FileTreeNode key={node.id} node={node} />
+                <div className="files-folder-grid">
+                  {rootFolderCards.map((folder) => (
+                    <button
+                      key={folder.label}
+                      type="button"
+                      className={`files-folder-card ${folder.count > 0 ? "has-files" : ""} ${
+                        selectedFolderTarget?.scope === "client" && selectedFolderTarget.folderLabel === folder.label ? "active" : ""
+                      }`}
+                      onClick={() => setSelectedFolderTarget({ scope: "client", folderLabel: folder.label })}
+                    >
+                      <div className="files-folder-top">
+                        <div className="files-folder-icon">{folder.label.charAt(0)}</div>
+                        <div className="files-folder-count">{folder.count}</div>
+                      </div>
+                      <div className="files-folder-name">{folder.label}</div>
+                    </button>
                   ))}
-                </ul>
+                </div>
               </div>
 
-              <div className="files-guideline-grid">
-                <div className="files-surface files-guideline-card">
-                  <div className="files-card-title">Pastas fixas do cliente</div>
-                  <div className="files-card-sub">Essas pastas fazem sentido existir mesmo antes do primeiro processo.</div>
-                  <div className="files-guideline-list">
-                    {selectedClientFolders.map((folder) => (
-                      <div key={folder.label} className="files-guideline-item">
-                        <div className="files-guideline-name">{folder.label}</div>
-                        <div className="files-guideline-note">{folder.note}</div>
+              <div className="files-surface files-documents-card">
+                <div className="files-card-head">
+                  <div>
+                    <div className="files-card-title">{selectedFolderTitle}</div>
+                    <div className="files-card-sub">{selectedFolderDescription}</div>
+                  </div>
+                  <div className="files-panel-badge">{selectedFolderDocuments.length}</div>
+                </div>
+
+                {documentMessage && <div className="files-status-message">{documentMessage}</div>}
+                {documentsError && <div className="error">{documentsError}</div>}
+
+                {isLoadingDocuments ? (
+                  <div className="files-empty">Carregando documentos...</div>
+                ) : selectedFolderDocuments.length === 0 ? (
+                  <div className="files-empty">Nenhum documento enviado ainda para a pasta selecionada.</div>
+                ) : (
+                  <div className="files-document-list">
+                    {selectedFolderDocuments.map((record) => (
+                      <div key={record.id} className="files-document-item">
+                        <div className="files-document-main">
+                          <div className="files-document-name">{record.original_name}</div>
+                          <div className="files-document-meta">
+                            <span>{record.case_id ? `${caseLabelById.get(record.case_id) || "Processo"} / ${record.folder_label}` : `${selectedClientTree.client.name} / ${record.folder_label}`}</span>
+                            <span>{formatFileSize(record.size_bytes)}</span>
+                            <span>{formatDateTimePtBr(record.created_at)}</span>
+                          </div>
+                        </div>
+                        <div className="files-document-actions">
+                          <button className="btn ghost small" type="button" onClick={() => handleDownloadStoredDocument(record)}>
+                            Baixar
+                          </button>
+                          <button
+                            className="btn ghost small danger"
+                            type="button"
+                            disabled={deletingDocumentId === record.id}
+                            onClick={() => handleDeleteStoredDocument(record)}
+                          >
+                            {deletingDocumentId === record.id ? "Removendo..." : "Excluir"}
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
-                </div>
+                )}
+              </div>
 
-                <div className="files-surface files-guideline-card">
-                  <div className="files-card-title">Pastas padrão por processo</div>
-                  <div className="files-card-sub">Cada processo cadastrado pode nascer com esta divisão interna.</div>
-                  <div className="files-guideline-list">
-                    {processFolderBlueprint.map((folder) => (
-                      <div key={folder.label} className="files-guideline-item">
-                        <div className="files-guideline-name">{folder.label}</div>
-                        <div className="files-guideline-note">{folder.note}</div>
-                      </div>
-                    ))}
+              <div className="files-surface files-browser-card">
+                <div className="files-card-head">
+                  <div>
+                    <div className="files-card-title">Processos vinculados</div>
+                    <div className="files-card-sub">Cada processo possui subpastas próprias, como documentos e financeiro, sem misturar arquivos entre casos.</div>
                   </div>
                 </div>
+                {processCards.length === 0 ? (
+                  <div className="files-empty">Este cliente ainda não possui processos vinculados.</div>
+                ) : (
+                  <div className="files-case-grid">
+                    {processCards.map(({ caseItem, latestRecord, totalDocuments, sections }) => (
+                      <article key={caseItem.id} className="files-case-card">
+                        <div className="files-case-head">
+                          <div>
+                            <div className="files-case-number">{caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`}</div>
+                            <div className="files-case-note">
+                              {[caseItem.title?.trim(), caseItem.status?.trim()].filter(Boolean).join(" · ") || "Sem detalhes adicionais"}
+                            </div>
+                          </div>
+                        <div className="files-case-summary">
+                          <strong>{totalDocuments}</strong>
+                          <span>PDF{totalDocuments === 1 ? "" : "s"}</span>
+                        </div>
+                      </div>
+                      <div className="files-case-folders">
+                        {sections.map((folder) => (
+                          <button
+                            key={`${caseItem.id}-${folder.label}`}
+                            type="button"
+                            className={`files-case-folder-chip ${folder.count > 0 ? "filled" : ""} ${
+                              selectedFolderTarget?.scope === "case" &&
+                              selectedFolderTarget.caseId === caseItem.id &&
+                              selectedFolderTarget.folderLabel === folder.label
+                                ? "active"
+                                : ""
+                            }`}
+                            onClick={() => setSelectedFolderTarget({ scope: "case", caseId: caseItem.id, folderLabel: folder.label })}
+                          >
+                            <span>{folder.label}</span>
+                            <strong>{folder.count}</strong>
+                          </button>
+                        ))}
+                      </div>
+                        <div className="files-case-footer">
+                          {latestRecord ? `Último envio: ${formatDateTimePtBr(latestRecord.created_at)}` : "Nenhum PDF enviado para este processo"}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
               </div>
-            </>
-          )}
-        </section>
-      </div>
+          </>
+        )}
+      </section>
+
+      {selectedClientTree && (
+        <FilesUploadModal
+          open={showUploadModal}
+          clientName={selectedClientTree.client.name}
+          cases={selectedClientTree.cases}
+          folderOptions={uploadFolderOptions}
+          selectedCaseId={selectedUploadCaseId}
+          selectedFolder={selectedUploadFolder}
+          selectedFile={selectedUploadFile}
+          inputKey={uploadInputKey}
+          errorMessage={uploadError}
+          saving={isUploadingDocument}
+          onClose={handleCloseUploadModal}
+          onCaseChange={setSelectedUploadCaseId}
+          onFolderChange={setSelectedUploadFolder}
+          onFileChange={handleSelectUploadFile}
+          onSave={handleUploadDocument}
+        />
+      )}
     </div>
   );
 }
