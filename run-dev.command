@@ -4,20 +4,31 @@
 set -euo pipefail
 
 ROOT="$HOME/Documents/NEWLAW"
-PYBIN="$ROOT/backend/.venv/bin/python"
+API_URL="${VITE_API_URL:-https://api.newlaw.app.br}"
+PYBIN="$ROOT/backend/.venv312/bin/python"
+if [ ! -x "$PYBIN" ]; then
+  PYBIN="$ROOT/backend/.venv/bin/python"
+fi
 
 cd "$ROOT" || exit 1
+
+echo "Using API: $API_URL"
 
 # Libera porta do Vite, se estiver presa
 pkill -f "vite --host --port 5173" 2>/dev/null || true
 
-# Sobe backend FastAPI
-source "$ROOT/backend/.venv/bin/activate"
-"$PYBIN" -m uvicorn backend.main:app --reload --port 8000 &
-BACK_PID=$!
+BACK_PID=""
+if [ "$API_URL" = "http://127.0.0.1:8000" ] || [ "$API_URL" = "http://localhost:8000" ]; then
+  # Sobe backend FastAPI apenas quando o app for usar a API local.
+  source "$(dirname "$PYBIN")/activate"
+  "$PYBIN" -m uvicorn backend.main:app --reload --port 8000 &
+  BACK_PID=$!
+fi
 
 # Roda Tauri (sobe o frontend Vite e abre a janela)
-cargo tauri dev
+VITE_API_URL="$API_URL" cargo tauri dev
 
 # Ao sair do Tauri, derruba o backend
-kill "$BACK_PID" 2>/dev/null || true
+if [ -n "$BACK_PID" ]; then
+  kill "$BACK_PID" 2>/dev/null || true
+fi

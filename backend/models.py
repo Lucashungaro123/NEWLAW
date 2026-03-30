@@ -168,6 +168,46 @@ class ClientDocument(TimestampMixin, table=True):
     size_bytes: int
 
 
+class PublicationAutomationConfig(TimestampMixin, table=True):
+    __table_args__ = (UniqueConstraint("organization_id", name="uq_publication_automation_config_org"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: int = Field(foreign_key="organization.id", index=True)
+    is_enabled: bool = False
+    schedule_time: str = Field(default="06:00", description="Horário diário local no formato HH:MM")
+    last_run_at: Optional[datetime] = Field(default=None, index=True)
+    last_status: Optional[str] = Field(default=None)
+    last_message: Optional[str] = Field(default=None)
+    last_new_records: int = 0
+    last_existing_records: int = 0
+    last_failed_records: int = 0
+
+
+class PublicationRecord(TimestampMixin, table=True):
+    __table_args__ = (UniqueConstraint("organization_id", "source_key", name="uq_publication_record_org_source"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: int = Field(foreign_key="organization.id", index=True)
+    client_id: Optional[int] = Field(default=None, index=True)
+    case_id: Optional[int] = Field(default=None, index=True)
+    document_id: Optional[int] = Field(default=None, index=True)
+    client_name_snapshot: Optional[str] = None
+    case_number_snapshot: Optional[str] = None
+    source: str = Field(index=True)
+    source_key: str = Field(index=True)
+    matched_via: Optional[str] = Field(default=None, index=True, description="case_number|client_name|team_oab")
+    matched_query: Optional[str] = None
+    title: str
+    summary: Optional[str] = None
+    detail_url: str
+    certified_url: Optional[str] = None
+    publication_date: datetime = Field(index=True)
+    edition_number: Optional[str] = None
+    section_name: Optional[str] = None
+    page_number: Optional[str] = None
+    document_storage_path: Optional[str] = None
+
+
 class Template(TimestampMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: Optional[int] = Field(default=None, foreign_key="organization.id")

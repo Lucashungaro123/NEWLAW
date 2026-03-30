@@ -17,6 +17,7 @@ VPS_SERVICE="${VPS_SERVICE:-newlaw-api}"
 API_BASE_URL="${API_BASE_URL:-https://api.newlaw.app.br}"
 
 DO_SYNC=1
+DO_INSTALL=1
 DO_RESTART=1
 DO_CHECK=1
 
@@ -27,6 +28,7 @@ Uso:
 
 Opcoes:
   --sync-only     Faz apenas sincronizacao de arquivos (rsync).
+  --skip-install  Pula instalacao de dependencias Python no VPS.
   --restart-only  Reinicia apenas o servico no VPS.
   --no-check      Pula validacoes HTTP apos restart.
 EOF
@@ -36,11 +38,16 @@ for arg in "$@"; do
   case "$arg" in
     --sync-only)
       DO_SYNC=1
+      DO_INSTALL=0
       DO_RESTART=0
       DO_CHECK=0
       ;;
+    --skip-install)
+      DO_INSTALL=0
+      ;;
     --restart-only)
       DO_SYNC=0
+      DO_INSTALL=0
       DO_RESTART=1
       DO_CHECK=1
       ;;
@@ -61,6 +68,16 @@ done
 
 if [[ "$DO_SYNC" -eq 1 ]]; then
   "$SYNC_SCRIPT"
+fi
+
+if [[ "$DO_INSTALL" -eq 1 ]]; then
+  echo "Instalando dependencias Python no VPS..."
+  ssh "${VPS_USER}@${VPS_HOST}" "
+    set -e
+    cd ${VPS_PATH}
+    source backend/.venv/bin/activate
+    pip install -r backend/requirements.txt
+  "
 fi
 
 if [[ "$DO_RESTART" -eq 1 ]]; then

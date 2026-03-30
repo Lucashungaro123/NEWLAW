@@ -36,7 +36,8 @@ Use dois terminais:
    VITE_API_URL=https://api.newlaw.app.br cargo tauri dev
    ```
    - Se a porta 5173 estiver ocupada: `pkill -f "vite --host --port 5173"` e rode de novo.
-   - Se o Tauri não achar o Python, edite `src-tauri/src/main.rs` e troque `"python"` por `"/Users/lucashungaro/Documents/NEWLAW/backend/.venv/bin/python"`.
+   - Para usar a API local em vez da remota: `VITE_API_URL=http://127.0.0.1:8000 cargo tauri dev`
+   - Se precisar definir o Python manualmente, use a variável `NEWLAW_PYTHON` apontando para a venv 3.12 do projeto.
 
 Opcional: subir o frontend no navegador diretamente
 ```

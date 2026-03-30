@@ -13,15 +13,20 @@ import os
 import re
 import secrets
 import smtplib
-from datetime import datetime, timedelta, timezone
+import threading
+import time
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
-from html import escape
+from html import escape, unescape
 from typing import Annotated, Any, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo
 
+import requests
 from cryptography.fernet import Fernet, InvalidToken
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
@@ -46,6 +51,8 @@ from .models import (
     Invoice,
     Organization,
     Plan,
+    PublicationAutomationConfig,
+    PublicationRecord,
     RefreshToken,
     TeamMember,
     Template,
@@ -115,6 +122,17 @@ FINANCE_RECURRING_OPTIONS = ("nao-recorrente", "mensal", "anual", "personalizado
 CASE_NUMBER_PATTERN = re.compile(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$")
 FILES_MAX_UPLOAD_BYTES = int(os.getenv("NEWLAW_FILES_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 FILES_ALLOWED_CONTENT_TYPES = ("application/pdf", "application/x-pdf", "application/octet-stream")
+PUBLICATIONS_DEFAULT_SCHEDULE_TIME = os.getenv("NEWLAW_PUBLICATIONS_DEFAULT_SCHEDULE", "06:00")
+PUBLICATIONS_LOOKBACK_DAYS = int(os.getenv("NEWLAW_PUBLICATIONS_LOOKBACK_DAYS", "7"))
+PUBLICATIONS_FOLDER_LABEL = "Publicações"
+PUBLICATIONS_SCHEDULER_INTERVAL_SECONDS = int(os.getenv("NEWLAW_PUBLICATIONS_SCHEDULER_INTERVAL_SECONDS", "60"))
+PUBLICATIONS_HTTP_TIMEOUT_SECONDS = int(os.getenv("NEWLAW_PUBLICATIONS_HTTP_TIMEOUT_SECONDS", "30"))
+PUBLICATIONS_SOURCE_DJEN = "djen_cnj"
+PUBLICATIONS_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Accept": "application/json, application/pdf, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -127,6 +145,14 @@ MICROSOFT_PROFILE_URL = "https://graph.microsoft.com/v1.0/me?$select=mail,userPr
 MICROSOFT_EVENTS_URL = "https://graph.microsoft.com/v1.0/me/calendarView"
 
 PENDING_OAUTH_STATES: dict[str, dict[str, Any]] = {}
+PUBLICATION_SYNC_LOCKS: dict[int, threading.Lock] = {}
+PUBLICATION_SYNC_LOCKS_GUARD = threading.Lock()
+PUBLICATION_SCHEDULER_THREAD: threading.Thread | None = None
+
+try:
+    APP_TIMEZONE = ZoneInfo(os.getenv("NEWLAW_TIMEZONE", "America/Sao_Paulo"))
+except Exception:
+    APP_TIMEZONE = ZoneInfo("America/Sao_Paulo")
 
 engine = create_engine(DB_PATH, echo=False)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -519,7 +545,7 @@ def build_calendar_oauth_url(provider: str, state: str, redirect_uri: str) -> st
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email openid",
+            "scope": "https://www.googleapis.com/auth/calendar.readonly",
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
@@ -739,7 +765,11 @@ def save_calendar_connection_tokens(
         connection.token_expires_at = datetime.utcnow() + timedelta(minutes=50)
     if isinstance(scope, str) and scope.strip():
         connection.scope = scope.strip()
-    connection.provider_email = provider_email or connection.provider_email
+    if provider_email is not None:
+        connection.provider_email = provider_email
+    elif connection.provider == "google":
+        # Google no longer asks for profile scopes in this flow.
+        connection.provider_email = None
     connection.is_active = True
     connection.sync_error = None
     connection.updated_at = datetime.utcnow()
@@ -763,7 +793,9 @@ def ensure_calendar_access_token(session: Session, connection: CalendarConnectio
             detail="Reconecte seu calendário para atualizar os eventos.",
         )
     refreshed = refresh_calendar_access_token(connection.provider, refresh_token)
-    provider_email = fetch_provider_profile_email(connection.provider, refreshed.get("access_token", "")) if refreshed.get("access_token") else None
+    provider_email = None
+    if connection.provider != "google" and refreshed.get("access_token"):
+        provider_email = fetch_provider_profile_email(connection.provider, refreshed.get("access_token", ""))
     updated = save_calendar_connection_tokens(session, connection, refreshed, provider_email)
     access_token = decrypt_calendar_token(updated.access_token_encrypted)
     if not access_token:
@@ -1087,6 +1119,101 @@ def parse_deadline_due_date(raw_value: str) -> datetime:
     return parsed
 
 
+INTERNAL_AGENDA_EVENT_TYPES = {"deadline", "meeting", "hearing", "audit"}
+
+
+def normalize_internal_agenda_event_type(raw_value: str | None) -> str:
+    value = (raw_value or "").strip().lower()
+    aliases = {
+        "prazo": "deadline",
+        "reuniao": "meeting",
+        "reunião": "meeting",
+        "audiencia": "hearing",
+        "audiência": "hearing",
+        "auditoria": "audit",
+    }
+    normalized = aliases.get(value, value or "deadline")
+    return normalized if normalized in INTERNAL_AGENDA_EVENT_TYPES else "deadline"
+
+
+def normalize_internal_agenda_time(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%H:%M")
+    except ValueError:
+        return None
+    return parsed.strftime("%H:%M")
+
+
+def parse_internal_agenda_metadata(raw_notes: str | None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "notes": None,
+        "event_type": "deadline",
+        "meeting_url": None,
+        "assignees": None,
+        "end_time": None,
+        "assignee_id": None,
+        "assignee_name": None,
+        "is_all_day": True,
+    }
+    if not raw_notes:
+        return metadata
+    try:
+        parsed = json.loads(raw_notes)
+    except (TypeError, json.JSONDecodeError):
+        metadata["notes"] = raw_notes.strip() or None
+        return metadata
+    if not isinstance(parsed, dict) or not parsed.get("_agenda_internal"):
+        metadata["notes"] = raw_notes.strip() or None
+        return metadata
+    metadata["notes"] = parsed.get("notes").strip() if isinstance(parsed.get("notes"), str) and parsed.get("notes").strip() else None
+    metadata["event_type"] = normalize_internal_agenda_event_type(parsed.get("event_type"))
+    metadata["meeting_url"] = (
+        parsed.get("meeting_url").strip() if isinstance(parsed.get("meeting_url"), str) and parsed.get("meeting_url").strip() else None
+    )
+    metadata["assignees"] = (
+        parsed.get("assignees").strip() if isinstance(parsed.get("assignees"), str) and parsed.get("assignees").strip() else None
+    )
+    metadata["end_time"] = normalize_internal_agenda_time(parsed.get("end_time") if isinstance(parsed.get("end_time"), str) else None)
+    metadata["assignee_id"] = parsed.get("assignee_id") if isinstance(parsed.get("assignee_id"), int) else None
+    metadata["assignee_name"] = (
+        parsed.get("assignee_name").strip()
+        if isinstance(parsed.get("assignee_name"), str) and parsed.get("assignee_name").strip()
+        else None
+    )
+    metadata["is_all_day"] = bool(parsed.get("is_all_day", True))
+    return metadata
+
+
+def serialize_internal_agenda_metadata(
+    *,
+    notes: str | None,
+    event_type: str,
+    meeting_url: str | None,
+    assignees: str | None,
+    end_time: str | None,
+    assignee_id: int | None,
+    assignee_name: str | None,
+    is_all_day: bool,
+) -> str | None:
+    payload = {
+        "_agenda_internal": True,
+        "notes": (notes or "").strip() or None,
+        "event_type": normalize_internal_agenda_event_type(event_type),
+        "meeting_url": (meeting_url or "").strip() or None,
+        "assignees": (assignees or "").strip() or None,
+        "end_time": normalize_internal_agenda_time(end_time),
+        "assignee_id": assignee_id,
+        "assignee_name": (assignee_name or "").strip() or None,
+        "is_all_day": bool(is_all_day),
+    }
+    if not any(value for key, value in payload.items() if key != "_agenda_internal") and is_all_day:
+        return None
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def serialize_calendar_connection_status(provider: str, connection: CalendarConnection | None) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -1098,20 +1225,34 @@ def serialize_calendar_connection_status(provider: str, connection: CalendarConn
 
 
 def serialize_deadline(deadline: AgendaDeadline) -> dict[str, Any]:
+    metadata = parse_internal_agenda_metadata(deadline.notes)
+    event_type = normalize_internal_agenda_event_type(metadata.get("event_type"))
+    is_all_day = bool(metadata.get("is_all_day", True))
+    assignees = metadata.get("assignees") or metadata.get("assignee_name")
+    ends_at = deadline.due_at + timedelta(hours=1)
+    end_time = normalize_internal_agenda_time(metadata.get("end_time"))
+    if not is_all_day and end_time:
+        hour, minute = map(int, end_time.split(":"))
+        ends_at = deadline.due_at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if ends_at <= deadline.due_at:
+            ends_at = ends_at + timedelta(days=1)
     return {
         "id": f"deadline-{deadline.id}",
         "entity_id": deadline.id,
-        "kind": "deadline",
+        "kind": "deadline" if event_type == "deadline" else "meeting",
         "source": "internal",
         "title": deadline.title,
         "starts_at": deadline.due_at.isoformat(timespec="seconds"),
-        "ends_at": (deadline.due_at + timedelta(hours=1)).isoformat(timespec="seconds"),
-        "is_all_day": True,
+        "ends_at": ends_at.isoformat(timespec="seconds"),
+        "is_all_day": is_all_day,
         "location": None,
-        "meeting_url": None,
+        "meeting_url": metadata.get("meeting_url"),
         "reference": deadline.reference,
-        "description": deadline.notes,
+        "description": metadata.get("notes"),
         "status": "concluido" if deadline.is_completed else "pendente",
+        "event_type": event_type,
+        "assignee_name": assignees,
+        "assignees": assignees,
     }
 
 
@@ -1724,6 +1865,11 @@ class AgendaDeadlineCreateRequest(BaseModel):
     due_date: str
     reference: str | None = None
     notes: str | None = None
+    event_type: str | None = None
+    meeting_url: str | None = None
+    assignees: str | None = None
+    end_time: str | None = None
+    is_all_day: bool = True
 
 
 class AgendaSyncResponse(BaseModel):
@@ -1790,6 +1936,76 @@ class ClientDocumentResponse(BaseModel):
     size_bytes: int
     created_at: datetime
     updated_at: datetime
+
+
+class PublicationAutomationUpdateRequest(BaseModel):
+    is_enabled: bool
+    schedule_time: str
+
+
+class PublicationRecordSummaryResponse(BaseModel):
+    id: int
+    title: str
+    publication_date: datetime
+    client_name: str | None = None
+    case_number: str | None = None
+    matched_via: str | None = None
+    created_at: datetime
+
+
+class PublicationAutomationConfigResponse(BaseModel):
+    organization_id: int
+    is_enabled: bool
+    schedule_time: str
+    last_run_at: datetime | None = None
+    next_run_at: datetime | None = None
+    last_status: str | None = None
+    last_message: str | None = None
+    last_new_records: int = 0
+    last_existing_records: int = 0
+    last_failed_records: int = 0
+    is_running: bool = False
+    recent_records: list[PublicationRecordSummaryResponse] = []
+
+
+class PublicationAutomationRunResponse(BaseModel):
+    started_at: datetime
+    finished_at: datetime
+    new_records: int
+    existing_records: int
+    failed_records: int
+    message: str
+    config: PublicationAutomationConfigResponse
+
+
+class TodayPublicationItemResponse(BaseModel):
+    id: int
+    hash: str
+    title: str
+    publication_date: str
+    tribunal: str | None = None
+    court_name: str | None = None
+    process_number: str | None = None
+    communication_type: str | None = None
+    detail_url: str
+    summary: str | None = None
+
+
+class TodayPublicationsResponse(BaseModel):
+    member_name: str
+    member_email: str
+    oab: str
+    publication_date: str
+    count: int
+    items: list[TodayPublicationItemResponse]
+
+
+class PublicationSearchByOabRequest(BaseModel):
+    oab_number: str
+    oab_uf: str
+    member_name: str
+    member_email: str
+    publication_date: str
 
 
 def resolve_organization_scope(
@@ -2288,6 +2504,741 @@ def purge_documents(session: Session, documents: list[ClientDocument]) -> None:
         session.delete(document)
 
 
+def get_publication_sync_lock(organization_id: int) -> threading.Lock:
+    with PUBLICATION_SYNC_LOCKS_GUARD:
+        lock = PUBLICATION_SYNC_LOCKS.get(organization_id)
+        if lock is None:
+            lock = threading.Lock()
+            PUBLICATION_SYNC_LOCKS[organization_id] = lock
+        return lock
+
+
+def is_publication_sync_running(organization_id: int) -> bool:
+    return get_publication_sync_lock(organization_id).locked()
+
+
+def get_local_now() -> datetime:
+    return datetime.now(APP_TIMEZONE).replace(tzinfo=None)
+
+
+def validate_publication_schedule_time(raw_value: str | None) -> str:
+    value = (raw_value or "").strip()
+    if not re.fullmatch(r"\d{2}:\d{2}", value):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Horário inválido. Use o formato HH:MM")
+    hours, minutes = value.split(":")
+    hour = int(hours)
+    minute = int(minutes)
+    if hour > 23 or minute > 59:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Horário inválido. Use um horário entre 00:00 e 23:59")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_publication_schedule_time(value: str) -> tuple[int, int]:
+    clean = validate_publication_schedule_time(value)
+    hours, minutes = clean.split(":")
+    return int(hours), int(minutes)
+
+
+def compute_next_publication_run_at(config: PublicationAutomationConfig, now_local: datetime | None = None) -> datetime:
+    reference = now_local or get_local_now()
+    hour, minute = parse_publication_schedule_time(config.schedule_time)
+    next_run = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if config.last_run_at and config.last_run_at.date() == reference.date() and config.last_run_at >= next_run:
+        next_run = next_run + timedelta(days=1)
+    elif reference > next_run:
+        next_run = next_run + timedelta(days=1)
+    return next_run
+
+
+def should_run_publication_sync(config: PublicationAutomationConfig, now_local: datetime | None = None) -> bool:
+    if not config.is_enabled:
+        return False
+    reference = now_local or get_local_now()
+    hour, minute = parse_publication_schedule_time(config.schedule_time)
+    scheduled_for_today = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reference < scheduled_for_today:
+        return False
+    if config.last_run_at and config.last_run_at.date() == reference.date() and config.last_run_at >= scheduled_for_today:
+        return False
+    return True
+
+
+def get_or_create_publication_config(session: Session, organization_id: int) -> PublicationAutomationConfig:
+    config = session.exec(
+        select(PublicationAutomationConfig).where(PublicationAutomationConfig.organization_id == organization_id)
+    ).first()
+    if config:
+        return config
+    config = PublicationAutomationConfig(
+        organization_id=organization_id,
+        is_enabled=False,
+        schedule_time=PUBLICATIONS_DEFAULT_SCHEDULE_TIME,
+    )
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+    return config
+
+
+def strip_html_text(value: str | None) -> str:
+    if not value:
+        return ""
+    without_tags = re.sub(r"<[^>]+>", " ", value)
+    normalized = re.sub(r"\s+", " ", unescape(without_tags)).strip()
+    return normalized
+
+
+def normalize_case_number_digits(value: str | None) -> str:
+    return "".join(char for char in (value or "") if char.isdigit())
+
+
+def format_case_number_from_digits(value: str | None) -> str | None:
+    digits = normalize_case_number_digits(value)
+    if len(digits) != 20:
+        return None
+    return f"{digits[:7]}-{digits[7:9]}.{digits[9:13]}.{digits[13]}.{digits[14:16]}.{digits[16:]}"
+
+
+def normalize_publication_match_text(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.upper()
+    normalized = re.sub(r"[^A-Z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def parse_team_member_oab(value: str | None) -> dict[str, str] | None:
+    raw = (value or "").strip().upper()
+    if not raw:
+        return None
+    compact = re.sub(r"\s+", "", raw)
+    match = re.search(r"(?P<number>\d+)[^A-Z0-9]?(?P<uf>[A-Z]{2})$", compact)
+    if match:
+        number = match.group("number")
+        uf = match.group("uf")
+    else:
+        number = "".join(char for char in compact if char.isdigit())
+        letters = "".join(char for char in compact if char.isalpha())
+        uf = letters[-2:] if len(letters) >= 2 else ""
+    if not number:
+        return None
+    normalized = f"{number}/{uf}" if uf else number
+    return {
+        "number": number,
+        "uf": uf,
+        "normalized": normalized,
+    }
+
+
+def make_publication_file_name(title: str, publication_date: datetime) -> str:
+    slug = slugify_storage_segment(strip_html_text(title)[:90])
+    return f"publicacao-{publication_date.date().isoformat()}-{slug}.pdf"
+
+
+def store_internal_client_document_pdf(
+    session: Session,
+    *,
+    client: Client,
+    case: Case | None,
+    folder_label: str,
+    original_name: str,
+    content: bytes,
+) -> ClientDocument:
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo de publicação inválido")
+    label = normalize_document_folder_label(folder_label)
+    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label)
+    absolute_path = get_document_absolute_path(storage_relative_path)
+    with open(absolute_path, "wb") as buffer:
+        buffer.write(content)
+    document = ClientDocument(
+        organization_id=client.organization_id,
+        uploaded_by_user_id=None,
+        client_id=client.id,
+        case_id=case.id if case and case.id is not None else None,
+        folder_label=label,
+        original_name=original_name,
+        stored_name=stored_name,
+        storage_path=storage_relative_path,
+        content_type="application/pdf",
+        size_bytes=len(content),
+    )
+    session.add(document)
+    session.flush()
+    return document
+
+
+def publication_record_has_local_document(session: Session, record: PublicationRecord) -> bool:
+    if not record.document_storage_path:
+        return False
+    try:
+        absolute_path = get_document_absolute_path(record.document_storage_path)
+    except HTTPException:
+        return False
+    if not os.path.exists(absolute_path):
+        return False
+    if record.document_id is None:
+        return False
+    return session.get(ClientDocument, record.document_id) is not None
+
+
+def serialize_publication_record_summary(record: PublicationRecord) -> dict[str, Any]:
+    return PublicationRecordSummaryResponse(
+        id=record.id or 0,
+        title=record.title,
+        publication_date=record.publication_date,
+        client_name=record.client_name_snapshot,
+        case_number=record.case_number_snapshot,
+        matched_via=record.matched_via,
+        created_at=record.created_at,
+    ).model_dump()
+
+
+def build_publication_config_response(
+    session: Session,
+    config: PublicationAutomationConfig,
+) -> dict[str, Any]:
+    recent_records = session.exec(
+        select(PublicationRecord)
+        .where(PublicationRecord.organization_id == config.organization_id)
+        .order_by(PublicationRecord.created_at.desc())
+    ).all()[:5]
+    return PublicationAutomationConfigResponse(
+        organization_id=config.organization_id,
+        is_enabled=config.is_enabled,
+        schedule_time=config.schedule_time,
+        last_run_at=config.last_run_at,
+        next_run_at=compute_next_publication_run_at(config),
+        last_status=config.last_status,
+        last_message=config.last_message,
+        last_new_records=config.last_new_records,
+        last_existing_records=config.last_existing_records,
+        last_failed_records=config.last_failed_records,
+        is_running=is_publication_sync_running(config.organization_id),
+        recent_records=[serialize_publication_record_summary(record) for record in recent_records],
+    ).model_dump()
+
+
+def build_publication_search_targets(
+    session: Session,
+    organization_id: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    members = session.exec(
+        select(TeamMember).where(
+            TeamMember.organization_id == organization_id,
+            TeamMember.is_active == True,  # noqa: E712
+        )
+    ).all()
+    targets: list[dict[str, Any]] = []
+    skipped_members: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for member in members:
+        parsed_oab = parse_team_member_oab(member.oab)
+        if parsed_oab is None or not parsed_oab["uf"]:
+            skipped_members.append(member.full_name)
+            continue
+        key = (parsed_oab["number"], parsed_oab["uf"])
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(
+            {
+                "number": parsed_oab["number"],
+                "uf": parsed_oab["uf"],
+                "oab": parsed_oab["normalized"],
+                "member_name": member.full_name,
+            }
+        )
+
+    return targets, skipped_members
+
+
+def build_publication_case_lookup(session: Session, organization_id: int) -> dict[str, tuple[Case, Client]]:
+    clients = session.exec(select(Client).where(Client.organization_id == organization_id)).all()
+    client_map = {client.id: client for client in clients if client.id is not None}
+    cases = session.exec(select(Case).where(Case.organization_id == organization_id)).all()
+    lookup: dict[str, tuple[Case, Client]] = {}
+
+    for case in cases:
+        if case.id is None or case.client_id is None:
+            continue
+        client = client_map.get(case.client_id)
+        if client is None:
+            continue
+        digits = normalize_case_number_digits(case.number)
+        if digits and digits not in lookup:
+            lookup[digits] = (case, client)
+
+    return lookup
+
+
+def build_publication_client_name_lookup(session: Session, organization_id: int) -> dict[str, Client]:
+    clients = session.exec(select(Client).where(Client.organization_id == organization_id)).all()
+    lookup: dict[str, Client] = {}
+    for client in clients:
+        if client.id is None:
+            continue
+        normalized_name = normalize_publication_match_text(client.name)
+        if normalized_name and normalized_name not in lookup:
+            lookup[normalized_name] = client
+    return lookup
+
+
+def request_publications_json(
+    http: requests.Session,
+    *,
+    url: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    for attempt in range(2):
+        response = http.get(url, params=params, timeout=PUBLICATIONS_HTTP_TIMEOUT_SECONDS)
+        if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS and attempt == 0:
+            time.sleep(60)
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+        raise RuntimeError("O DJEN retornou uma resposta inválida")
+    raise RuntimeError("O DJEN excedeu o limite de requisições")
+
+
+def search_djen_publications(
+    http: requests.Session,
+    *,
+    oab_number: str,
+    oab_uf: str,
+    publish_from: datetime,
+    publish_to: datetime,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 1
+    per_page = 100
+
+    while True:
+        payload = request_publications_json(
+            http,
+            url="https://comunicaapi.pje.jus.br/api/v1/comunicacao",
+            params={
+                "numeroOab": oab_number,
+                "ufOab": oab_uf,
+                "dataDisponibilizacaoInicio": publish_from.date().isoformat(),
+                "dataDisponibilizacaoFim": publish_to.date().isoformat(),
+                "itensPorPagina": per_page,
+                "pagina": page,
+                "meio": "D",
+            },
+        )
+        batch = payload.get("items")
+        if not isinstance(batch, list) or not batch:
+            break
+        items.extend(item for item in batch if isinstance(item, dict))
+        total_raw = payload.get("count")
+        total = int(total_raw) if isinstance(total_raw, (int, float)) else None
+        if len(batch) < per_page or (total is not None and len(items) >= total):
+            break
+        page += 1
+
+    return items
+
+
+def build_djen_publication_title(item: dict[str, Any]) -> str:
+    process_number = (
+        str(item.get("numeroprocessocommascara") or "").strip()
+        or format_case_number_from_digits(str(item.get("numero_processo") or "").strip())
+        or "sem processo identificado"
+    )
+    communication_type = str(item.get("tipoComunicacao") or item.get("tipoDocumento") or "Publicação").strip() or "Publicação"
+    tribunal = str(item.get("siglaTribunal") or "").strip()
+    if tribunal:
+        return f"{communication_type} · Processo {process_number} · {tribunal}"
+    return f"{communication_type} · Processo {process_number}"
+
+
+def extract_djen_certified_pdf_url(item: dict[str, Any]) -> str:
+    communication_hash = str(item.get("hash") or "").strip()
+    if not communication_hash:
+        raise RuntimeError("A publicação não informou o hash da certidão")
+    return f"https://comunicaapi.pje.jus.br/api/v1/comunicacao/{communication_hash}/certidao"
+
+
+def download_djen_certified_pdf(http: requests.Session, certified_url: str) -> bytes:
+    response = http.get(certified_url, timeout=PUBLICATIONS_HTTP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    content = response.content
+    if not content.startswith(b"%PDF-"):
+        raise RuntimeError("A certidão do DJEN retornou um arquivo inválido")
+    return content
+
+
+def match_publication_target(
+    item: dict[str, Any],
+    *,
+    case_lookup: dict[str, tuple[Case, Client]],
+    client_name_lookup: dict[str, Client],
+) -> dict[str, Any] | None:
+    process_digits = normalize_case_number_digits(
+        str(item.get("numeroprocessocommascara") or "").strip() or str(item.get("numero_processo") or "").strip()
+    )
+    if process_digits:
+        matched_case = case_lookup.get(process_digits)
+        if matched_case is not None:
+            case, client = matched_case
+            return {
+                "client": client,
+                "case": case,
+                "matched_via": "case_number",
+                "matched_query": case.number,
+            }
+
+    for recipient in item.get("destinatarios") or []:
+        if not isinstance(recipient, dict):
+            continue
+        recipient_name = normalize_publication_match_text(str(recipient.get("nome") or ""))
+        if not recipient_name:
+            continue
+        client = client_name_lookup.get(recipient_name)
+        if client is None:
+            continue
+        return {
+            "client": client,
+            "case": None,
+            "matched_via": "client_name",
+            "matched_query": client.name,
+        }
+
+    return None
+
+
+def get_publication_match_priority(match: dict[str, Any] | None) -> int:
+    if not match:
+        return 0
+    if match.get("case") is not None:
+        return 2
+    if match.get("client") is not None:
+        return 1
+    return 0
+
+
+def serialize_today_publication_item(item: dict[str, Any]) -> dict[str, Any]:
+    process_number = (
+        str(item.get("numeroprocessocommascara") or "").strip()
+        or format_case_number_from_digits(str(item.get("numero_processo") or "").strip())
+    )
+    detail_url = str(item.get("link") or "").strip() or "https://comunica.pje.jus.br/"
+    summary = strip_html_text(str(item.get("texto") or "").strip()) or None
+    publication_date = str(item.get("data_disponibilizacao") or "").strip()
+    return TodayPublicationItemResponse(
+        id=int(item.get("id") or 0),
+        hash=str(item.get("hash") or "").strip(),
+        title=build_djen_publication_title(item),
+        publication_date=publication_date,
+        tribunal=str(item.get("siglaTribunal") or "").strip() or None,
+        court_name=str(item.get("nomeOrgao") or "").strip() or None,
+        process_number=process_number or None,
+        communication_type=str(item.get("tipoComunicacao") or item.get("tipoDocumento") or "").strip() or None,
+        detail_url=detail_url,
+        summary=summary,
+    ).model_dump()
+
+
+def fetch_djen_publications_for_member_oab(
+    *,
+    member_name: str,
+    member_email: str,
+    oab_number: str,
+    oab_uf: str,
+    publication_date: date,
+) -> dict[str, Any]:
+    target_datetime = datetime.combine(publication_date, datetime.min.time())
+    try:
+        with requests.Session() as http:
+            http.headers.update(PUBLICATIONS_HTTP_HEADERS)
+            raw_items = search_djen_publications(
+                http,
+                oab_number=oab_number,
+                oab_uf=oab_uf,
+                publish_from=target_datetime,
+                publish_to=target_datetime,
+            )
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Não foi possível consultar o DJEN no momento. {exc}",
+        ) from exc
+
+    unique_items: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for item in raw_items:
+        item_hash = str(item.get("hash") or "").strip()
+        if item_hash and item_hash in seen_hashes:
+            continue
+        if item_hash:
+            seen_hashes.add(item_hash)
+        unique_items.append(item)
+
+    unique_items.sort(
+        key=lambda item: (
+            str(item.get("siglaTribunal") or "").strip(),
+            str(item.get("numeroprocessocommascara") or item.get("numero_processo") or "").strip(),
+            str(item.get("hash") or "").strip(),
+        )
+    )
+
+    return TodayPublicationsResponse(
+        member_name=member_name,
+        member_email=member_email,
+        oab=f"{oab_number}/{oab_uf}",
+        publication_date=publication_date.isoformat(),
+        count=len(unique_items),
+        items=[serialize_today_publication_item(item) for item in unique_items],
+    ).model_dump()
+
+
+def sync_publications_for_organization(
+    session: Session,
+    organization: Organization,
+) -> dict[str, Any]:
+    organization_id = get_organization_pk(organization)
+    config = get_or_create_publication_config(session, organization_id)
+    targets, skipped_members = build_publication_search_targets(session, organization_id)
+    started_at = get_local_now()
+
+    if not targets:
+        config.last_run_at = started_at
+        config.last_status = "warning"
+        config.last_message = (
+            "Nenhuma OAB ativa com UF foi encontrada na equipe para consulta automática."
+            if skipped_members
+            else "Nenhuma OAB ativa foi encontrada na equipe para consulta automática."
+        )
+        config.last_new_records = 0
+        config.last_existing_records = 0
+        config.last_failed_records = 0
+        config.updated_at = datetime.utcnow()
+        session.add(config)
+        session.commit()
+        session.refresh(config)
+        return {
+            "started_at": started_at,
+            "finished_at": get_local_now(),
+            "new_records": 0,
+            "existing_records": 0,
+            "failed_records": 0,
+            "message": config.last_message,
+            "config": build_publication_config_response(session, config),
+        }
+
+    publish_to = started_at
+    publish_from = started_at - timedelta(days=max(PUBLICATIONS_LOOKBACK_DAYS - 1, 0))
+    case_lookup = build_publication_case_lookup(session, organization_id)
+    client_name_lookup = build_publication_client_name_lookup(session, organization_id)
+    candidate_hits: dict[str, dict[str, Any]] = {}
+    query_errors: list[str] = []
+
+    with requests.Session() as http:
+        http.headers.update(PUBLICATIONS_HTTP_HEADERS)
+        for target in targets:
+            try:
+                results = search_djen_publications(
+                    http,
+                    oab_number=target["number"],
+                    oab_uf=target["uf"],
+                    publish_from=publish_from,
+                    publish_to=publish_to,
+                )
+            except (requests.RequestException, RuntimeError, ValueError) as exc:
+                query_errors.append(f'{target["oab"]}: {exc}')
+                continue
+
+            for item in results:
+                source_identifier = str(item.get("hash") or item.get("id") or item.get("numeroComunicacao") or "").strip()
+                if not source_identifier:
+                    continue
+                source_key = f"{PUBLICATIONS_SOURCE_DJEN}:{source_identifier}"
+                match = match_publication_target(item, case_lookup=case_lookup, client_name_lookup=client_name_lookup)
+                existing = candidate_hits.get(source_key)
+                if existing is None or get_publication_match_priority(match) > get_publication_match_priority(existing.get("match")):
+                    candidate_hits[source_key] = {
+                        "item": item,
+                        "match": match,
+                        "oab": target["oab"],
+                    }
+
+        new_records = 0
+        existing_records = 0
+        failed_records = 0
+        unmatched_records = 0
+        errors: list[str] = []
+
+        for source_key, candidate in candidate_hits.items():
+            item = candidate["item"]
+            existing_record = session.exec(
+                select(PublicationRecord).where(
+                    PublicationRecord.organization_id == organization_id,
+                    PublicationRecord.source_key == source_key,
+                )
+            ).first()
+            if existing_record and publication_record_has_local_document(session, existing_record):
+                existing_records += 1
+                continue
+
+            match = candidate.get("match")
+            if not match:
+                unmatched_records += 1
+                continue
+
+            client: Client = match["client"]
+            case: Case | None = match["case"]
+            if client.id is None:
+                unmatched_records += 1
+                continue
+
+            detail_url = str(item.get("link") or "").strip() or "https://comunica.pje.jus.br/"
+            title = build_djen_publication_title(item)
+            summary = strip_html_text(str(item.get("texto") or "").strip()) or None
+            publication_date_raw = str(item.get("data_disponibilizacao") or "").strip()
+            try:
+                publication_date = datetime.strptime(publication_date_raw, "%Y-%m-%d")
+            except ValueError:
+                publication_date = started_at
+
+            document: ClientDocument | None = None
+            try:
+                certified_url = extract_djen_certified_pdf_url(item)
+                pdf_content = download_djen_certified_pdf(http, certified_url)
+                document = store_internal_client_document_pdf(
+                    session,
+                    client=client,
+                    case=case,
+                    folder_label=PUBLICATIONS_FOLDER_LABEL,
+                    original_name=make_publication_file_name(title, publication_date),
+                    content=pdf_content,
+                )
+                if existing_record:
+                    old_document = session.get(ClientDocument, existing_record.document_id) if existing_record.document_id else None
+                    if old_document:
+                        remove_document_file(old_document.storage_path)
+                        session.delete(old_document)
+                    existing_record.client_id = client.id
+                    existing_record.case_id = case.id if case and case.id is not None else None
+                    existing_record.document_id = document.id
+                    existing_record.document_storage_path = document.storage_path
+                    existing_record.client_name_snapshot = client.name
+                    existing_record.case_number_snapshot = case.number if case else format_case_number_from_digits(str(item.get("numero_processo") or "").strip())
+                    existing_record.source = PUBLICATIONS_SOURCE_DJEN
+                    existing_record.matched_via = match["matched_via"]
+                    existing_record.matched_query = match["matched_query"]
+                    existing_record.title = title
+                    existing_record.summary = summary
+                    existing_record.detail_url = detail_url
+                    existing_record.certified_url = certified_url
+                    existing_record.publication_date = publication_date
+                    existing_record.edition_number = str(item.get("numeroComunicacao") or "").strip() or None
+                    existing_record.section_name = str(item.get("nomeOrgao") or item.get("siglaTribunal") or "").strip() or None
+                    existing_record.page_number = None
+                    existing_record.updated_at = datetime.utcnow()
+                    session.add(existing_record)
+                else:
+                    session.add(
+                        PublicationRecord(
+                            organization_id=organization_id,
+                            client_id=client.id,
+                            case_id=case.id if case and case.id is not None else None,
+                            document_id=document.id,
+                            client_name_snapshot=client.name,
+                            case_number_snapshot=case.number if case else format_case_number_from_digits(str(item.get("numero_processo") or "").strip()),
+                            source=PUBLICATIONS_SOURCE_DJEN,
+                            source_key=source_key,
+                            matched_via=match["matched_via"],
+                            matched_query=match["matched_query"],
+                            title=title,
+                            summary=summary,
+                            detail_url=detail_url,
+                            certified_url=certified_url,
+                            publication_date=publication_date,
+                            edition_number=str(item.get("numeroComunicacao") or "").strip() or None,
+                            section_name=str(item.get("nomeOrgao") or item.get("siglaTribunal") or "").strip() or None,
+                            page_number=None,
+                            document_storage_path=document.storage_path,
+                        )
+                    )
+                session.commit()
+                new_records += 1
+            except Exception as exc:
+                session.rollback()
+                if document and document.storage_path:
+                    try:
+                        remove_document_file(document.storage_path)
+                    except HTTPException:
+                        pass
+                failed_records += 1
+                errors.append(f"{title}: {exc}")
+
+    config = get_or_create_publication_config(session, organization_id)
+    finished_at = get_local_now()
+    message_parts = [f"{new_records} nova(s) publicação(ões) baixada(s).", f"{existing_records} já existiam."]
+    if unmatched_records:
+        message_parts.append(f"{unmatched_records} não puderam ser vinculadas a cliente/processo.")
+    if skipped_members:
+        message_parts.append(f"{len(skipped_members)} colaborador(es) sem OAB completa foram ignorados.")
+    if failed_records:
+        message_parts.append(f"{failed_records} falharam.")
+    if not candidate_hits and not query_errors:
+        message_parts = ["Nenhuma publicação nova foi localizada nas OABs da equipe no período consultado."]
+        if skipped_members:
+            message_parts.append(f"{len(skipped_members)} colaborador(es) sem OAB completa foram ignorados.")
+    if query_errors and not candidate_hits:
+        message_parts = ["A consulta ao DJEN falhou para as OABs configuradas."]
+
+    if failed_records or query_errors:
+        last_status = "error" if new_records == 0 and existing_records == 0 else "warning"
+    elif unmatched_records or skipped_members:
+        last_status = "warning"
+    else:
+        last_status = "success"
+
+    config.last_run_at = finished_at
+    config.last_status = last_status
+    config.last_message = " ".join(message_parts)
+    if errors:
+        config.last_message = f'{config.last_message} Último erro: {errors[0]}'
+    elif query_errors:
+        config.last_message = f'{config.last_message} Último erro: {query_errors[0]}'
+    config.last_new_records = new_records
+    config.last_existing_records = existing_records
+    config.last_failed_records = failed_records
+    config.updated_at = datetime.utcnow()
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+
+    return {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "new_records": new_records,
+        "existing_records": existing_records,
+        "failed_records": failed_records,
+        "message": config.last_message,
+        "config": build_publication_config_response(session, config),
+    }
+
+
+def run_publication_sync_for_organization(
+    session: Session,
+    organization: Organization,
+) -> dict[str, Any]:
+    organization_id = get_organization_pk(organization)
+    lock = get_publication_sync_lock(organization_id)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A rotina de publicações já está em execução.")
+    try:
+        return sync_publications_for_organization(session, organization)
+    finally:
+        lock.release()
+
+
 def normalize_cpf_digits(value: str | None) -> str:
     return "".join(char for char in (value or "") if char.isdigit())
 
@@ -2382,6 +3333,9 @@ def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMe
     email = payload.email.strip().lower()
     cpf = normalize_cpf_digits(payload.cpf)
     oab = payload.oab.strip().upper()
+    parsed_oab = parse_team_member_oab(oab)
+    if parsed_oab:
+        oab = parsed_oab["normalized"]
     role_title = payload.role_title.strip()
     team_name = payload.team_name.strip()
     phone = (payload.phone or "").strip() or None
@@ -2397,8 +3351,8 @@ def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMe
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF é obrigatório")
     if not is_valid_cpf_digits(cpf):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CPF válido")
-    if not oab:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAB é obrigatória")
+    if not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe a OAB com 6 números e UF")
     if not role_title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cargo é obrigatório")
     if not team_name:
@@ -2536,10 +3490,55 @@ def sync_user_from_team_member(
     return user, invite_token
 
 
+def publication_scheduler_loop() -> None:
+    while True:
+        try:
+            now_local = get_local_now()
+            with Session(engine) as session:
+                configs = session.exec(
+                    select(PublicationAutomationConfig).where(PublicationAutomationConfig.is_enabled == True)  # noqa: E712
+                ).all()
+                due_organization_ids = [
+                    config.organization_id
+                    for config in configs
+                    if should_run_publication_sync(config, now_local)
+                ]
+
+            for organization_id in due_organization_ids:
+                with Session(engine) as session:
+                    organization = session.get(Organization, organization_id)
+                    if not organization or not organization.is_active:
+                        continue
+                    lock = get_publication_sync_lock(organization_id)
+                    if not lock.acquire(blocking=False):
+                        continue
+                    try:
+                        sync_publications_for_organization(session, organization)
+                    finally:
+                        lock.release()
+        except Exception:
+            # O scheduler deve continuar tentando mesmo que uma execução falhe.
+            pass
+        time.sleep(PUBLICATIONS_SCHEDULER_INTERVAL_SECONDS)
+
+
+def start_publication_scheduler() -> None:
+    global PUBLICATION_SCHEDULER_THREAD
+    if PUBLICATION_SCHEDULER_THREAD and PUBLICATION_SCHEDULER_THREAD.is_alive():
+        return
+    PUBLICATION_SCHEDULER_THREAD = threading.Thread(
+        target=publication_scheduler_loop,
+        name="newlaw-publication-scheduler",
+        daemon=True,
+    )
+    PUBLICATION_SCHEDULER_THREAD.start()
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     validate_security_config()
     init_db()
+    start_publication_scheduler()
 
 
 @app.get("/health")
@@ -2834,7 +3833,9 @@ def complete_calendar_connection(
     try:
         token_payload = exchange_calendar_oauth_code(provider_name, code, redirect_uri)
         access_token = token_payload.get("access_token")
-        provider_email = fetch_provider_profile_email(provider_name, access_token) if isinstance(access_token, str) else None
+        provider_email = None
+        if provider_name != "google" and isinstance(access_token, str):
+            provider_email = fetch_provider_profile_email(provider_name, access_token)
         if user.id is None:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
         connection = get_calendar_connection(session, user.id, provider_name)
@@ -2944,13 +3945,23 @@ def create_agenda_deadline(
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título do prazo é obrigatório")
+    event_type = normalize_internal_agenda_event_type(payload.event_type)
     deadline = AgendaDeadline(
         user_id=user.id,
         organization_id=user.organization_id,
         title=title,
         due_at=parse_deadline_due_date(payload.due_date),
         reference=(payload.reference or "").strip() or None,
-        notes=(payload.notes or "").strip() or None,
+        notes=serialize_internal_agenda_metadata(
+            notes=payload.notes,
+            event_type=event_type,
+            meeting_url=payload.meeting_url,
+            assignees=payload.assignees,
+            end_time=payload.end_time,
+            assignee_id=None,
+            assignee_name=None,
+            is_all_day=payload.is_all_day,
+        ),
         is_completed=False,
     )
     session.add(deadline)
@@ -3475,6 +4486,9 @@ def delete_client(
 
     documents = session.exec(select(ClientDocument).where(ClientDocument.client_id == client.id)).all()
     purge_documents(session, documents)
+    publication_records = session.exec(select(PublicationRecord).where(PublicationRecord.client_id == client.id)).all()
+    for record in publication_records:
+        session.delete(record)
     session.delete(client)
     session.commit()
     return {"status": "ok", "id": client_id}
@@ -3606,6 +4620,9 @@ def delete_case(
         session.delete(link)
     documents = session.exec(select(ClientDocument).where(ClientDocument.case_id == case.id)).all()
     purge_documents(session, documents)
+    publication_records = session.exec(select(PublicationRecord).where(PublicationRecord.case_id == case.id)).all()
+    for record in publication_records:
+        session.delete(record)
     session.flush()
     session.delete(case)
     session.commit()
@@ -3898,6 +4915,120 @@ def delete_client_document(
     session.delete(document)
     session.commit()
     return {"status": "ok", "id": document_id}
+
+
+@app.get("/publications/automation", response_model=PublicationAutomationConfigResponse)
+def get_publication_automation_settings(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "settings")
+    organization = resolve_organization_entity(user, session, user.organization_id)
+    config = get_or_create_publication_config(session, get_organization_pk(organization))
+    return build_publication_config_response(session, config)
+
+
+@app.get("/publications/today", response_model=TodayPublicationsResponse)
+def get_today_publications_for_logged_member(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    publication_date: str | None = None,
+) -> dict[str, Any]:
+    ensure_nav_access(user, "official")
+    member = get_team_member_for_user(session, user)
+    if not member or not member.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Nenhum membro ativo da equipe está vinculado ao e-mail logado.",
+        )
+
+    parsed_oab = parse_team_member_oab(member.oab)
+    if not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A OAB do seu cadastro precisa ter 6 números e UF.",
+        )
+
+    target_date = get_local_now().date()
+    if publication_date:
+        try:
+            target_date = datetime.strptime(publication_date, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A data da consulta deve estar no formato YYYY-MM-DD.",
+            ) from exc
+
+    return fetch_djen_publications_for_member_oab(
+        member_name=member.full_name,
+        member_email=member.email,
+        oab_number=parsed_oab["number"],
+        oab_uf=parsed_oab["uf"],
+        publication_date=target_date,
+    )
+
+
+@app.post("/publications/search-by-oab", response_model=TodayPublicationsResponse)
+def search_publications_by_oab(payload: PublicationSearchByOabRequest) -> dict[str, Any]:
+    parsed_oab = parse_team_member_oab(f"{payload.oab_number}/{payload.oab_uf}")
+    if not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A OAB informada precisa ter 6 números e UF.",
+        )
+
+    try:
+        target_date = datetime.strptime(payload.publication_date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A data da consulta deve estar no formato YYYY-MM-DD.",
+        ) from exc
+
+    member_name = payload.member_name.strip() or "Membro da equipe"
+    member_email = payload.member_email.strip().lower()
+    if not member_email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="O e-mail do membro é obrigatório para a consulta.",
+        )
+
+    return fetch_djen_publications_for_member_oab(
+        member_name=member_name,
+        member_email=member_email,
+        oab_number=parsed_oab["number"],
+        oab_uf=parsed_oab["uf"],
+        publication_date=target_date,
+    )
+
+
+@app.put("/publications/automation", response_model=PublicationAutomationConfigResponse)
+def update_publication_automation_settings(
+    payload: PublicationAutomationUpdateRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "settings")
+    organization = resolve_organization_entity(user, session, user.organization_id)
+    config = get_or_create_publication_config(session, get_organization_pk(organization))
+    config.is_enabled = bool(payload.is_enabled)
+    config.schedule_time = validate_publication_schedule_time(payload.schedule_time)
+    config.updated_at = datetime.utcnow()
+    session.add(config)
+    session.commit()
+    session.refresh(config)
+    return build_publication_config_response(session, config)
+
+
+@app.post("/publications/automation/run", response_model=PublicationAutomationRunResponse)
+def run_publication_automation_now(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "settings")
+    organization = resolve_organization_entity(user, session, user.organization_id)
+    result = run_publication_sync_for_organization(session, organization)
+    return PublicationAutomationRunResponse(**result).model_dump()
 
 
 @app.get("/invoices")

@@ -13,7 +13,12 @@ import {
   ApiWallet,
   CalendarConnectionStatus,
   CalendarProvider,
+  InternalAgendaEventType,
   LOCAL_API_BASE_URL,
+  PublicationAutomationRecord,
+  PublicationAutomationSettings,
+  TodayPublicationItem,
+  TodayPublicationsResponse,
   TeamMembersCapacity,
   baseURL,
   createAgendaDeadline as apiCreateAgendaDeadline,
@@ -32,13 +37,16 @@ import {
   deleteFinanceEntry as apiDeleteFinanceEntry,
   disconnectCalendarConnection as apiDisconnectCalendarConnection,
   getTeamMembersCapacity as apiGetTeamMembersCapacity,
+  getPublicationAutomationSettings as apiGetPublicationAutomationSettings,
+  getTodayPublications as apiGetTodayPublications,
+  searchPublicationsByOabLocally as apiSearchPublicationsByOabLocally,
   listAgendaEvents as apiListAgendaEvents,
   listCalendarConnections as apiListCalendarConnections,
   listClientDocuments as apiListClientDocuments,
   listFinanceEntries as apiListFinanceEntries,
-  listTeamMembers as apiListTeamMembers,
   listCases as apiListCases,
   listClients as apiListClients,
+  listTeamMembers as apiListTeamMembers,
   listWallets as apiListWallets,
   startCalendarConnection as apiStartCalendarConnection,
   syncCalendarConnection as apiSyncCalendarConnection,
@@ -52,7 +60,9 @@ import {
   login as apiLogin,
   logout as apiLogout,
   ping,
-  saveAuthSession
+  runPublicationAutomationNow as apiRunPublicationAutomationNow,
+  saveAuthSession,
+  updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
 } from "./api";
 import { NavKey } from "./types";
 
@@ -97,6 +107,36 @@ const textScaleOptions = [
   { label: "Grande", value: 1.2 }
 ] as const;
 
+const brazilUfOptions = [
+  "AC",
+  "AL",
+  "AP",
+  "AM",
+  "BA",
+  "CE",
+  "DF",
+  "ES",
+  "GO",
+  "MA",
+  "MT",
+  "MS",
+  "MG",
+  "PA",
+  "PB",
+  "PR",
+  "PE",
+  "PI",
+  "RJ",
+  "RN",
+  "RS",
+  "RO",
+  "RR",
+  "SC",
+  "SP",
+  "SE",
+  "TO"
+] as const;
+
 const clampTextScaleIndex = (value: number) => Math.min(Math.max(value, 0), textScaleOptions.length - 1);
 
 const navItems: { key: NavKey; label: string }[] = [
@@ -120,6 +160,67 @@ const navItems: { key: NavKey; label: string }[] = [
 const navPermissionOptions = navItems.map((item) => ({ key: item.key, label: item.label }));
 const defaultMemberNavKeys = navPermissionOptions.map((item) => item.key);
 const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
+const MASTER_OFFICE_NAME = "NEWLAW";
+const PROFILE_STORAGE_KEY = "newlaw-profile-preferences";
+const profilePhotoMaxSizeBytes = 2 * 1024 * 1024;
+
+type UserProfilePreferences = {
+  avatarDataUrl: string;
+  displayName: string;
+  roleLabel: string;
+  phone: string;
+  bio: string;
+};
+
+const buildDefaultProfilePreferences = (user: AuthUser | null): UserProfilePreferences => ({
+  avatarDataUrl: "",
+  displayName: user?.name?.trim() || "",
+  roleLabel: "Login master",
+  phone: "",
+  bio: ""
+});
+
+const normalizeProfilePreferences = (
+  value: Partial<UserProfilePreferences> | null | undefined,
+  user: AuthUser | null
+): UserProfilePreferences => {
+  const defaults = buildDefaultProfilePreferences(user);
+  return {
+    avatarDataUrl:
+      typeof value?.avatarDataUrl === "string" && value.avatarDataUrl.startsWith("data:image/")
+        ? value.avatarDataUrl
+        : "",
+    displayName: typeof value?.displayName === "string" && value.displayName.trim() ? value.displayName.trim() : defaults.displayName,
+    roleLabel: typeof value?.roleLabel === "string" && value.roleLabel.trim() ? value.roleLabel.trim() : defaults.roleLabel,
+    phone: typeof value?.phone === "string" ? value.phone.trim().slice(0, 32) : defaults.phone,
+    bio: typeof value?.bio === "string" ? value.bio.trim().slice(0, 220) : defaults.bio
+  };
+};
+
+const loadStoredProfilePreferences = (user: AuthUser | null): UserProfilePreferences => {
+  if (typeof window === "undefined") return buildDefaultProfilePreferences(user);
+  try {
+    const raw = window.localStorage.getItem(PROFILE_STORAGE_KEY);
+    if (!raw) return buildDefaultProfilePreferences(user);
+    return normalizeProfilePreferences(JSON.parse(raw) as Partial<UserProfilePreferences>, user);
+  } catch {
+    return buildDefaultProfilePreferences(user);
+  }
+};
+
+const readFileAsDataUrl = (file: File) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("Não foi possível carregar a imagem."));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Não foi possível carregar a imagem."));
+    reader.readAsDataURL(file);
+  });
 
 const navIconProps = {
   viewBox: "0 0 24 24",
@@ -529,6 +630,7 @@ const formatCaseNumber = (value: string) => {
 };
 
 const isCompleteCaseNumber = (value: string) => caseNumberPattern.test(formatCaseNumber(value));
+const formatCounterparty = (value: string) => value.toUpperCase().replace(/[^A-ZÀ-Ÿ0-9\s]/g, "");
 
 const getCaseFormValidationMessage = (form: CaseForm) => {
   if (!isCompleteCaseNumber(form.process)) {
@@ -719,6 +821,15 @@ const emptyFinanceSettlementForm: FinanceSettlementForm = {
 };
 
 const financeMonths = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+const financeMonthOptions = financeMonths.map((shortLabel, index) => {
+  const baseDate = new Date(2026, index, 1);
+  const fullLabel = baseDate.toLocaleDateString("pt-BR", { month: "long" });
+  return {
+    value: index,
+    shortLabel,
+    label: fullLabel.charAt(0).toUpperCase() + fullLabel.slice(1)
+  };
+});
 const financeChartViewOptions: { value: FinanceChartView; label: string }[] = [
   { value: "year", label: "Ano" },
   { value: "month", label: "Mês" }
@@ -866,27 +977,58 @@ const buildNiceChartScale = (values: number[], tickCount = 5) => {
   };
 };
 
-const buildRoundedStepChartPath = (points: Array<{ x: number; y: number }>) => {
+const buildSmoothChartPath = (points: Array<{ x: number; y: number }>) => {
   if (!points.length) return "";
   if (points.length === 1) return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
-  let path = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
-  for (let index = 1; index < points.length; index += 1) {
-    const previous = points[index - 1];
+  if (points.length === 2) {
+    return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)} L ${points[1].x.toFixed(2)} ${points[1].y.toFixed(2)}`;
+  }
+
+  const slopes = Array.from({ length: points.length - 1 }, (_, index) => {
     const current = points[index];
-    if (Math.abs(current.y - previous.y) < 0.001) {
-      path += ` H ${current.x.toFixed(2)}`;
+    const next = points[index + 1];
+    return (next.y - current.y) / (next.x - current.x);
+  });
+  const tangents = Array.from({ length: points.length }, () => 0);
+  tangents[0] = slopes[0];
+  tangents[points.length - 1] = slopes[slopes.length - 1];
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const previousSlope = slopes[index - 1];
+    const nextSlope = slopes[index];
+    tangents[index] = previousSlope * nextSlope <= 0 ? 0 : (previousSlope + nextSlope) / 2;
+  }
+
+  for (let index = 0; index < slopes.length; index += 1) {
+    const slope = slopes[index];
+    if (Math.abs(slope) < 1e-9) {
+      tangents[index] = 0;
+      tangents[index + 1] = 0;
       continue;
     }
-
-    const deltaX = current.x - previous.x;
-    const curveWidth = Math.min(Math.abs(deltaX) * 0.34, 2.4);
-    const curveStartX = current.x - curveWidth;
-    const controlX1 = curveStartX + curveWidth * 0.5;
-    const controlX2 = current.x - curveWidth * 0.35;
-
-    path += ` H ${curveStartX.toFixed(2)}`;
-    path += ` C ${controlX1.toFixed(2)} ${previous.y.toFixed(2)} ${controlX2.toFixed(2)} ${current.y.toFixed(2)} ${current.x.toFixed(2)} ${current.y.toFixed(2)}`;
+    const alpha = tangents[index] / slope;
+    const beta = tangents[index + 1] / slope;
+    const magnitude = alpha * alpha + beta * beta;
+    if (magnitude > 9) {
+      const scale = 3 / Math.sqrt(magnitude);
+      tangents[index] = scale * alpha * slope;
+      tangents[index + 1] = scale * beta * slope;
+    }
   }
+
+  let path = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const deltaX = next.x - current.x;
+    const control1X = current.x + deltaX / 3;
+    const control1Y = current.y + (tangents[index] * deltaX) / 3;
+    const control2X = next.x - deltaX / 3;
+    const control2Y = next.y - (tangents[index + 1] * deltaX) / 3;
+    path += ` C ${control1X.toFixed(2)} ${control1Y.toFixed(2)} ${control2X.toFixed(2)} ${control2Y.toFixed(2)} ${next.x.toFixed(2)} ${next.y.toFixed(2)}`;
+  }
+
   return path;
 };
 
@@ -1038,6 +1180,18 @@ const normalizeSearchText = (value: string) =>
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+
+const extractCaseCounterparty = (title?: string | null) => {
+  const normalizedTitle = (title || "").trim();
+  if (!normalizedTitle) return "";
+  const [, ...rest] = normalizedTitle.split(/\s+x\s+/i);
+  return rest.length ? rest.join(" x ").trim() : normalizedTitle;
+};
+
+const getCasePickerLabel = (caseItem: ApiCase) => {
+  const counterparty = extractCaseCounterparty(caseItem.title) || "Parte contrária";
+  return caseItem.number ? `${caseItem.number} - ${counterparty}` : counterparty;
+};
 
 const countFileNodes = (nodes: FileFolderNode[]): number =>
   nodes.reduce((total, node) => total + 1 + countFileNodes(node.children || []), 0);
@@ -1564,7 +1718,7 @@ function ProcessFormFields({
       </div>
       <div className="field">
         <label>Parte contrária</label>
-        <input value={form.counterparty} onChange={(e) => onChange("counterparty", e.target.value)} />
+        <input value={form.counterparty} onChange={(e) => onChange("counterparty", formatCounterparty(e.target.value))} />
       </div>
       <div className="field">
         <label>Advogado parte contrária</label>
@@ -2325,7 +2479,11 @@ function Files() {
   const [error, setError] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
   const [isClientSearchOpen, setIsClientSearchOpen] = useState(false);
+  const [processSearchTerm, setProcessSearchTerm] = useState("");
+  const [isProcessSearchOpen, setIsProcessSearchOpen] = useState(false);
   const [selectedClientId, setSelectedClientId] = useState<number | null>(null);
+  const [browserMode, setBrowserMode] = useState<"client" | "process">("client");
+  const [selectedProcessId, setSelectedProcessId] = useState<number | null>(null);
   const [selectedFolderTarget, setSelectedFolderTarget] = useState<FilesFolderTarget | null>(null);
   const [documents, setDocuments] = useState<ApiClientDocument[]>([]);
   const [isLoadingDocuments, setIsLoadingDocuments] = useState(false);
@@ -2337,6 +2495,8 @@ function Files() {
   const [uploadError, setUploadError] = useState("");
   const [isUploadingDocument, setIsUploadingDocument] = useState(false);
   const [deletingDocumentId, setDeletingDocumentId] = useState<number | null>(null);
+  const [documentPendingDelete, setDocumentPendingDelete] = useState<ApiClientDocument | null>(null);
+  const [deleteDocumentError, setDeleteDocumentError] = useState("");
   const [documentMessage, setDocumentMessage] = useState("");
   const [documentsRefreshKey, setDocumentsRefreshKey] = useState(0);
   const [uploadInputKey, setUploadInputKey] = useState(0);
@@ -2406,6 +2566,27 @@ function Files() {
     () => allClientTrees.find((tree) => tree.client.id === selectedClientId) ?? null,
     [allClientTrees, selectedClientId]
   );
+  const selectedClientDetails = useMemo(
+    () => (selectedClientTree ? toClientRow(selectedClientTree.client) : null),
+    [selectedClientTree]
+  );
+
+  useEffect(() => {
+    if (!selectedClientTree) {
+      setBrowserMode("client");
+      setSelectedProcessId(null);
+      return;
+    }
+    setSelectedProcessId((current) => {
+      if (current !== null && selectedClientTree.cases.some((caseItem) => caseItem.id === current)) {
+        return current;
+      }
+      return selectedClientTree.cases[0]?.id ?? null;
+    });
+    if (!selectedClientTree.cases.length) {
+      setBrowserMode("client");
+    }
+  }, [selectedClientTree]);
 
   useEffect(() => {
     if (!selectedClientId) {
@@ -2441,6 +2622,10 @@ function Files() {
     setSelectedUploadFolder("");
     setSelectedUploadFile(null);
     setUploadError("");
+    setProcessSearchTerm("");
+    setIsProcessSearchOpen(false);
+    setDocumentPendingDelete(null);
+    setDeleteDocumentError("");
     setUploadInputKey((value) => value + 1);
     setShowUploadModal(false);
   }, [selectedClientId]);
@@ -2456,10 +2641,6 @@ function Files() {
   }, [selectedClientTree, selectedUploadCaseId]);
 
   const linkedCaseCount = useMemo(() => cases.filter((caseItem) => Number(caseItem.client_id)).length, [cases]);
-  const totalSuggestedFolders = useMemo(
-    () => allClientTrees.reduce((total, tree) => total + tree.totalFolders, 0),
-    [allClientTrees]
-  );
   const selectedClientFolders = useMemo(
     () => (selectedClientTree ? getClientFolderBlueprint(selectedClientTree.kind) : getClientFolderBlueprint("PF")),
     [selectedClientTree]
@@ -2469,21 +2650,29 @@ function Files() {
       setSelectedFolderTarget(null);
       return;
     }
+    if (browserMode === "process") {
+      const processId = selectedProcessId ?? selectedClientTree.cases[0]?.id ?? null;
+      if (!processId) {
+        setSelectedFolderTarget(null);
+        return;
+      }
+      setSelectedFolderTarget((current) => {
+        if (current?.scope === "case" && current.caseId === processId && processFolderBlueprint.some((folder) => folder.label === current.folderLabel)) {
+          return current;
+        }
+        const defaultFolder = processFolderBlueprint[0]?.label;
+        return defaultFolder ? { scope: "case", caseId: processId, folderLabel: defaultFolder } : null;
+      });
+      return;
+    }
     setSelectedFolderTarget((current) => {
       if (current?.scope === "client" && selectedClientFolders.some((folder) => folder.label === current.folderLabel)) {
-        return current;
-      }
-      if (
-        current?.scope === "case" &&
-        selectedClientTree.cases.some((caseItem) => caseItem.id === current.caseId) &&
-        processFolderBlueprint.some((folder) => folder.label === current.folderLabel)
-      ) {
         return current;
       }
       const defaultFolder = selectedClientFolders[0]?.label;
       return defaultFolder ? { scope: "client", folderLabel: defaultFolder } : null;
     });
-  }, [selectedClientFolders, selectedClientTree]);
+  }, [browserMode, selectedClientFolders, selectedClientTree, selectedProcessId]);
   const selectedUploadCase = useMemo(
     () => selectedClientTree?.cases.find((item) => String(item.id) === selectedUploadCaseId) ?? null,
     [selectedClientTree, selectedUploadCaseId]
@@ -2525,6 +2714,57 @@ function Files() {
     });
     return map;
   }, [selectedClientTree]);
+  const selectedProcessCard = useMemo(
+    () => processCards.find(({ caseItem }) => caseItem.id === selectedProcessId) ?? null,
+    [processCards, selectedProcessId]
+  );
+  const processSearchEntries = useMemo(
+    () =>
+      processCards.map(({ caseItem, totalDocuments }) => ({
+        caseItem,
+        totalDocuments,
+        label: getCasePickerLabel(caseItem),
+        subtitle: [caseItem.title?.trim(), caseItem.status?.trim()].filter(Boolean).join(" · ") || "Sem detalhes adicionais",
+        searchText: normalizeSearchText(
+          [caseItem.number, extractCaseCounterparty(caseItem.title), caseItem.title, caseItem.status]
+            .filter(Boolean)
+            .join(" ")
+        )
+      })),
+    [processCards]
+  );
+  const processSearchResults = useMemo(() => {
+    const normalizedTerm = normalizeSearchText(processSearchTerm.trim());
+    const matches = !normalizedTerm
+      ? processSearchEntries
+      : processSearchEntries.filter((entry) => entry.searchText.includes(normalizedTerm));
+    return matches.slice(0, 8);
+  }, [processSearchEntries, processSearchTerm]);
+  const selectedProcessSearchEntry = useMemo(
+    () => processSearchEntries.find((entry) => entry.caseItem.id === selectedProcessId) ?? null,
+    [processSearchEntries, selectedProcessId]
+  );
+  const activeFolderCards = useMemo(
+    () => (browserMode === "client" ? rootFolderCards : selectedProcessCard?.sections || []),
+    [browserMode, rootFolderCards, selectedProcessCard]
+  );
+  const browserPanelTitle = browserMode === "client" ? "Pastas do cliente" : "Pastas do processo";
+  const browserPanelSubtitle =
+    browserMode === "client"
+      ? "Selecione uma pasta principal do cliente para visualizar os arquivos abaixo."
+      : selectedProcessCard
+        ? "Selecione uma pasta do processo para visualizar os documentos correspondentes."
+        : "Selecione um processo para visualizar as pastas e os documentos.";
+  const selectedProcessLabel = selectedProcessSearchEntry?.label || "";
+  const selectedProcessMeta = selectedProcessSearchEntry?.subtitle || "";
+  useEffect(() => {
+    if (isProcessSearchOpen) return;
+    if (!selectedProcessSearchEntry) {
+      setProcessSearchTerm("");
+      return;
+    }
+    setProcessSearchTerm(selectedProcessSearchEntry.label);
+  }, [isProcessSearchOpen, selectedProcessSearchEntry]);
   const selectedFolderDocuments = useMemo(() => {
     if (!selectedFolderTarget) return [];
     return documents.filter((record) =>
@@ -2591,6 +2831,19 @@ function Files() {
     setSelectedClientId(tree.client.id);
     setSearchTerm(tree.client.name);
     setIsClientSearchOpen(false);
+  };
+
+  const handleSearchProcess = (event: ChangeEvent<HTMLInputElement>) => {
+    setProcessSearchTerm(event.target.value);
+    setIsProcessSearchOpen(true);
+  };
+
+  const handleSelectProcess = (caseId: number) => {
+    const selectedEntry = processSearchEntries.find((entry) => entry.caseItem.id === caseId);
+    setBrowserMode("process");
+    setSelectedProcessId(caseId);
+    setProcessSearchTerm(selectedEntry?.label || "");
+    setIsProcessSearchOpen(false);
   };
 
   const resetUploadForm = () => {
@@ -2662,21 +2915,31 @@ function Files() {
       anchor.click();
       anchor.remove();
       window.URL.revokeObjectURL(objectUrl);
+      setDocumentMessage("Download iniciado com sucesso.");
     } catch (err) {
       setDocumentsError(extractApiErrorMessage(err, "Não foi possível baixar o documento."));
     }
   };
 
-  const handleDeleteStoredDocument = async (record: ApiClientDocument) => {
-    if (!window.confirm(`Deseja remover o documento ${record.original_name}?`)) return;
+  const handleRequestDeleteStoredDocument = (record: ApiClientDocument) => {
+    setDeleteDocumentError("");
+    setDocumentsError("");
+    setDocumentPendingDelete(record);
+  };
+
+  const handleDeleteStoredDocument = async () => {
+    if (!documentPendingDelete) return;
+    const record = documentPendingDelete;
     setDeletingDocumentId(record.id);
+    setDeleteDocumentError("");
     setDocumentsError("");
     try {
       await apiDeleteClientDocument(record.id);
-      setDocumentMessage("Documento removido.");
-      setDocumentsRefreshKey((value) => value + 1);
+      setDocuments((prev) => prev.filter((item) => item.id !== record.id));
+      setDocumentMessage("Documento removido com sucesso.");
+      setDocumentPendingDelete(null);
     } catch (err) {
-      setDocumentsError(extractApiErrorMessage(err, "Não foi possível remover o documento."));
+      setDeleteDocumentError(extractApiErrorMessage(err, "Não foi possível remover o documento."));
     } finally {
       setDeletingDocumentId(null);
     }
@@ -2687,12 +2950,66 @@ function Files() {
       <div className="page-header">
         <div>
           <div className="eyebrow">Arquivos</div>
-          <h1 className="page-title">Pastas automáticas para clientes e processos.</h1>
-          <div className="page-subtitle">
-            Cada cliente vira uma pasta raiz, com subpastas fixas e novas pastas de processo conforme o cadastro cresce.
-          </div>
         </div>
         <div className="files-page-actions">
+          <div className="files-header-search-wrap">
+            <div className="search-input files-header-search">
+              <input
+                placeholder="Buscar cliente"
+                value={searchTerm}
+                onChange={handleSearchClient}
+                onFocus={() => setIsClientSearchOpen(true)}
+                onBlur={() => window.setTimeout(() => setIsClientSearchOpen(false), 120)}
+              />
+            </div>
+            {isClientSearchOpen && (
+              <div className="files-client-picker">
+                {isLoading ? (
+                  <div className="files-picker-empty">Carregando clientes...</div>
+                ) : error ? (
+                  <div className="files-picker-empty">{error}</div>
+                ) : clientSearchResults.length === 0 ? (
+                  <div className="files-picker-empty">
+                    {allClientTrees.length === 0
+                      ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
+                      : "Nenhum cliente encontrado para a busca informada."}
+                  </div>
+                ) : (
+                  <>
+                    {clientSearchResults.map((tree) => (
+                      <button
+                        key={tree.client.id}
+                        type="button"
+                        className={`files-picker-item ${tree.client.id === selectedClientId ? "active" : ""}`}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => handleSelectClientTree(tree)}
+                      >
+                        <div className="files-client-avatar">{tree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                        <div className="files-picker-copy">
+                          <div className="files-client-row">
+                            <div className="files-client-name">{tree.client.name}</div>
+                            <div className="files-client-folder-count">{tree.totalFolders}</div>
+                          </div>
+                          <div className="files-client-sub">
+                            {tree.cases.length
+                              ? `${tree.cases.length} processo${tree.cases.length > 1 ? "s" : ""} com subpastas`
+                              : "Estrutura pronta para receber o primeiro processo"}
+                          </div>
+                          <div className="files-client-tags">
+                            <span className="files-chip">{tree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                            {tree.client.document && <span className="files-chip muted">{tree.client.document}</span>}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                    {!searchTerm.trim() && allClientTrees.length > clientSearchResults.length && (
+                      <div className="files-picker-footer">Mostrando os primeiros 8 clientes. Digite para refinar.</div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
           <button
             type="button"
             className="files-new-btn"
@@ -2708,118 +3025,34 @@ function Files() {
               <path d="m6 9 6 6 6-6" />
             </svg>
           </button>
-          <div className="pill">PDF até 10 MB</div>
         </div>
       </div>
-
-      <div className="stats-grid">
-        <StatCard
-          title="Clientes com pasta"
-          value={`${allClientTrees.length}`}
-          description="Uma raiz para cada cliente cadastrado"
-          badge={`${linkedCaseCount} processos já viram subpastas`}
-        />
-        <StatCard
-          title="Pastas sugeridas"
-          value={`${totalSuggestedFolders}`}
-          description="Estrutura lógica atual da aba Arquivos"
-          badge="5 fixas por cliente + 7 por processo"
-        />
-        <StatCard
-          title="Subpastas por processo"
-          value={`${processFolderBlueprint.length}`}
-          description="Modelo base para organizar cada caso"
-          badge="Petições, andamentos, financeiro e mais"
-        />
-      </div>
+      {error && !isClientSearchOpen && <div className="error">{error}</div>}
 
       <section className="files-workspace">
         <div className="files-surface files-overview-card">
           <div className="files-overview-main">
-            <div className="eyebrow">Explorer de arquivos</div>
-            <h2 className="files-overview-title">{selectedClientTree ? selectedClientTree.client.name : "Selecione um cliente"}</h2>
-            <div className="files-overview-sub">
-              {selectedClientTree
-                ? selectedClientTree.cases.length
-                  ? "Use os cards abaixo para navegar pelas pastas fixas do cliente e pelas subpastas de cada processo."
-                  : "As pastas fixas do cliente já estão prontas. Quando um processo for cadastrado, ele aparece abaixo em blocos próprios."
-                : "Use a barra abaixo para localizar o cliente e abrir a estrutura de documentos sem uma lista lateral fixa."}
-            </div>
-            <div className="files-overview-search-wrap">
-              <div className="search-input files-overview-search">
-                <input
-                  placeholder="Buscar cliente"
-                  value={searchTerm}
-                  onChange={handleSearchClient}
-                  onFocus={() => setIsClientSearchOpen(true)}
-                  onBlur={() => window.setTimeout(() => setIsClientSearchOpen(false), 120)}
-                />
+            <div className="eyebrow">Explorador de arquivos</div>
+            <h2 className="files-overview-title">{selectedClientDetails ? selectedClientDetails.name : "Selecione um cliente"}</h2>
+            {selectedClientTree && selectedClientDetails ? (
+              <div className="files-overview-meta">
+                {selectedClientDetails.phone !== "-" && <span className="files-overview-meta-item">{selectedClientDetails.phone}</span>}
+                {selectedClientDetails.email !== "-" && <span className="files-overview-meta-item">{selectedClientDetails.email}</span>}
+                {selectedClientDetails.city !== "-" && <span className="files-overview-meta-item">{selectedClientDetails.city}</span>}
+                <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
+                <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
+                <span className="files-chip">{documents.length} PDF{documents.length === 1 ? "" : "s"}</span>
               </div>
-              {isClientSearchOpen && (
-                <div className="files-client-picker">
-                  {isLoading ? (
-                    <div className="files-picker-empty">Carregando clientes...</div>
-                  ) : error ? (
-                    <div className="files-picker-empty">{error}</div>
-                  ) : clientSearchResults.length === 0 ? (
-                    <div className="files-picker-empty">
-                      {allClientTrees.length === 0
-                        ? "Cadastre um cliente na aba Pessoas para gerar a primeira pasta."
-                        : "Nenhum cliente encontrado para a busca informada."}
-                    </div>
-                  ) : (
-                    <>
-                      {clientSearchResults.map((tree) => (
-                        <button
-                          key={tree.client.id}
-                          type="button"
-                          className={`files-picker-item ${tree.client.id === selectedClientId ? "active" : ""}`}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={() => handleSelectClientTree(tree)}
-                        >
-                          <div className="files-client-avatar">{tree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
-                          <div className="files-picker-copy">
-                            <div className="files-client-row">
-                              <div className="files-client-name">{tree.client.name}</div>
-                              <div className="files-client-folder-count">{tree.totalFolders}</div>
-                            </div>
-                            <div className="files-client-sub">
-                              {tree.cases.length
-                                ? `${tree.cases.length} processo${tree.cases.length > 1 ? "s" : ""} com subpastas`
-                                : "Estrutura pronta para receber o primeiro processo"}
-                            </div>
-                            <div className="files-client-tags">
-                              <span className="files-chip">{tree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
-                              {tree.client.document && <span className="files-chip muted">{tree.client.document}</span>}
-                            </div>
-                          </div>
-                        </button>
-                      ))}
-                      {!searchTerm.trim() && allClientTrees.length > clientSearchResults.length && (
-                        <div className="files-picker-footer">Mostrando os primeiros 8 clientes. Digite para refinar.</div>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-            {error && !isClientSearchOpen && <div className="error">{error}</div>}
-          </div>
-          <div className="files-overview-side">
-            {selectedClientTree ? (
+            ) : (
               <>
-                <div className="files-client-avatar large">{selectedClientTree.client.name.trim().charAt(0).toUpperCase() || "C"}</div>
+                <div className="files-overview-sub">
+                  Use a busca acima para localizar o cliente e abrir a estrutura de documentos sem uma lista lateral fixa.
+                </div>
                 <div className="files-client-tags">
-                  <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
-                  <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
-                  <span className="files-chip">{documents.length} PDF{documents.length === 1 ? "" : "s"}</span>
+                  <span className="files-chip">{allClientTrees.length} cliente{allClientTrees.length === 1 ? "" : "s"} com pasta</span>
+                  <span className="files-chip">{linkedCaseCount} processo{linkedCaseCount === 1 ? "" : "s"}</span>
                 </div>
               </>
-            ) : (
-              <div className="files-client-tags">
-                <span className="files-chip">{allClientTrees.length} cliente{allClientTrees.length === 1 ? "" : "s"} com pasta</span>
-                <span className="files-chip">{linkedCaseCount} processo{linkedCaseCount === 1 ? "" : "s"}</span>
-              </div>
             )}
           </div>
         </div>
@@ -2833,136 +3066,212 @@ function Files() {
                 : "Busque um cliente e selecione-o na barra acima para visualizar a estrutura de arquivos."}
           </div>
         ) : (
-          <>
-            <div className="files-surface files-browser-card">
-                <div className="files-card-head">
-                  <div>
-                    <div className="files-card-title">Pastas do cliente</div>
-                    <div className="files-card-sub">Visão direta das áreas principais, com contagem de PDFs em cada uma.</div>
-                  </div>
-                </div>
-                <div className="files-folder-grid">
-                  {rootFolderCards.map((folder) => (
-                    <button
-                      key={folder.label}
-                      type="button"
-                      className={`files-folder-card ${folder.count > 0 ? "has-files" : ""} ${
-                        selectedFolderTarget?.scope === "client" && selectedFolderTarget.folderLabel === folder.label ? "active" : ""
-                      }`}
-                      onClick={() => setSelectedFolderTarget({ scope: "client", folderLabel: folder.label })}
-                    >
-                      <div className="files-folder-top">
-                        <div className="files-folder-icon">{folder.label.charAt(0)}</div>
-                        <div className="files-folder-count">{folder.count}</div>
-                      </div>
-                      <div className="files-folder-name">{folder.label}</div>
-                    </button>
-                  ))}
-                </div>
+          <div className="files-surface files-browser-panel">
+            <div className="files-browser-top">
+              <div>
+                <div className="files-card-title">Arquivos</div>
+                <div className="files-card-sub">Escolha entre as pastas principais do cliente ou as pastas de um processo específico.</div>
               </div>
-
-              <div className="files-surface files-documents-card">
-                <div className="files-card-head">
-                  <div>
-                    <div className="files-card-title">{selectedFolderTitle}</div>
-                    <div className="files-card-sub">{selectedFolderDescription}</div>
-                  </div>
-                  <div className="files-panel-badge">{selectedFolderDocuments.length}</div>
-                </div>
-
-                {documentMessage && <div className="files-status-message">{documentMessage}</div>}
-                {documentsError && <div className="error">{documentsError}</div>}
-
-                {isLoadingDocuments ? (
-                  <div className="files-empty">Carregando documentos...</div>
-                ) : selectedFolderDocuments.length === 0 ? (
-                  <div className="files-empty">Nenhum documento enviado ainda para a pasta selecionada.</div>
-                ) : (
-                  <div className="files-document-list">
-                    {selectedFolderDocuments.map((record) => (
-                      <div key={record.id} className="files-document-item">
-                        <div className="files-document-main">
-                          <div className="files-document-name">{record.original_name}</div>
-                          <div className="files-document-meta">
-                            <span>{record.case_id ? `${caseLabelById.get(record.case_id) || "Processo"} / ${record.folder_label}` : `${selectedClientTree.client.name} / ${record.folder_label}`}</span>
-                            <span>{formatFileSize(record.size_bytes)}</span>
-                            <span>{formatDateTimePtBr(record.created_at)}</span>
-                          </div>
-                        </div>
-                        <div className="files-document-actions">
-                          <button className="btn ghost small" type="button" onClick={() => handleDownloadStoredDocument(record)}>
-                            Baixar
-                          </button>
-                          <button
-                            className="btn ghost small danger"
-                            type="button"
-                            disabled={deletingDocumentId === record.id}
-                            onClick={() => handleDeleteStoredDocument(record)}
-                          >
-                            {deletingDocumentId === record.id ? "Removendo..." : "Excluir"}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+              <div className="wallets-switch files-browser-switch" role="tablist" aria-label="Modo do explorador">
+                <button
+                  type="button"
+                  className={`wallets-switch-btn ${browserMode === "client" ? "active" : ""}`}
+                  onClick={() => setBrowserMode("client")}
+                  aria-pressed={browserMode === "client"}
+                >
+                  Cliente
+                </button>
+                <button
+                  type="button"
+                  className={`wallets-switch-btn ${browserMode === "process" ? "active" : ""}`}
+                  onClick={() => {
+                    if (!selectedClientTree.cases.length) return;
+                    setBrowserMode("process");
+                  }}
+                  aria-pressed={browserMode === "process"}
+                  disabled={!selectedClientTree.cases.length}
+                >
+                  Processos
+                </button>
               </div>
+            </div>
 
-              <div className="files-surface files-browser-card">
-                <div className="files-card-head">
-                  <div>
-                    <div className="files-card-title">Processos vinculados</div>
-                    <div className="files-card-sub">Cada processo possui subpastas próprias, como documentos e financeiro, sem misturar arquivos entre casos.</div>
-                  </div>
-                </div>
+            {browserMode === "process" && (
+              <>
                 {processCards.length === 0 ? (
                   <div className="files-empty">Este cliente ainda não possui processos vinculados.</div>
                 ) : (
-                  <div className="files-case-grid">
-                    {processCards.map(({ caseItem, latestRecord, totalDocuments, sections }) => (
-                      <article key={caseItem.id} className="files-case-card">
-                        <div className="files-case-head">
-                          <div>
-                            <div className="files-case-number">{caseItem.number ? `Processo ${caseItem.number}` : `Processo #${caseItem.id}`}</div>
-                            <div className="files-case-note">
-                              {[caseItem.title?.trim(), caseItem.status?.trim()].filter(Boolean).join(" · ") || "Sem detalhes adicionais"}
-                            </div>
-                          </div>
-                        <div className="files-case-summary">
-                          <strong>{totalDocuments}</strong>
-                          <span>PDF{totalDocuments === 1 ? "" : "s"}</span>
-                        </div>
+                  <>
+                    <div className="files-process-search-wrap">
+                      <div className="search-input files-process-search">
+                        <input
+                          placeholder="Buscar processo por número ou parte contrária"
+                          value={processSearchTerm}
+                          onChange={handleSearchProcess}
+                          onFocus={() => setIsProcessSearchOpen(true)}
+                          onBlur={() => window.setTimeout(() => setIsProcessSearchOpen(false), 120)}
+                        />
                       </div>
-                      <div className="files-case-folders">
-                        {sections.map((folder) => (
-                          <button
-                            key={`${caseItem.id}-${folder.label}`}
-                            type="button"
-                            className={`files-case-folder-chip ${folder.count > 0 ? "filled" : ""} ${
-                              selectedFolderTarget?.scope === "case" &&
-                              selectedFolderTarget.caseId === caseItem.id &&
-                              selectedFolderTarget.folderLabel === folder.label
-                                ? "active"
-                                : ""
-                            }`}
-                            onClick={() => setSelectedFolderTarget({ scope: "case", caseId: caseItem.id, folderLabel: folder.label })}
-                          >
-                            <span>{folder.label}</span>
-                            <strong>{folder.count}</strong>
-                          </button>
-                        ))}
-                      </div>
-                        <div className="files-case-footer">
-                          {latestRecord ? `Último envio: ${formatDateTimePtBr(latestRecord.created_at)}` : "Nenhum PDF enviado para este processo"}
+                      {isProcessSearchOpen && (
+                        <div className="files-client-picker">
+                          {processSearchResults.length === 0 ? (
+                            <div className="files-picker-empty">Nenhum processo encontrado para a busca informada.</div>
+                          ) : (
+                            <>
+                              {processSearchResults.map((entry) => (
+                                <button
+                                  key={entry.caseItem.id}
+                                  type="button"
+                                  className={`files-picker-item ${selectedProcessId === entry.caseItem.id ? "active" : ""}`}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => handleSelectProcess(entry.caseItem.id)}
+                                >
+                                  <div className="files-picker-copy">
+                                    <div className="files-client-row">
+                                      <div className="files-client-name">{entry.label}</div>
+                                      <div className="files-client-folder-count">{entry.totalDocuments}</div>
+                                    </div>
+                                    <div className="files-client-sub">{entry.subtitle}</div>
+                                  </div>
+                                </button>
+                              ))}
+                            </>
+                          )}
                         </div>
-                      </article>
+                      )}
+                    </div>
+                    {selectedProcessCard && (
+                      <div className="files-process-current">
+                        <div className="files-process-current-title">{selectedProcessLabel}</div>
+                        <div className="files-process-current-sub">{selectedProcessMeta}</div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {browserMode === "process" && processCards.length > 0 && !selectedProcessCard ? (
+              <div className="files-empty">Selecione um processo para visualizar as pastas e os documentos.</div>
+            ) : (
+              <>
+                <div className="files-panel-section">
+                  <div className="files-card-head">
+                    <div>
+                      <div className="files-card-title">{browserPanelTitle}</div>
+                      <div className="files-card-sub">{browserPanelSubtitle}</div>
+                    </div>
+                  </div>
+                  <div className="files-folder-grid">
+                    {activeFolderCards.map((folder) => (
+                      <button
+                        key={`${browserMode}-${folder.label}`}
+                        type="button"
+                        className={`files-folder-card ${folder.count > 0 ? "has-files" : ""} ${
+                          browserMode === "client"
+                            ? selectedFolderTarget?.scope === "client" && selectedFolderTarget.folderLabel === folder.label
+                              ? "active"
+                              : ""
+                            : selectedFolderTarget?.scope === "case" &&
+                                selectedProcessCard &&
+                                selectedFolderTarget.caseId === selectedProcessCard.caseItem.id &&
+                                selectedFolderTarget.folderLabel === folder.label
+                              ? "active"
+                              : ""
+                        }`}
+                        onClick={() => {
+                          if (browserMode === "client") {
+                            setSelectedFolderTarget({ scope: "client", folderLabel: folder.label });
+                            return;
+                          }
+                          if (!selectedProcessCard) return;
+                          setSelectedFolderTarget({ scope: "case", caseId: selectedProcessCard.caseItem.id, folderLabel: folder.label });
+                        }}
+                      >
+                        <div className="files-folder-top">
+                          <div className="files-folder-name">{folder.label}</div>
+                          <div className="files-folder-count">{folder.count}</div>
+                        </div>
+                      </button>
                     ))}
                   </div>
-                )}
-              </div>
-          </>
+                </div>
+
+                <div className="files-panel-section files-browser-documents">
+                  <div className="files-card-head">
+                    <div>
+                      <div className="files-card-title">{selectedFolderTitle}</div>
+                      <div className="files-card-sub">{selectedFolderDescription}</div>
+                    </div>
+                    <div className="files-panel-badge">{selectedFolderDocuments.length}</div>
+                  </div>
+
+                  {documentsError && <div className="error">{documentsError}</div>}
+
+                  {isLoadingDocuments ? (
+                    <div className="files-empty">Carregando documentos...</div>
+                  ) : selectedFolderDocuments.length === 0 ? (
+                    <div className="files-empty">Nenhum documento enviado ainda para a pasta selecionada.</div>
+                  ) : (
+                    <div className="files-document-list">
+                      {selectedFolderDocuments.map((record) => (
+                        <div key={record.id} className="files-document-item">
+                          <div className="files-document-main">
+                            <div className="files-document-name">{record.original_name}</div>
+                            <div className="files-document-meta">
+                              <span>{record.case_id ? `${caseLabelById.get(record.case_id) || "Processo"} / ${record.folder_label}` : `${selectedClientTree.client.name} / ${record.folder_label}`}</span>
+                              <span>{formatFileSize(record.size_bytes)}</span>
+                              <span>{formatDateTimePtBr(record.created_at)}</span>
+                            </div>
+                          </div>
+                          <div className="files-document-actions">
+                            <button className="btn ghost small" type="button" onClick={() => handleDownloadStoredDocument(record)}>
+                              Baixar
+                            </button>
+                            <button
+                              className="btn ghost small danger"
+                              type="button"
+                              disabled={deletingDocumentId === record.id}
+                              onClick={() => handleRequestDeleteStoredDocument(record)}
+                            >
+                              {deletingDocumentId === record.id ? "Removendo..." : "Excluir"}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
         )}
       </section>
+
+      {documentMessage && (
+        <div className="files-status-message" role="status" aria-live="polite">
+          {documentMessage}
+        </div>
+      )}
+
+      <ConfirmDeleteModal
+        open={documentPendingDelete !== null}
+        title="Excluir documento"
+        message={
+          documentPendingDelete
+            ? `Deseja remover o documento ${documentPendingDelete.original_name}?`
+            : ""
+        }
+        confirmLabel="Excluir documento"
+        busy={deletingDocumentId !== null}
+        errorMessage={deleteDocumentError}
+        onCancel={() => {
+          if (deletingDocumentId !== null) return;
+          setDeleteDocumentError("");
+          setDocumentPendingDelete(null);
+        }}
+        onConfirm={handleDeleteStoredDocument}
+      />
 
       {selectedClientTree && (
         <FilesUploadModal
@@ -2988,6 +3297,7 @@ function Files() {
 }
 
 function Finance() {
+  const today = useMemo(() => new Date(), []);
   const [entries, setEntries] = useState<FinanceEntry[]>(seedFinanceEntries);
   const [isLoadingEntries, setIsLoadingEntries] = useState(true);
   const [entriesError, setEntriesError] = useState("");
@@ -2997,6 +3307,8 @@ function Finance() {
   const [clientFilter, setClientFilter] = useState<string>("todos");
   const [statusFilter, setStatusFilter] = useState<FinanceStatus | "todos">("todos");
   const [chartView, setChartView] = useState<FinanceChartView>("year");
+  const [selectedChartYear, setSelectedChartYear] = useState(() => today.getFullYear());
+  const [selectedChartMonth, setSelectedChartMonth] = useState(() => today.getMonth());
   const [showQuickMenu, setShowQuickMenu] = useState(false);
   const [showRevenueModal, setShowRevenueModal] = useState(false);
   const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -3077,11 +3389,20 @@ function Finance() {
     const unique = Array.from(new Set(entries.map((entry) => entry.client.trim()).filter(Boolean)));
     return unique.sort((a, b) => a.localeCompare(b, "pt-BR", { sensitivity: "base" }));
   }, [entries]);
-  const now = useMemo(() => new Date(), []);
   const currentMonthLabel = useMemo(
-    () => now.toLocaleDateString("pt-BR", { month: "long", year: "numeric" }),
-    [now]
+    () => new Date(selectedChartYear, selectedChartMonth, 1).toLocaleDateString("pt-BR", { month: "long", year: "numeric" }),
+    [selectedChartMonth, selectedChartYear]
   );
+  const financeChartYearOptions = useMemo(() => {
+    const entryYears = entries
+      .map((entry) => toDateStart(entry.dueDate)?.getFullYear() ?? null)
+      .filter((value): value is number => value !== null);
+    const baseMinYear = entryYears.length ? Math.min(...entryYears) : today.getFullYear();
+    const baseMaxYear = entryYears.length ? Math.max(...entryYears) : today.getFullYear();
+    const minYear = Math.min(baseMinYear, today.getFullYear() - 2);
+    const maxYear = Math.max(baseMaxYear, today.getFullYear() + 2);
+    return Array.from({ length: maxYear - minYear + 1 }, (_, index) => minYear + index);
+  }, [entries, today]);
 
   const expectedRevenue = useMemo(
     () => revenueEntries.reduce((sum, entry) => sum + entry.amount, 0),
@@ -3126,14 +3447,13 @@ function Finance() {
   const receiptRate = expectedRevenue > 0 ? Math.round((receivedRevenue / expectedRevenue) * 100) : 0;
 
   const annualChartData = useMemo(() => {
-    const currentYear = now.getFullYear();
     const expectedByMonth = Array.from({ length: 12 }, () => 0);
     const receivedByMonth = Array.from({ length: 12 }, () => 0);
     const expenseByMonth = Array.from({ length: 12 }, () => 0);
 
     entries.forEach((entry) => {
       const dueDate = toDateStart(entry.dueDate);
-      if (!dueDate || dueDate.getFullYear() !== currentYear) return;
+      if (!dueDate || dueDate.getFullYear() !== selectedChartYear) return;
       const monthIndex = dueDate.getMonth();
       if (entry.entryType === "receita") {
         expectedByMonth[monthIndex] += entry.amount;
@@ -3151,11 +3471,9 @@ function Finance() {
       expense: expenseByMonth[index],
       result: receivedByMonth[index] - expenseByMonth[index]
     }));
-  }, [entries, now]);
+  }, [entries, selectedChartYear]);
   const monthlyChartData = useMemo(() => {
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth();
-    const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+    const daysInMonth = new Date(selectedChartYear, selectedChartMonth + 1, 0).getDate();
     const highlightedDays = new Set(
       daysInMonth <= 7 ? Array.from({ length: daysInMonth }, (_, index) => index + 1) : [1, 5, 10, 15, 20, 25, daysInMonth]
     );
@@ -3165,7 +3483,7 @@ function Finance() {
 
     entries.forEach((entry) => {
       const dueDate = toDateStart(entry.dueDate);
-      if (!dueDate || dueDate.getFullYear() !== currentYear || dueDate.getMonth() !== currentMonth) return;
+      if (!dueDate || dueDate.getFullYear() !== selectedChartYear || dueDate.getMonth() !== selectedChartMonth) return;
       const dayIndex = dueDate.getDate() - 1;
       if (entry.entryType === "receita") {
         expectedByDay[dayIndex] += entry.amount;
@@ -3189,7 +3507,7 @@ function Finance() {
         result: received - expense
       };
     });
-  }, [entries, now]);
+  }, [entries, selectedChartMonth, selectedChartYear]);
   const annualResult = useMemo(
     () => annualChartData.reduce((sum, item) => sum + item.result, 0),
     [annualChartData]
@@ -3206,7 +3524,6 @@ function Finance() {
       : `Receita prevista, receita recebida, despesas e linha de resultado por dia em ${currentMonthLabel}.`;
   const comparisonChartResultLabel = chartView === "year" ? "Resultado anual" : "Resultado do mês";
   const comparisonChartResult = chartView === "year" ? annualResult : monthlyResult;
-  const comparisonChartPeriodLabel = chartView === "year" ? String(now.getFullYear()) : currentMonthLabel;
   const comparisonChartScale = useMemo(() => {
     const values = comparisonChartData.flatMap((item) => [item.expected, item.received, item.expense, item.result]);
     return buildNiceChartScale(values, 5);
@@ -3223,7 +3540,7 @@ function Finance() {
   const buildComparisonPoints = (values: number[]) =>
     values.map((value, index) => ({
       value,
-      x: values.length === 1 ? 50 : (index / Math.max(1, values.length - 1)) * 100,
+      x: values.length === 1 ? 50 : ((index + 0.5) / values.length) * 100,
       y: ((comparisonChartScale.max - value) / comparisonChartScale.range) * 100
     }));
   const comparisonChartResultPoints = useMemo(
@@ -3231,7 +3548,7 @@ function Finance() {
     [comparisonChartData, comparisonChartScale]
   );
   const comparisonChartResultLine = useMemo(
-    () => buildRoundedStepChartPath(comparisonChartResultPoints),
+    () => buildSmoothChartPath(comparisonChartResultPoints),
     [comparisonChartResultPoints]
   );
   const comparisonChartGridStyle = useMemo(
@@ -3271,8 +3588,8 @@ function Finance() {
   }, [entries, searchTerm]);
 
   const filteredOverviewEntries = useMemo(() => {
-    const today = new Date(now);
-    today.setHours(0, 0, 0, 0);
+    const todayBase = new Date(today);
+    todayBase.setHours(0, 0, 0, 0);
     return filteredEntries.filter((entry) => {
       const status = getFinanceStatus(entry);
       const dueDate = toDateStart(entry.dueDate);
@@ -3283,10 +3600,10 @@ function Finance() {
 
       if (periodFilter === "this-month") {
         matchesPeriod = Boolean(
-          dueDate && dueDate.getFullYear() === today.getFullYear() && dueDate.getMonth() === today.getMonth()
+          dueDate && dueDate.getFullYear() === todayBase.getFullYear() && dueDate.getMonth() === todayBase.getMonth()
         );
       } else if (periodFilter === "this-week") {
-        const startOfWeek = new Date(today);
+        const startOfWeek = new Date(todayBase);
         const day = startOfWeek.getDay();
         const diffToMonday = day === 0 ? -6 : 1 - day;
         startOfWeek.setDate(startOfWeek.getDate() + diffToMonday);
@@ -3299,7 +3616,7 @@ function Finance() {
 
       return matchesType && matchesClient && matchesStatus && matchesPeriod;
     });
-  }, [clientFilter, entryTypeFilter, filteredEntries, now, periodFilter, statusFilter]);
+  }, [clientFilter, entryTypeFilter, filteredEntries, periodFilter, statusFilter, today]);
 
   const periodRevenue = useMemo(
     () =>
@@ -3590,7 +3907,36 @@ function Finance() {
                       </button>
                     ))}
                   </div>
-                  <span className="finance-chart-period">{comparisonChartPeriodLabel}</span>
+                  <div className="finance-chart-period-controls">
+                    {chartView === "month" && (
+                      <div className="finance-chart-period-select finance-chart-period-select-month">
+                        <select
+                          aria-label="Selecionar mês do gráfico"
+                          value={selectedChartMonth}
+                          onChange={(event) => setSelectedChartMonth(Number(event.target.value))}
+                        >
+                          {financeMonthOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className="finance-chart-period-select finance-chart-period-select-year">
+                      <select
+                        aria-label="Selecionar ano do gráfico"
+                        value={selectedChartYear}
+                        onChange={(event) => setSelectedChartYear(Number(event.target.value))}
+                      >
+                        {financeChartYearOptions.map((year) => (
+                          <option key={year} value={year}>
+                            {year}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
                 </div>
                 <div className="finance-chart-result finance-chart-result-strong">
                   {comparisonChartResultLabel}: <strong>{formatCurrencyBRL(comparisonChartResult)}</strong>
@@ -4396,10 +4742,25 @@ const formatIsoDate = (date: Date) => {
 };
 
 const formatBrazilDate = (value: string) => parseLocalDate(value).toLocaleDateString("pt-BR");
+const splitStoredOab = (value: string) => {
+  const compact = value.trim().toUpperCase().replace(/\s+/g, "");
+  const digits = compact.replace(/\D/g, "").slice(0, 6);
+  const ufMatch = compact.match(/([A-Z]{2})$/);
+  return {
+    number: digits,
+    uf: ufMatch?.[1] ?? ""
+  };
+};
 
-function Publications() {
+function Publications({ user }: { user: AuthUser | null }) {
   const [publications, setPublications] = useState<Publication[]>([]);
   const [form, setForm] = useState({ title: "", publicationDate: "", deadlineDays: "" });
+  const [todayPublicationResult, setTodayPublicationResult] = useState<TodayPublicationsResponse | null>(null);
+  const [isLoadingTodayPublications, setIsLoadingTodayPublications] = useState(false);
+  const [todayPublicationsError, setTodayPublicationsError] = useState("");
+  const [todayPublicationsInlineMessage, setTodayPublicationsInlineMessage] = useState("");
+  const [selectedPublicationDate, setSelectedPublicationDate] = useState(() => formatIsoDate(new Date()));
+  const runningInTauri = typeof window !== "undefined" && isTauri();
   const [month, setMonth] = useState(() => {
     const today = new Date();
     return new Date(today.getFullYear(), today.getMonth(), 1);
@@ -4426,6 +4787,61 @@ function Publications() {
   const orderedDeadlines = useMemo(() => {
     return [...publications].sort((a, b) => a.deadlineDate.localeCompare(b.deadlineDate));
   }, [publications]);
+
+  const handlePublicationSearchDateChange = (value: string) => {
+    if (!value) return;
+    setSelectedPublicationDate(value);
+    const nextDate = parseLocalDate(value);
+    setMonth(new Date(nextDate.getFullYear(), nextDate.getMonth(), 1));
+    setTodayPublicationsError("");
+    setTodayPublicationsInlineMessage("");
+    setTodayPublicationResult(null);
+  };
+
+  const handleLoadTodayPublications = async (event?: React.FormEvent) => {
+    event?.preventDefault();
+    setIsLoadingTodayPublications(true);
+    setTodayPublicationsError("");
+    setTodayPublicationsInlineMessage("");
+    try {
+      let data: TodayPublicationsResponse;
+      if (runningInTauri && baseURL !== LOCAL_API_BASE_URL) {
+        const memberEmail = user?.email?.trim().toLowerCase();
+        if (!memberEmail) {
+          throw new Error("Não foi possível identificar o e-mail do usuário logado.");
+        }
+        const members = await apiListTeamMembers();
+        const currentMember = members.find((member) => member.is_active && member.email.trim().toLowerCase() === memberEmail);
+        if (!currentMember) {
+          throw new Error("Nenhum membro ativo da equipe está vinculado ao e-mail logado.");
+        }
+        const parsedOab = splitStoredOab(currentMember.oab || "");
+        if (parsedOab.number.length !== 6 || !parsedOab.uf) {
+          throw new Error("A OAB do seu cadastro precisa ter 6 números e UF.");
+        }
+        data = await apiSearchPublicationsByOabLocally({
+          oab_number: parsedOab.number,
+          oab_uf: parsedOab.uf,
+          member_name: currentMember.full_name || user?.name || "Membro da equipe",
+          member_email: currentMember.email || memberEmail,
+          publication_date: selectedPublicationDate
+        });
+      } else {
+        data = await apiGetTodayPublications(selectedPublicationDate);
+      }
+      const formattedDate = formatBrazilDate(data.publication_date);
+      setTodayPublicationResult(data);
+      setTodayPublicationsInlineMessage(
+        data.count > 0
+          ? `${data.count} publicação(ões) encontrada(s) em ${formattedDate} para ${data.oab}.`
+          : `Nenhuma publicação encontrada em ${formattedDate} para ${data.oab}.`
+      );
+    } catch (err) {
+      setTodayPublicationsError(extractApiErrorMessage(err, "Não foi possível carregar as publicações da data selecionada."));
+    } finally {
+      setIsLoadingTodayPublications(false);
+    }
+  };
 
   const handleAddPublication = (event: React.FormEvent) => {
     event.preventDefault();
@@ -4556,18 +4972,84 @@ function Publications() {
               const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
               const deadlines = deadlinesByDate[dateKey] || [];
               const hasDeadline = deadlines.length > 0;
+              const isSelected = dateKey === selectedPublicationDate;
               return (
-                <div
+                <button
                   key={dateKey}
-                  className={`calendar-cell ${hasDeadline ? "has-deadline" : ""} ${dateKey === todayKey ? "today" : ""}`}
+                  type="button"
+                  className={`calendar-cell calendar-day-btn ${hasDeadline ? "has-deadline" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                  onClick={() => handlePublicationSearchDateChange(dateKey)}
                 >
                   <div className="calendar-day">{dayNumber}</div>
                   {hasDeadline && <div className="calendar-count">{deadlines.length} prazo{deadlines.length > 1 ? "s" : ""}</div>}
-                </div>
+                </button>
               );
             })}
           </div>
         </div>
+      </div>
+
+      <div className="publication-card publication-search-card">
+        <div className="publication-live-head">
+          <div>
+            <div className="publication-title">Buscar publicações da minha OAB</div>
+            <div className="publication-live-subtitle">
+              Selecione uma data no calendário ou no campo abaixo para consultar o DJEN da OAB vinculada ao seu login.
+            </div>
+          </div>
+        </div>
+        <form className="publication-form publication-search-form" onSubmit={handleLoadTodayPublications}>
+          <div className="field">
+            <label>Data da consulta</label>
+            <input
+              type="date"
+              value={selectedPublicationDate}
+              onChange={(event) => handlePublicationSearchDateChange(event.target.value)}
+            />
+          </div>
+          <div className="publication-search-actions">
+            <button className="btn ghost small" type="submit" disabled={isLoadingTodayPublications}>
+              {isLoadingTodayPublications ? "Consultando..." : "Buscar publicações"}
+            </button>
+          </div>
+        </form>
+        {todayPublicationsError && <div className="error">{todayPublicationsError}</div>}
+        {todayPublicationsInlineMessage && <div className="agenda-inline">{todayPublicationsInlineMessage}</div>}
+        {todayPublicationResult && (
+          <div className="publication-live-meta">
+            <span>OAB {todayPublicationResult.oab}</span>
+            <span>{todayPublicationResult.member_name}</span>
+            <span>{formatDatePtBr(todayPublicationResult.publication_date)}</span>
+          </div>
+        )}
+        {!todayPublicationResult ? (
+          <div className="publication-empty">Selecione uma data e clique em buscar publicações para consultar o DJEN.</div>
+        ) : todayPublicationResult.items.length === 0 ? (
+          <div className="publication-empty">Nenhuma publicação encontrada para a data selecionada.</div>
+        ) : (
+          <div className="publication-list">
+            {todayPublicationResult.items.map((publication: TodayPublicationItem) => (
+              <div key={publication.hash || publication.id} className="publication-item publication-today-item">
+                <div>
+                  <div className="publication-name">{publication.title}</div>
+                  <div className="publication-meta">
+                    {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+                    {publication.tribunal ? ` · ${publication.tribunal}` : ""}
+                    {publication.communication_type ? ` · ${publication.communication_type}` : ""}
+                  </div>
+                  {publication.court_name && <div className="publication-meta">{publication.court_name}</div>}
+                  {publication.summary && <div className="publication-summary">{publication.summary}</div>}
+                </div>
+                <div className="publication-today-actions">
+                  {publication.tribunal && <span className="publication-tag">{publication.tribunal}</span>}
+                  <a className="publication-link" href={publication.detail_url} target="_blank" rel="noreferrer">
+                    Abrir íntegra
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4586,17 +5068,42 @@ const agendaProviders: { provider: CalendarProvider; label: string; description:
   }
 ];
 
+const internalAgendaTypeOptions: { value: InternalAgendaEventType; label: string; kind: AgendaItem["kind"] }[] = [
+  { value: "deadline", label: "Prazo", kind: "deadline" },
+  { value: "meeting", label: "Reunião", kind: "meeting" },
+  { value: "hearing", label: "Audiência", kind: "meeting" },
+  { value: "audit", label: "Auditoria", kind: "meeting" }
+];
+
+const getInternalAgendaTypeOption = (value?: InternalAgendaEventType | string | null) =>
+  internalAgendaTypeOptions.find((item) => item.value === value) || internalAgendaTypeOptions[0];
+
 const agendaSourceLabel = (source: string) => {
-  if (source === "internal") return "Prazo interno";
+  if (source === "internal") return "Interno";
   if (source === "google") return "Google";
   if (source === "microsoft") return "Microsoft";
   return source;
 };
 
-const formatAgendaTime = (value: string, isAllDay: boolean) => {
+const agendaEventTagLabel = (item: AgendaItem) => {
+  if (item.source === "internal") {
+    return getInternalAgendaTypeOption(item.event_type).label;
+  }
+  return item.kind === "deadline" ? "Prazo" : "Reunião";
+};
+
+const agendaEventAssigneesLabel = (item: AgendaItem) => item.assignees || item.assignee_name || "";
+
+const formatAgendaTime = (startValue: string, endValue: string, isAllDay: boolean) => {
   if (isAllDay) return "Dia inteiro";
-  const date = new Date(value);
-  return date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const startDate = new Date(startValue);
+  const endDate = new Date(endValue);
+  const startLabel = startDate.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const endLabel = endDate.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  if (!endValue || Number.isNaN(endDate.getTime()) || startLabel === endLabel) {
+    return startLabel;
+  }
+  return `${startLabel} - ${endLabel}`;
 };
 
 const formatAgendaHeaderDate = (value: string) => {
@@ -4607,6 +5114,22 @@ const formatAgendaHeaderDate = (value: string) => {
     year: "numeric",
     weekday: "long"
   });
+};
+
+const getAgendaAssigneeSearchTerm = (value: string) => {
+  const parts = value.split(";");
+  return parts[parts.length - 1]?.trim() || "";
+};
+
+const injectAgendaAssigneeEmail = (value: string, email: string) => {
+  const cleanEmail = email.trim();
+  if (!cleanEmail) return value;
+  const completed = value
+    .split(";")
+    .slice(0, -1)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return completed.length ? `${completed.join("; ")}; ${cleanEmail}; ` : `${cleanEmail}; `;
 };
 
 function Agenda() {
@@ -4622,13 +5145,54 @@ function Agenda() {
   const [sourceFilter, setSourceFilter] = useState<"all" | "internal" | CalendarProvider>("all");
   const [typeFilter, setTypeFilter] = useState<"all" | "deadline" | "meeting">("all");
   const [savingDeadline, setSavingDeadline] = useState(false);
-  const [deadlineForm, setDeadlineForm] = useState({ title: "", dueDate: formatIsoDate(new Date()), reference: "", notes: "" });
+  const [teamMembers, setTeamMembers] = useState<ApiTeamMember[]>([]);
+  const [isLoadingTeamMembers, setIsLoadingTeamMembers] = useState(false);
+  const [isAssigneePickerOpen, setIsAssigneePickerOpen] = useState(false);
+  const [deadlineForm, setDeadlineForm] = useState({
+    title: "",
+    dueDate: formatIsoDate(new Date()),
+    startTime: "",
+    endTime: "",
+    eventType: "deadline" as InternalAgendaEventType,
+    assignees: "",
+    meetingUrl: "",
+    reference: "",
+    notes: ""
+  });
+  const assigneesInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!inlineMessage) return;
     const timeout = window.setTimeout(() => setInlineMessage(""), 4200);
     return () => window.clearTimeout(timeout);
   }, [inlineMessage]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadTeamMembers = async () => {
+      setIsLoadingTeamMembers(true);
+      try {
+        const data = await apiListTeamMembers();
+        if (cancelled) return;
+        setTeamMembers(
+          data
+            .filter((member) => member.is_active && member.email.trim())
+            .sort((a, b) => a.full_name.localeCompare(b.full_name, "pt-BR"))
+        );
+      } catch {
+        if (cancelled) return;
+        setTeamMembers([]);
+      } finally {
+        if (!cancelled) {
+          setIsLoadingTeamMembers(false);
+        }
+      }
+    };
+    void loadTeamMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadAgendaData = async (
     targetMonth: Date,
@@ -4733,40 +5297,93 @@ function Agenda() {
       .slice(0, 8);
   }, [filteredEvents, selectedDate]);
 
+  const assigneeSearchTerm = useMemo(() => getAgendaAssigneeSearchTerm(deadlineForm.assignees), [deadlineForm.assignees]);
+
+  const assigneeSuggestions = useMemo(() => {
+    const query = normalizeSearchText(assigneeSearchTerm);
+    if (!query) return [];
+    const selectedEmails = new Set(
+      deadlineForm.assignees
+        .split(";")
+        .slice(0, -1)
+        .map((part) => part.trim().toLowerCase())
+        .filter(Boolean)
+    );
+    return teamMembers
+      .filter((member) => {
+        const normalizedName = normalizeSearchText(member.full_name);
+        const normalizedEmail = normalizeSearchText(member.email);
+        if (selectedEmails.has(member.email.trim().toLowerCase())) return false;
+        return normalizedName.includes(query) || normalizedEmail.includes(query);
+      })
+      .slice(0, 6);
+  }, [assigneeSearchTerm, deadlineForm.assignees, teamMembers]);
+
+  const handleSelectAssigneeSuggestion = (member: ApiTeamMember) => {
+    setDeadlineForm((prev) => ({ ...prev, assignees: injectAgendaAssigneeEmail(prev.assignees, member.email) }));
+    setIsAssigneePickerOpen(false);
+    window.setTimeout(() => assigneesInputRef.current?.focus(), 0);
+  };
+
   const handleCreateDeadline = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!deadlineForm.title.trim() || !deadlineForm.dueDate) return;
+    if (deadlineForm.endTime && !deadlineForm.startTime) {
+      setError("Preencha o horário de início antes do horário final.");
+      return;
+    }
+    if (deadlineForm.startTime && deadlineForm.endTime && deadlineForm.endTime <= deadlineForm.startTime) {
+      setError("O horário final deve ser maior que o horário de início.");
+      return;
+    }
     setSavingDeadline(true);
     setError("");
     try {
+      const dueDateValue = deadlineForm.startTime ? `${deadlineForm.dueDate}T${deadlineForm.startTime}:00` : deadlineForm.dueDate;
       await apiCreateAgendaDeadline({
         title: deadlineForm.title.trim(),
-        due_date: deadlineForm.dueDate,
+        due_date: dueDateValue,
         reference: deadlineForm.reference.trim() || undefined,
-        notes: deadlineForm.notes.trim() || undefined
+        notes: deadlineForm.notes.trim() || undefined,
+        event_type: deadlineForm.eventType,
+        meeting_url: deadlineForm.meetingUrl.trim() || undefined,
+        assignees: deadlineForm.assignees.trim() || undefined,
+        end_time: deadlineForm.endTime || undefined,
+        is_all_day: !deadlineForm.startTime && !deadlineForm.endTime
       });
       const dueDate = parseLocalDate(deadlineForm.dueDate);
       const dueMonth = new Date(dueDate.getFullYear(), dueDate.getMonth(), 1);
       setMonth(dueMonth);
       setSelectedDate(deadlineForm.dueDate);
-      setDeadlineForm((prev) => ({ ...prev, title: "", reference: "", notes: "" }));
-      setInlineMessage("Prazo cadastrado com sucesso.");
+      setDeadlineForm((prev) => ({
+        ...prev,
+        title: "",
+        startTime: "",
+        endTime: "",
+        eventType: "deadline",
+        assignees: "",
+        meetingUrl: "",
+        reference: "",
+        notes: ""
+      }));
+      setIsAssigneePickerOpen(false);
+      setInlineMessage("Compromisso interno cadastrado com sucesso.");
       await loadAgendaData(dueMonth);
     } catch (err) {
-      setError(extractApiErrorMessage(err, "Não foi possível salvar o prazo."));
+      setError(extractApiErrorMessage(err, "Não foi possível salvar o compromisso interno."));
     } finally {
       setSavingDeadline(false);
     }
   };
 
   const handleDeleteDeadline = async (eventItem: AgendaItem) => {
-    if (eventItem.kind !== "deadline") return;
+    if (eventItem.source !== "internal") return;
     try {
       await apiDeleteAgendaDeadline(eventItem.entity_id);
-      setInlineMessage("Prazo removido.");
+      setInlineMessage("Compromisso interno removido.");
       await loadAgendaData(month);
     } catch (err) {
-      setError(extractApiErrorMessage(err, "Não foi possível remover o prazo."));
+      setError(extractApiErrorMessage(err, "Não foi possível remover o compromisso interno."));
     }
   };
 
@@ -4838,14 +5455,14 @@ function Agenda() {
           </div>
 
           <div className="publication-card agenda-deadline-card">
-            <div className="publication-title">Novo prazo interno</div>
+            <div className="publication-title">Novo compromisso interno</div>
             <form className="publication-form agenda-deadline-form" onSubmit={handleCreateDeadline}>
               <div className="field">
                 <label>Título *</label>
                 <input
                   value={deadlineForm.title}
                   onChange={(event) => setDeadlineForm((prev) => ({ ...prev, title: event.target.value }))}
-                  placeholder="Ex: Contrarrazões do processo AP-002"
+                  placeholder="Ex: Reunião com cliente AP-002"
                 />
               </div>
               <div className="field">
@@ -4854,6 +5471,99 @@ function Agenda() {
                   type="date"
                   value={deadlineForm.dueDate}
                   onChange={(event) => setDeadlineForm((prev) => ({ ...prev, dueDate: event.target.value }))}
+                />
+              </div>
+              <div className="field">
+                <label>Tipo</label>
+                <select
+                  value={deadlineForm.eventType}
+                  onChange={(event) =>
+                    setDeadlineForm((prev) => ({ ...prev, eventType: event.target.value as InternalAgendaEventType }))
+                  }
+                >
+                  {internalAgendaTypeOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Horário</label>
+                <div className="agenda-time-range">
+                  <div className="agenda-time-slot">
+                    <span className="agenda-time-label">Início</span>
+                    <input
+                      type="time"
+                      aria-label="Horário de início"
+                      value={deadlineForm.startTime}
+                      onChange={(event) => setDeadlineForm((prev) => ({ ...prev, startTime: event.target.value }))}
+                    />
+                  </div>
+                  <div className="agenda-time-slot">
+                    <span className="agenda-time-label">Fim</span>
+                    <input
+                      type="time"
+                      aria-label="Horário de fim"
+                      value={deadlineForm.endTime}
+                      onChange={(event) => setDeadlineForm((prev) => ({ ...prev, endTime: event.target.value }))}
+                    />
+                  </div>
+                </div>
+              </div>
+              <div className="field span-2">
+                <label>Responsáveis</label>
+                <div className="agenda-assignees-field">
+                  <input
+                    ref={assigneesInputRef}
+                    value={deadlineForm.assignees}
+                    onChange={(event) => {
+                      setDeadlineForm((prev) => ({ ...prev, assignees: event.target.value }));
+                      setIsAssigneePickerOpen(true);
+                    }}
+                    onFocus={() => setIsAssigneePickerOpen(true)}
+                    onBlur={() => window.setTimeout(() => setIsAssigneePickerOpen(false), 120)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && isAssigneePickerOpen && assigneeSuggestions.length > 0) {
+                        event.preventDefault();
+                        handleSelectAssigneeSuggestion(assigneeSuggestions[0]);
+                      }
+                      if (event.key === "Escape") {
+                        setIsAssigneePickerOpen(false);
+                      }
+                    }}
+                    placeholder="Digite nome ou e-mail; clique para completar"
+                  />
+                  {isAssigneePickerOpen && (assigneeSearchTerm || isLoadingTeamMembers) && (
+                    <div className="agenda-assignee-picker">
+                      {isLoadingTeamMembers ? (
+                        <div className="agenda-assignee-empty">Carregando equipe...</div>
+                      ) : assigneeSuggestions.length === 0 ? (
+                        <div className="agenda-assignee-empty">Nenhum membro encontrado.</div>
+                      ) : (
+                        assigneeSuggestions.map((member) => (
+                          <button
+                            key={member.id}
+                            type="button"
+                            className="agenda-assignee-option"
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => handleSelectAssigneeSuggestion(member)}
+                          >
+                            <div className="agenda-assignee-name">{member.full_name}</div>
+                            <div className="agenda-assignee-email">{member.email}</div>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="field">
+                <label>Link da reunião</label>
+                <input
+                  value={deadlineForm.meetingUrl}
+                  onChange={(event) => setDeadlineForm((prev) => ({ ...prev, meetingUrl: event.target.value }))}
+                  placeholder="https://meet.google.com/..."
                 />
               </div>
               <div className="field">
@@ -4869,15 +5579,12 @@ function Agenda() {
                 <textarea
                   value={deadlineForm.notes}
                   onChange={(event) => setDeadlineForm((prev) => ({ ...prev, notes: event.target.value }))}
-                  placeholder="Detalhes do prazo"
+                  placeholder="Detalhes do compromisso"
                 />
               </div>
-              <div className="publication-actions">
-                <div className="deadline-preview">
-                  Data selecionada: <strong>{formatBrazilDate(deadlineForm.dueDate || selectedDate)}</strong>
-                </div>
+              <div className="publication-actions agenda-deadline-actions">
                 <button className="btn" type="submit" disabled={!deadlineForm.title.trim() || !deadlineForm.dueDate || savingDeadline}>
-                  {savingDeadline ? "Salvando..." : "Salvar prazo"}
+                  {savingDeadline ? "Salvando..." : "Salvar compromisso"}
                 </button>
               </div>
             </form>
@@ -4894,14 +5601,14 @@ function Agenda() {
               <div className="agenda-filters">
                 <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as "all" | "internal" | CalendarProvider)}>
                   <option value="all">Todas origens</option>
-                  <option value="internal">Somente prazos</option>
+                  <option value="internal">Somente internos</option>
                   <option value="google">Google</option>
                   <option value="microsoft">Microsoft</option>
                 </select>
                 <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as "all" | "deadline" | "meeting")}>
                   <option value="all">Todos tipos</option>
                   <option value="deadline">Prazos</option>
-                  <option value="meeting">Reuniões</option>
+                  <option value="meeting">Reuniões e compromissos</option>
                 </select>
               </div>
             </div>
@@ -4917,9 +5624,11 @@ function Agenda() {
                     <div>
                       <div className="publication-name">{item.title}</div>
                       <div className="publication-meta">
-                        {formatAgendaTime(item.starts_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
+                        {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
                         {item.reference ? ` · ${item.reference}` : ""}
                       </div>
+                      {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
+                      {item.description && <div className="agenda-event-description">{item.description}</div>}
                       {item.location && <div className="publication-meta">Local: {item.location}</div>}
                       {item.meeting_url && (
                         <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
@@ -4928,8 +5637,8 @@ function Agenda() {
                       )}
                     </div>
                     <div className="agenda-event-side">
-                      <span className={`publication-tag agenda-tag ${item.kind}`}>{item.kind === "deadline" ? "Prazo" : "Reunião"}</span>
-                      {item.kind === "deadline" && (
+                      <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                      {item.source === "internal" && (
                         <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
                           Remover
                         </button>
@@ -4952,11 +5661,12 @@ function Agenda() {
                     <div>
                       <div className="publication-name">{item.title}</div>
                       <div className="publication-meta">
-                        {new Date(item.starts_at).toLocaleDateString("pt-BR")} · {formatAgendaTime(item.starts_at, item.is_all_day)} ·{" "}
+                      {new Date(item.starts_at).toLocaleDateString("pt-BR")} · {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} ·{" "}
                         {agendaSourceLabel(item.source)}
                       </div>
+                      {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
                     </div>
-                    <span className={`publication-tag agenda-tag ${item.kind}`}>{item.kind === "deadline" ? "Prazo" : "Reunião"}</span>
+                    <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
                   </div>
                 ))}
               </div>
@@ -5245,7 +5955,7 @@ function Cases() {
     setIsSavingCase(true);
     setSaveCaseError("");
     try {
-      const counterparty = createCaseForm.counterparty.trim() || "Parte contrária";
+      const counterparty = formatCounterparty(createCaseForm.counterparty).trim() || "Parte contrária";
       const formattedProcess = formatCaseNumber(createCaseForm.process);
       const created = await apiCreateCase({
         number: formattedProcess,
@@ -5277,7 +5987,7 @@ function Cases() {
       court: selectedCase.action === "Ação judicial" ? "" : selectedCase.action,
       region: selectedCase.forum === "-" ? "" : selectedCase.forum,
       associated: "",
-      counterparty: selectedCase.counterparty === "-" ? "" : selectedCase.counterparty,
+      counterparty: formatCounterparty(selectedCase.counterparty === "-" ? "" : selectedCase.counterparty),
       counterLawyer: "",
       oab: "",
       contact: "",
@@ -5300,7 +6010,7 @@ function Cases() {
       const formattedProcess = formatCaseNumber(editCaseForm.process);
       const payload = {
         number: formattedProcess,
-        title: `${selectedCase.client} x ${editCaseForm.counterparty.trim() || "Parte contrária"}`,
+        title: `${selectedCase.client} x ${formatCounterparty(editCaseForm.counterparty).trim() || "Parte contrária"}`,
         client_id: selectedCase.clientId,
         wallet_id: editCaseForm.walletId ? Number(editCaseForm.walletId) : undefined,
         status: selectedCase.rawStatus || "aberto",
@@ -6065,7 +6775,8 @@ const buildEmptyTeamForm = () => ({
   email: "",
   phone: "",
   cpf: "",
-  oab: "",
+  oabNumber: "",
+  oabUf: "",
   roleTitle: "",
   teamName: "",
   notes: "",
@@ -6089,8 +6800,11 @@ const getTeamFormValidationMessage = (form: TeamForm) => {
   if (!isValidCpf(form.cpf)) {
     return "Informe um CPF válido.";
   }
-  if (!form.oab.trim()) {
-    return "Informe a OAB do membro.";
+  if (form.oabNumber.trim().length !== 6) {
+    return "Informe os 6 números da OAB do membro.";
+  }
+  if (!form.oabUf.trim()) {
+    return "Selecione a UF da OAB.";
   }
   if (!form.roleTitle.trim()) {
     return "Informe o cargo do membro.";
@@ -6161,7 +6875,16 @@ function Team({ canManage }: { canManage: boolean }) {
     return `(${digits.slice(0, 2)})${digits.slice(2, 7)}-${digits.slice(7)}`;
   };
 
-  const formatOab = (value: string) => value.toUpperCase().replace(/[^A-Z0-9/\-.\s]/g, "").slice(0, 20);
+  const formatOabNumber = (value: string) => value.replace(/\D/g, "").slice(0, 6);
+  const splitStoredOab = (value: string) => {
+    const compact = value.trim().toUpperCase().replace(/\s+/g, "");
+    const digits = compact.replace(/\D/g, "").slice(0, 6);
+    const ufMatch = compact.match(/([A-Z]{2})$/);
+    return {
+      number: digits,
+      uf: ufMatch?.[1] ?? ""
+    };
+  };
 
   const filteredMembers = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -6250,7 +6973,7 @@ function Team({ canManage }: { canManage: boolean }) {
         email: form.email.trim(),
         phone: form.phone.trim() || undefined,
         cpf: normalizeCpfDigits(form.cpf),
-        oab: form.oab.trim().toUpperCase(),
+        oab: `${form.oabNumber.trim()}/${form.oabUf.trim().toUpperCase()}`,
         role_title: form.roleTitle.trim(),
         team_name: form.teamName.trim(),
         notes: form.notes.trim() || undefined,
@@ -6288,12 +7011,14 @@ function Team({ canManage }: { canManage: boolean }) {
     setEditingId(member.id);
     const memberNavKeys = normalizeNavKeys(member.allowed_nav_keys);
     const baseNavKeys = memberNavKeys.length ? memberNavKeys : [...defaultMemberNavKeys];
+    const parsedOab = splitStoredOab(member.oab || "");
     setForm({
       fullName: member.full_name || "",
       email: member.email || "",
       phone: member.phone || "",
       cpf: formatCpfFromDigits(member.cpf || ""),
-      oab: member.oab || "",
+      oabNumber: parsedOab.number,
+      oabUf: parsedOab.uf,
       roleTitle: member.role_title || "",
       teamName: member.team_name || "",
       notes: member.notes || "",
@@ -6470,7 +7195,7 @@ function Team({ canManage }: { canManage: boolean }) {
             <div className="processes-eyebrow">Equipe</div>
             <h2>{editingId ? "Editar membro" : "Cadastrar novo membro"}</h2>
             <div className="wallets-form-hint">
-              Campos obrigatórios: Nome, Email, CPF, OAB, Cargo e Equipe.
+              Campos obrigatórios: Nome, Email, CPF, número OAB, UF da OAB, Cargo e Equipe.
               {typeof userLimit === "number" && (
                 <> Limite de usuários ativos: {activeUsers}/{userLimit} (disponíveis: {availableSlots ?? 0}).</>
               )}
@@ -6504,8 +7229,24 @@ function Team({ canManage }: { canManage: boolean }) {
                 {cpfInvalid && <div className="error-inline">Informe um CPF válido.</div>}
               </div>
               <div className="field">
-                <label>OAB *</label>
-                <input value={form.oab} onChange={(event) => setForm((prev) => ({ ...prev, oab: formatOab(event.target.value) }))} />
+                <label>Número OAB *</label>
+                <input
+                  value={form.oabNumber}
+                  onChange={(event) => setForm((prev) => ({ ...prev, oabNumber: formatOabNumber(event.target.value) }))}
+                  placeholder="347991"
+                  inputMode="numeric"
+                />
+              </div>
+              <div className="field">
+                <label>UF da OAB *</label>
+                <select value={form.oabUf} onChange={(event) => setForm((prev) => ({ ...prev, oabUf: event.target.value }))}>
+                  <option value="">Selecione</option>
+                  {brazilUfOptions.map((uf) => (
+                    <option key={uf} value={uf}>
+                      {uf}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="field">
                 <label>Cargo *</label>
@@ -6596,21 +7337,48 @@ function Team({ canManage }: { canManage: boolean }) {
   );
 }
 
+function ProfileAvatar({
+  avatarDataUrl,
+  label,
+  size
+}: {
+  avatarDataUrl?: string | null;
+  label: string;
+  size: "sidebar" | "settings";
+}) {
+  const className = `profile-avatar ${size === "sidebar" ? "profile-avatar-sidebar" : "profile-avatar-settings"}`;
+  if (avatarDataUrl) {
+    return <img className={className} src={avatarDataUrl} alt={`Foto de ${label}`} />;
+  }
+  return (
+    <div className={`${className} profile-avatar-fallback`} role="img" aria-label={`Avatar padrão de ${label}`}>
+      <span className="profile-avatar-head" />
+      <span className="profile-avatar-body" />
+    </div>
+  );
+}
+
 function Settings({
   theme,
   onThemeChange,
   textScaleIndex,
   onTextScaleChange,
-  onLogout
+  onLogout,
+  user,
+  profile,
+  onSaveProfile
 }: {
   theme: ThemeMode;
   onThemeChange: (value: ThemeMode) => void;
   textScaleIndex: number;
   onTextScaleChange: (value: number) => void;
   onLogout: () => void;
+  user: AuthUser | null;
+  profile: UserProfilePreferences;
+  onSaveProfile: (value: UserProfilePreferences) => UserProfilePreferences;
 }) {
   const runningInTauri = typeof window !== "undefined" && isTauri();
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("0.1.6");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateMessage, setUpdateMessage] = useState("Clique em verificar atualização.");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
@@ -6623,8 +7391,23 @@ function Settings({
   const [connectingProvider, setConnectingProvider] = useState<CalendarProvider | null>(null);
   const [syncingProvider, setSyncingProvider] = useState<CalendarProvider | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<CalendarProvider | null>(null);
+  const [publicationSettings, setPublicationSettings] = useState<PublicationAutomationSettings | null>(null);
+  const [publicationForm, setPublicationForm] = useState({ is_enabled: false, schedule_time: "06:00" });
+  const [isLoadingPublicationSettings, setIsLoadingPublicationSettings] = useState(true);
+  const [publicationSettingsError, setPublicationSettingsError] = useState("");
+  const [publicationInlineMessage, setPublicationInlineMessage] = useState("");
+  const [savingPublicationSettings, setSavingPublicationSettings] = useState(false);
+  const [runningPublicationSync, setRunningPublicationSync] = useState(false);
   const pollIntervalRef = useRef<number | null>(null);
+  const profilePhotoInputRef = useRef<HTMLInputElement | null>(null);
   const currentTextScale = textScaleOptions[clampTextScaleIndex(textScaleIndex)] ?? textScaleOptions[0];
+  const [profileForm, setProfileForm] = useState<UserProfilePreferences>(profile);
+  const [profileError, setProfileError] = useState("");
+  const [profileInlineMessage, setProfileInlineMessage] = useState("");
+
+  useEffect(() => {
+    setProfileForm(profile);
+  }, [profile]);
 
   useEffect(() => {
     if (!runningInTauri) {
@@ -6659,6 +7442,74 @@ function Settings({
     return () => window.clearTimeout(timeout);
   }, [calendarInlineMessage]);
 
+  useEffect(() => {
+    if (!publicationInlineMessage) return;
+    const timeout = window.setTimeout(() => setPublicationInlineMessage(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [publicationInlineMessage]);
+
+  useEffect(() => {
+    if (!profileInlineMessage) return;
+    const timeout = window.setTimeout(() => setProfileInlineMessage(""), 4200);
+    return () => window.clearTimeout(timeout);
+  }, [profileInlineMessage]);
+
+  const handleProfileFieldChange =
+    (field: keyof Omit<UserProfilePreferences, "avatarDataUrl">) =>
+    (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      setProfileForm((prev) => ({
+        ...prev,
+        [field]: event.target.value
+      }));
+      setProfileError("");
+      setProfileInlineMessage("");
+    };
+
+  const handleProfilePhotoChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setProfileError("Selecione uma imagem JPG, PNG ou WEBP.");
+      return;
+    }
+    if (file.size > profilePhotoMaxSizeBytes) {
+      setProfileError("A foto deve ter no máximo 2 MB.");
+      return;
+    }
+    try {
+      const avatarDataUrl = await readFileAsDataUrl(file);
+      setProfileForm((prev) => ({
+        ...prev,
+        avatarDataUrl
+      }));
+      setProfileError("");
+      setProfileInlineMessage("Foto carregada. Clique em salvar perfil para aplicar no topo.");
+    } catch (error) {
+      setProfileError(extractRuntimeErrorMessage(error, "Não foi possível carregar a foto do perfil."));
+    }
+  };
+
+  const handleRemoveProfilePhoto = () => {
+    setProfileForm((prev) => ({
+      ...prev,
+      avatarDataUrl: ""
+    }));
+    setProfileError("");
+    setProfileInlineMessage("Foto removida. Clique em salvar perfil para aplicar a alteração.");
+  };
+
+  const handleSaveProfile = () => {
+    try {
+      const nextProfile = onSaveProfile(profileForm);
+      setProfileForm(nextProfile);
+      setProfileError("");
+      setProfileInlineMessage("Perfil atualizado com sucesso.");
+    } catch (error) {
+      setProfileError(extractRuntimeErrorMessage(error, "Não foi possível salvar o perfil."));
+    }
+  };
+
   const loadCalendarConnections = async () => {
     setIsLoadingCalendarConnections(true);
     setCalendarConnectionsError("");
@@ -6672,8 +7523,34 @@ function Settings({
     }
   };
 
+  const loadPublicationAutomation = async () => {
+    setIsLoadingPublicationSettings(true);
+    setPublicationSettingsError("");
+    try {
+      const data = await apiGetPublicationAutomationSettings();
+      setPublicationSettings(data);
+      setPublicationForm({
+        is_enabled: data.is_enabled,
+        schedule_time: data.schedule_time || "06:00"
+      });
+    } catch (err) {
+      const error = err as { response?: { status?: number } };
+      if (error.response?.status === 404) {
+        setPublicationSettingsError("Esse recurso ainda não está disponível no servidor atual. A automação foi implementada localmente, mas ainda precisa ser publicada na API principal.");
+      } else {
+        setPublicationSettingsError(extractApiErrorMessage(err, "Não foi possível carregar a automação de publicações."));
+      }
+    } finally {
+      setIsLoadingPublicationSettings(false);
+    }
+  };
+
   useEffect(() => {
     void loadCalendarConnections();
+  }, []);
+
+  useEffect(() => {
+    void loadPublicationAutomation();
   }, []);
 
   useEffect(() => {
@@ -6784,12 +7661,77 @@ function Settings({
     }
   };
 
+  const handleSavePublicationSettings = async () => {
+    setSavingPublicationSettings(true);
+    setPublicationSettingsError("");
+    try {
+      const data = await apiUpdatePublicationAutomationSettings({
+        is_enabled: publicationForm.is_enabled,
+        schedule_time: publicationForm.schedule_time
+      });
+      setPublicationSettings(data);
+      setPublicationForm({
+        is_enabled: data.is_enabled,
+        schedule_time: data.schedule_time
+      });
+      setPublicationInlineMessage(data.is_enabled ? "Download automático atualizado." : "Download automático desativado.");
+    } catch (err) {
+      const error = err as { response?: { status?: number } };
+      if (error.response?.status === 404) {
+        setPublicationSettingsError("Esse recurso ainda não está disponível no servidor atual. A API principal ainda não recebeu a atualização de publicações automáticas.");
+      } else {
+        setPublicationSettingsError(extractApiErrorMessage(err, "Não foi possível salvar a automação de publicações."));
+      }
+    } finally {
+      setSavingPublicationSettings(false);
+    }
+  };
+
+  const handleRunPublicationSync = async () => {
+    setRunningPublicationSync(true);
+    setPublicationSettingsError("");
+    try {
+      const result = await apiRunPublicationAutomationNow();
+      setPublicationSettings(result.config);
+      setPublicationForm({
+        is_enabled: result.config.is_enabled,
+        schedule_time: result.config.schedule_time
+      });
+      setPublicationInlineMessage(result.message);
+    } catch (err) {
+      const error = err as { response?: { status?: number } };
+      if (error.response?.status === 404) {
+        setPublicationSettingsError("Esse recurso ainda não está disponível no servidor atual. A API principal ainda não recebeu a atualização de publicações automáticas.");
+      } else {
+        setPublicationSettingsError(extractApiErrorMessage(err, "Não foi possível executar a busca automática de publicações."));
+      }
+    } finally {
+      setRunningPublicationSync(false);
+    }
+  };
+
   const calendarConnectionMap = useMemo(() => {
     return calendarConnections.reduce<Record<string, CalendarConnectionStatus>>((acc, connection) => {
       acc[connection.provider] = connection;
       return acc;
     }, {});
   }, [calendarConnections]);
+  const publicationStatusTone =
+    publicationSettings?.last_status === "error"
+      ? "error"
+      : publicationSettings?.last_status === "warning"
+        ? "warning"
+        : publicationSettings?.last_status === "success"
+          ? "success"
+          : "";
+  const publicationRecentRecords = publicationSettings?.recent_records ?? [];
+  const getPublicationMatchLabel = (matchedVia?: string | null) => {
+    if (matchedVia === "case_number") return "match por processo";
+    if (matchedVia === "client_name") return "match por cliente";
+    return "match automático";
+  };
+  const publicationFeatureUnavailable = !publicationSettings && publicationSettingsError.toLowerCase().includes("não está disponível");
+  const isPublicationBusy = isLoadingPublicationSettings || savingPublicationSettings || runningPublicationSync || Boolean(publicationSettings?.is_running);
 
   const handleCheckForUpdates = async () => {
     if (!runningInTauri) return;
@@ -6875,11 +7817,112 @@ function Settings({
         <div>
           <div className="eyebrow">Configurações</div>
           <h1 className="page-title">Preferências do sistema</h1>
-          <div className="page-subtitle">Aparência, atualizações e ajustes gerais do NEWLAW.</div>
+          <div className="page-subtitle">Perfil, aparência, atualizações e ajustes gerais do NEWLAW.</div>
         </div>
         <div className="pill">Painel</div>
       </div>
       <div className="settings-grid">
+        <div className="settings-card settings-profile-card">
+          <div className="settings-row">
+            <div>
+              <div className="settings-title">Perfil</div>
+              <div className="settings-sub">
+                Personalize foto e informações complementares. Os dados já cadastrados na conta principal ficam bloqueados.
+              </div>
+            </div>
+            <div className="pill">Conta master</div>
+          </div>
+          {profileError && <div className="error">{profileError}</div>}
+          {profileInlineMessage && <div className="agenda-inline">{profileInlineMessage}</div>}
+          <div className="settings-profile-layout">
+            <div className="settings-profile-preview">
+              <ProfileAvatar avatarDataUrl={profileForm.avatarDataUrl} label={MASTER_OFFICE_NAME} size="settings" />
+              <div className="settings-profile-preview-copy">
+                <strong>{MASTER_OFFICE_NAME}</strong>
+                <span>{profileForm.displayName.trim() || user?.name || "Responsável da conta"}</span>
+                <small>{profileForm.roleLabel.trim() || "Login master"}</small>
+              </div>
+              <input
+                ref={profilePhotoInputRef}
+                className="settings-profile-file"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={handleProfilePhotoChange}
+              />
+              <div className="settings-profile-photo-actions">
+                <button className="btn small" type="button" onClick={() => profilePhotoInputRef.current?.click()}>
+                  Escolher foto
+                </button>
+                <button className="btn ghost small" type="button" onClick={handleRemoveProfilePhoto} disabled={!profileForm.avatarDataUrl}>
+                  Remover foto
+                </button>
+              </div>
+              <div className="field-hint">JPG, PNG ou WEBP com até 2 MB. A foto aparece no topo depois de salvar.</div>
+            </div>
+            <div className="settings-profile-form">
+              <div className="settings-profile-form-grid">
+                <div className="field">
+                  <label>Nome exibido</label>
+                  <input
+                    value={profileForm.displayName}
+                    onChange={handleProfileFieldChange("displayName")}
+                    placeholder="Responsável da conta"
+                    maxLength={60}
+                  />
+                </div>
+                <div className="field">
+                  <label>Cargo / função</label>
+                  <input
+                    value={profileForm.roleLabel}
+                    onChange={handleProfileFieldChange("roleLabel")}
+                    placeholder="Login master"
+                    maxLength={50}
+                  />
+                </div>
+                <div className="field">
+                  <label>Telefone para contato</label>
+                  <input
+                    value={profileForm.phone}
+                    onChange={handleProfileFieldChange("phone")}
+                    placeholder="(00) 00000-0000"
+                    maxLength={32}
+                  />
+                </div>
+                <div className="field span-2">
+                  <label>Sobre o perfil</label>
+                  <textarea
+                    value={profileForm.bio}
+                    onChange={handleProfileFieldChange("bio")}
+                    placeholder="Informações rápidas para identificar quem está usando a conta master."
+                    maxLength={220}
+                  />
+                </div>
+              </div>
+              <div className="settings-profile-locked">
+                <div className="settings-profile-locked-item">
+                  <span>Escritório vinculado</span>
+                  <strong>{MASTER_OFFICE_NAME}</strong>
+                </div>
+                <div className="settings-profile-locked-item">
+                  <span>E-mail de acesso</span>
+                  <strong>{user?.email || "usuario@newlaw.app.br"}</strong>
+                </div>
+                <div className="settings-profile-locked-item">
+                  <span>Nível de acesso</span>
+                  <strong>Login master</strong>
+                </div>
+              </div>
+              <div className="settings-profile-actions">
+                <button className="btn small" type="button" onClick={handleSaveProfile}>
+                  Salvar perfil
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="settings-note">
+            Esta área edita apenas preferências visuais e dados complementares do perfil. Cadastro principal e permissões continuam somente leitura.
+          </div>
+        </div>
         <div className="settings-card">
           <div className="settings-row">
             <div>
@@ -7022,6 +8065,108 @@ function Settings({
             As integrações são somente leitura. Criação e edição de reuniões continuam no Google/Outlook.
           </div>
         </div>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div>
+              <div className="settings-title">Publicações automáticas</div>
+              <div className="settings-sub">
+                Consulta o DJEN por OAB ativa da equipe, vincula pelo processo cadastrado e salva a certidão em <strong>Arquivos &gt; Publicações</strong>.
+              </div>
+            </div>
+            <button
+              className="btn ghost small"
+              type="button"
+              onClick={loadPublicationAutomation}
+              disabled={isPublicationBusy}
+            >
+              {isLoadingPublicationSettings ? "Atualizando..." : "Atualizar"}
+            </button>
+          </div>
+          {publicationSettingsError && <div className="error">{publicationSettingsError}</div>}
+          {publicationInlineMessage && <div className="agenda-inline">{publicationInlineMessage}</div>}
+          <div className="settings-publications-grid">
+            <label className="settings-checkbox settings-publications-span">
+              <input
+                type="checkbox"
+                checked={publicationForm.is_enabled}
+                onChange={(event) =>
+                  setPublicationForm((prev) => ({
+                    ...prev,
+                    is_enabled: event.target.checked
+                  }))
+                }
+                disabled={isPublicationBusy || publicationFeatureUnavailable}
+              />
+              <span>Ativar download automático diário</span>
+            </label>
+            <div className="field settings-field">
+              <label>Horário diário</label>
+              <input
+                type="time"
+                value={publicationForm.schedule_time}
+                onChange={(event) =>
+                  setPublicationForm((prev) => ({
+                    ...prev,
+                    schedule_time: event.target.value
+                  }))
+                }
+                disabled={isPublicationBusy || publicationFeatureUnavailable}
+              />
+            </div>
+            <div className="settings-publications-actions">
+              <button className="btn small" type="button" onClick={handleSavePublicationSettings} disabled={isPublicationBusy || publicationFeatureUnavailable}>
+                {savingPublicationSettings ? "Salvando..." : "Salvar automação"}
+              </button>
+              <button className="btn ghost small" type="button" onClick={handleRunPublicationSync} disabled={isPublicationBusy || publicationFeatureUnavailable}>
+                {runningPublicationSync || publicationSettings?.is_running ? "Baixando..." : "Baixar agora"}
+              </button>
+            </div>
+          </div>
+          <div className="settings-publications-meta">
+            <div className="settings-publications-meta-item">
+              <span>Última execução</span>
+              <strong>{publicationSettings?.last_run_at ? formatDateTimePtBr(publicationSettings.last_run_at) : "Ainda não executado"}</strong>
+            </div>
+            <div className="settings-publications-meta-item">
+              <span>Próxima execução</span>
+              <strong>{publicationSettings?.next_run_at ? formatDateTimePtBr(publicationSettings.next_run_at) : "--"}</strong>
+            </div>
+            <div className="settings-publications-meta-item">
+              <span>Último resultado</span>
+              <strong>
+                {publicationSettings
+                  ? `${publicationSettings.last_new_records} novas · ${publicationSettings.last_existing_records} repetidas`
+                  : "--"}
+              </strong>
+            </div>
+          </div>
+          <div className={`settings-publications-status ${publicationStatusTone}`}>
+            {publicationSettings?.last_message || "Configure o horário e clique em Baixar agora para iniciar a primeira varredura."}
+          </div>
+          <div className="settings-publications-list">
+            <div className="settings-publications-list-title">Últimas publicações baixadas</div>
+            {publicationRecentRecords.length === 0 ? (
+              <div className="settings-publications-empty">Nenhuma publicação automática baixada ainda.</div>
+            ) : (
+              publicationRecentRecords.map((record: PublicationAutomationRecord) => (
+                <div key={record.id} className="settings-publications-record">
+                  <div>
+                    <div className="settings-publications-record-title">{record.title}</div>
+                    <div className="settings-publications-record-meta">
+                      {record.case_number ? `Processo ${record.case_number}` : record.client_name || "Cliente vinculado"}
+                      {" · "}
+                      {getPublicationMatchLabel(record.matched_via)}
+                    </div>
+                  </div>
+                  <div className="settings-publications-record-date">{formatDateTimePtBr(record.created_at)}</div>
+                </div>
+              ))
+            )}
+          </div>
+          <div className="settings-note">
+            A rotina usa as OABs ativas da equipe no horário configurado. Se o app abrir depois desse horário, a execução pendente é recuperada automaticamente.
+          </div>
+        </div>
         <div className="settings-card update-card">
           <div className="settings-title">Central de Atualizações NEWLAW</div>
           <div className="update-shell">
@@ -7062,6 +8207,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
+  const [profilePreferences, setProfilePreferences] = useState<UserProfilePreferences>(() => loadStoredProfilePreferences(null));
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
@@ -7098,6 +8244,10 @@ function App() {
   }, [textScale, textScaleIndex]);
 
   useEffect(() => {
+    setProfilePreferences((current) => normalizeProfilePreferences(current, user));
+  }, [user]);
+
+  useEffect(() => {
     if (!usesLocalDesktopApi) return;
     let cancelled = false;
     const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -7132,6 +8282,8 @@ function App() {
     user && (user.role === "superadmin" || user.role === "owner" || user.role === "admin" || user.is_admin)
   );
   const activeNav = visibleNavItems.some((item) => item.key === active) ? active : (visibleNavItems[0]?.key ?? "settings");
+  const sidebarDisplayName = profilePreferences.displayName || user?.name || "Responsável da conta";
+  const sidebarRoleLabel = profilePreferences.roleLabel || "Login master";
 
   useEffect(() => {
     if (!token) return;
@@ -7209,6 +8361,15 @@ function App() {
     }
   };
 
+  const handleSaveProfile = (value: UserProfilePreferences) => {
+    const normalized = normalizeProfilePreferences(value, user);
+    setProfilePreferences(normalized);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(normalized));
+    }
+    return normalized;
+  };
+
   if (!token) {
     return (
       <div className="login-shell">
@@ -7255,7 +8416,7 @@ function App() {
       case "team":
         return <Team canManage={canManageTeamAndWallets} />;
       case "official":
-        return <Publications />;
+        return <Publications user={user} />;
       case "settings":
         return (
           <Settings
@@ -7264,6 +8425,9 @@ function App() {
             textScaleIndex={textScaleIndex}
             onTextScaleChange={setTextScaleIndex}
             onLogout={handleLogout}
+            user={user}
+            profile={profilePreferences}
+            onSaveProfile={handleSaveProfile}
           />
         );
       case "finance":
@@ -7288,9 +8452,12 @@ function App() {
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top">
-          <div className="brand">
-            <span className="brand-full">Arnaud{"\n"}Advocacia</span>
-            <span className="brand-short">NL</span>
+          <div className="sidebar-account">
+            <ProfileAvatar avatarDataUrl={profilePreferences.avatarDataUrl} label={MASTER_OFFICE_NAME} size="sidebar" />
+            <div className="brand">
+              <span className="brand-full">{MASTER_OFFICE_NAME}</span>
+              <span className="brand-meta">{sidebarRoleLabel}</span>
+            </div>
           </div>
           <button
             type="button"
@@ -7320,7 +8487,7 @@ function App() {
         </div>
         <div className="sidebar-footer">
           <div className="sidebar-user">
-            {canManageTeamAndWallets ? "Administrador" : "Membro"}
+            {sidebarDisplayName}
             <br />
             {user?.email || "usuario@newlaw.app.br"}
           </div>

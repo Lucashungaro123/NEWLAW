@@ -7,6 +7,7 @@ const USER_KEY = "newlaw.user";
 
 export const LOCAL_API_BASE_URL = "http://127.0.0.1:8000";
 const configuredBaseURL = import.meta.env.VITE_API_URL;
+const runningInTauri = isTauri();
 const defaultBaseURL = import.meta.env.DEV ? LOCAL_API_BASE_URL : "https://api.newlaw.app.br";
 export const baseURL = configuredBaseURL || defaultBaseURL;
 
@@ -134,6 +135,7 @@ export type CalendarConnectionStart = {
   expires_in_seconds: number;
 };
 export type AgendaItemKind = "deadline" | "meeting";
+export type InternalAgendaEventType = "deadline" | "meeting" | "hearing" | "audit";
 export type AgendaItem = {
   id: string;
   entity_id: number;
@@ -148,12 +150,20 @@ export type AgendaItem = {
   reference?: string | null;
   description?: string | null;
   status?: string | null;
+  event_type?: InternalAgendaEventType | null;
+  assignee_name?: string | null;
+  assignees?: string | null;
 };
 export type CreateAgendaDeadlinePayload = {
   title: string;
   due_date: string;
   reference?: string;
   notes?: string;
+  event_type?: InternalAgendaEventType;
+  meeting_url?: string;
+  assignees?: string;
+  end_time?: string;
+  is_all_day?: boolean;
 };
 export type FinanceEntryType = "receita" | "despesa";
 export type FinancePaymentMethod = "" | "pix" | "boleto" | "cartao" | "dinheiro" | "transferencia";
@@ -189,6 +199,69 @@ export type ApiClientDocument = {
   size_bytes: number;
   created_at: string;
   updated_at: string;
+};
+export type PublicationAutomationRecord = {
+  id: number;
+  title: string;
+  publication_date: string;
+  client_name?: string | null;
+  case_number?: string | null;
+  matched_via?: "document" | "case_number" | null;
+  created_at: string;
+};
+export type TodayPublicationItem = {
+  id: number;
+  hash: string;
+  title: string;
+  publication_date: string;
+  tribunal?: string | null;
+  court_name?: string | null;
+  process_number?: string | null;
+  communication_type?: string | null;
+  detail_url: string;
+  summary?: string | null;
+};
+export type TodayPublicationsResponse = {
+  member_name: string;
+  member_email: string;
+  oab: string;
+  publication_date: string;
+  count: number;
+  items: TodayPublicationItem[];
+};
+export type PublicationSearchByOabPayload = {
+  oab_number: string;
+  oab_uf: string;
+  member_name: string;
+  member_email: string;
+  publication_date: string;
+};
+export type PublicationAutomationSettings = {
+  organization_id: number;
+  is_enabled: boolean;
+  schedule_time: string;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_status?: "success" | "warning" | "error" | null;
+  last_message?: string | null;
+  last_new_records: number;
+  last_existing_records: number;
+  last_failed_records: number;
+  is_running: boolean;
+  recent_records: PublicationAutomationRecord[];
+};
+export type UpdatePublicationAutomationPayload = {
+  is_enabled: boolean;
+  schedule_time: string;
+};
+export type RunPublicationAutomationResponse = {
+  started_at: string;
+  finished_at: string;
+  new_records: number;
+  existing_records: number;
+  failed_records: number;
+  message: string;
+  config: PublicationAutomationSettings;
 };
 export type CreateFinanceEntryPayload = {
   entry_type: FinanceEntryType;
@@ -276,6 +349,11 @@ export function getRefreshToken() {
 
 export const api = axios.create({
   baseURL,
+  timeout: 10000
+});
+
+const desktopApi = axios.create({
+  baseURL: LOCAL_API_BASE_URL,
   timeout: 10000
 });
 
@@ -633,4 +711,36 @@ export async function downloadClientDocument(documentId: number) {
     responseType: "blob"
   });
   return data as Blob;
+}
+
+export async function getPublicationAutomationSettings() {
+  const { data } = await api.get("/publications/automation");
+  return data as PublicationAutomationSettings;
+}
+
+export async function getTodayPublications(publicationDate?: string) {
+  const { data } = await api.get("/publications/today", {
+    params: publicationDate ? { publication_date: publicationDate } : undefined,
+    timeout: 120000
+  });
+  return data as TodayPublicationsResponse;
+}
+
+export async function searchPublicationsByOabLocally(payload: PublicationSearchByOabPayload) {
+  const { data } = await desktopApi.post("/publications/search-by-oab", payload, {
+    timeout: 120000
+  });
+  return data as TodayPublicationsResponse;
+}
+
+export async function updatePublicationAutomationSettings(payload: UpdatePublicationAutomationPayload) {
+  const { data } = await api.put("/publications/automation", payload);
+  return data as PublicationAutomationSettings;
+}
+
+export async function runPublicationAutomationNow() {
+  const { data } = await api.post("/publications/automation/run", undefined, {
+    timeout: 120000
+  });
+  return data as RunPublicationAutomationResponse;
 }
