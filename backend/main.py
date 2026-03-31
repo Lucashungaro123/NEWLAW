@@ -4369,6 +4369,64 @@ def update_team_member(
     return serialize_team_member(member, invite_email_sent=invite_email_sent, invite_token=invite_token)
 
 
+@app.post("/team-members/{member_id}/password-reset")
+def reset_team_member_password(
+    member_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict:
+    ensure_can_manage_team_and_wallets(user)
+    member = session.get(TeamMember, member_id)
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Membro não encontrado")
+    current_scope = resolve_existing_record_scope(user, session, member.organization_id)
+    if current_scope is not None and member.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este membro")
+    if not member.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reative o membro antes de refazer a senha")
+
+    organization = session.get(Organization, member.organization_id) if member.organization_id is not None else None
+    if not organization or not organization.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organização inválida")
+
+    linked_user, invite_token = sync_user_from_team_member(
+        session,
+        organization,
+        old_member_email=member.email,
+        full_name=member.full_name,
+        email=member.email,
+        phone=member.phone,
+        is_admin=bool(member.is_team_admin),
+        allowed_nav_keys=normalize_nav_keys(parse_nav_keys(member.allowed_nav_keys), is_admin=bool(member.is_team_admin)),
+        is_active=True,
+        force_invite=True,
+    )
+    if not invite_token:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Não foi possível gerar um novo link de senha")
+
+    linked_user.failed_login_count = 0
+    linked_user.locked_until = None
+    linked_user.updated_at = datetime.utcnow()
+    session.add(linked_user)
+    session.commit()
+
+    if linked_user.id is not None:
+        revoke_refresh_tokens(session, linked_user.id)
+
+    invite_email_sent = send_member_invite_email(member.email, member.full_name, organization.name, invite_token)
+    response = {
+        "status": "ok",
+        "id": member_id,
+        "email": member.email,
+        "invite_email_sent": invite_email_sent,
+    }
+    if invite_token and DEV_RETURN_INVITE_TOKEN:
+        response["invite_token"] = invite_token
+    if invite_token and (DEV_RETURN_INVITE_TOKEN or not invite_email_sent):
+        response["invite_link"] = build_invite_link(invite_token)
+    return response
+
+
 @app.delete("/team-members/{member_id}")
 def delete_team_member(
     member_id: int,
@@ -4383,17 +4441,23 @@ def delete_team_member(
     if current_scope is not None and member.organization_id != current_scope:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este membro")
     linked_user = get_user_by_email(session, member.email)
-    if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "member":
+    if linked_user and linked_user.id is not None and linked_user.organization_id == member.organization_id and linked_user.role == "member":
         linked_user.is_active = False
         linked_user.updated_at = datetime.utcnow()
         session.add(linked_user)
+        active_tokens = session.exec(
+            select(RefreshToken).where(RefreshToken.user_id == linked_user.id, RefreshToken.revoked_at == None)  # noqa: E712
+        ).all()
+        if active_tokens:
+            revoked_at = datetime.utcnow()
+            for token in active_tokens:
+                token.revoked_at = revoked_at
+            session.add_all(active_tokens)
     access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.team_member_id == member.id)).all()
     for row in access_rows:
         session.delete(row)
     session.delete(member)
     session.commit()
-    if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "member" and linked_user.id is not None:
-        revoke_refresh_tokens(session, linked_user.id)
     return {"status": "ok", "id": member_id}
 
 

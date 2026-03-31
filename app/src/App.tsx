@@ -60,6 +60,7 @@ import {
   login as apiLogin,
   logout as apiLogout,
   ping,
+  resetTeamMemberPassword as apiResetTeamMemberPassword,
   runPublicationAutomationNow as apiRunPublicationAutomationNow,
   saveAuthSession,
   updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
@@ -161,7 +162,7 @@ const navPermissionOptions = navItems.map((item) => ({ key: item.key, label: ite
 const defaultMemberNavKeys = navPermissionOptions.map((item) => item.key);
 const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
 const MASTER_OFFICE_NAME = "NEWLAW";
-const PROFILE_STORAGE_KEY = "newlaw-profile-preferences";
+const PROFILE_STORAGE_KEY_PREFIX = "newlaw-profile-preferences";
 const profilePhotoMaxSizeBytes = 2 * 1024 * 1024;
 
 type UserProfilePreferences = {
@@ -197,10 +198,17 @@ const normalizeProfilePreferences = (
   };
 };
 
+const getProfileStorageKey = (user: AuthUser | null) => {
+  const identity = user?.id != null ? String(user.id) : user?.email?.trim().toLowerCase();
+  return identity ? `${PROFILE_STORAGE_KEY_PREFIX}:${identity}` : "";
+};
+
 const loadStoredProfilePreferences = (user: AuthUser | null): UserProfilePreferences => {
   if (typeof window === "undefined") return buildDefaultProfilePreferences(user);
+  const storageKey = getProfileStorageKey(user);
+  if (!storageKey) return buildDefaultProfilePreferences(user);
   try {
-    const raw = window.localStorage.getItem(PROFILE_STORAGE_KEY);
+    const raw = window.localStorage.getItem(storageKey);
     if (!raw) return buildDefaultProfilePreferences(user);
     return normalizeProfilePreferences(JSON.parse(raw) as Partial<UserProfilePreferences>, user);
   } catch {
@@ -1812,7 +1820,6 @@ function ConfirmDeleteModal({
           </button>
         </div>
         <div className="modal-note">{message}</div>
-        <div className="modal-note">Essa ação não poderá ser desfeita.</div>
         {errorMessage && <div className="error">{errorMessage}</div>}
         <div className="modal-actions">
           <button className="btn ghost" type="button" onClick={onCancel} disabled={busy}>
@@ -2339,6 +2346,1151 @@ function People() {
         }}
         cepError={editCepError}
       />
+    </div>
+  );
+}
+
+type JurisprudenceAreaId = "consumer" | "civil_bank" | "labor" | "family" | "health";
+
+type JurisprudenceIntakeForm = {
+  area: JurisprudenceAreaId | "";
+  claimType: string;
+  objective: string;
+  narrative: string;
+  opposingParty: string;
+  jurisdiction: string;
+  factPeriod: string;
+  valueRange: string;
+  evidenceStrength: string;
+  evidenceSummary: string;
+  proceduralStage: string;
+  hasDocuments: boolean;
+  hasMessages: boolean;
+  hasWitnesses: boolean;
+  hasAdministrativeAttempt: boolean;
+  needsExpertEvidence: boolean;
+};
+
+type JurisprudenceSimilarCase = {
+  number: string;
+  outcome: "Deferido" | "Parcialmente deferido" | "Indeferido";
+  tone: "granted" | "partial" | "denied";
+  counterparty: string;
+  decidedAt: string;
+  court: string;
+  organ: string;
+  summary: string;
+  highlight: string;
+  reason: string;
+};
+
+type JurisprudenceOutcomeTone = JurisprudenceSimilarCase["tone"];
+type JurisprudenceSamplesTab = "summary" | JurisprudenceOutcomeTone;
+
+const jurisprudenceAreaOptions = [
+  {
+    value: "consumer",
+    label: "Consumidor",
+    description: "Cobrança indevida, negativação, falha de serviço, cancelamento e vício do produto.",
+    claimSuggestions: ["Cobrança indevida", "Negativação indevida", "Falha na prestação de serviço", "Rescisão contratual"],
+    reading:
+      "Em consumo, os julgados parecidos normalmente giram em torno da falha comprovada, da reação do fornecedor e da extensão concreta do prejuízo.",
+    proofFocus: "Contratos, faturas, extratos, protocolos e histórico de atendimento costumam definir o eixo da comparação.",
+    sensitivePoint:
+      "Dano moral tende a oscilar quando o constrangimento é narrado sem cronologia, sem prova da insistência da cobrança ou sem negativação formal.",
+    officeBridge: "falha de serviço, documentação da cobrança, persistência do problema e resposta da empresa",
+    searchSeeds: ["falha na prestação do serviço", "inversão do ônus da prova", "dano moral por cobrança"],
+    nextStep: "separar contrato, comprovantes, extratos e protocolos em ordem cronológica"
+  },
+  {
+    value: "civil_bank",
+    label: "Cível bancário",
+    description: "Fraude, revisão contratual, descontos indevidos, empréstimos e dever de informação.",
+    claimSuggestions: ["Desconto indevido", "Fraude bancária", "Revisão contratual", "Juros abusivos"],
+    reading:
+      "Em litígios bancários, a jurisprudência costuma separar com nitidez o que é fraude, o que é inadimplemento contratual e o que é dever de informação insuficiente.",
+    proofFocus: "Extratos, contrato, comprovantes de autorização, logs de transação e registros de atendimento costumam ser decisivos.",
+    sensitivePoint:
+      "Sem documento financeiro claro, casos bancários tendem a se dispersar entre responsabilidade objetiva, culpa de terceiro e necessidade de perícia.",
+    officeBridge: "autorização da operação, cadeia documental do contrato e nexo entre o débito e a instituição financeira",
+    searchSeeds: ["desconto indevido em conta", "responsabilidade por fraude bancária", "revisão de contrato bancário"],
+    nextStep: "delimitar a operação específica, a data do débito e o documento que demonstra a irregularidade"
+  },
+  {
+    value: "labor",
+    label: "Trabalhista",
+    description: "Horas extras, verbas rescisórias, vínculo, assédio, adicionais e jornada.",
+    claimSuggestions: ["Horas extras", "Reconhecimento de vínculo", "Verbas rescisórias", "Assédio moral"],
+    reading:
+      "Em matéria trabalhista, julgados próximos costumam diferenciar o que está bem documentado do que depende fortemente de prova oral sobre a rotina real de trabalho.",
+    proofFocus: "Cartões de ponto, recibos, holerites, mensagens, escalas e testemunhas costumam empurrar a leitura jurisprudencial.",
+    sensitivePoint:
+      "Quando a narrativa não explica jornada, subordinação ou função efetiva, a comparação com precedentes trabalhistas perde precisão rapidamente.",
+    officeBridge: "rotina concreta de trabalho, documentos da relação empregatícia e coerência entre prova documental e oral",
+    searchSeeds: ["horas extras habitualidade", "reconhecimento de vínculo", "prova da jornada de trabalho"],
+    nextStep: "amarrar função, jornada, chefia imediata e período exato da prestação de serviços"
+  },
+  {
+    value: "family",
+    label: "Família",
+    description: "Alimentos, guarda, convivência, partilha e medidas de proteção.",
+    claimSuggestions: ["Fixação de alimentos", "Revisão de alimentos", "Guarda", "Regulamentação de convivência"],
+    reading:
+      "Em família, o comportamento da jurisprudência costuma ser mais casuístico e centrado em contexto fático, renda demonstrada e melhor interesse do núcleo familiar.",
+    proofFocus: "Comprovantes de renda, despesas da criança, rotina familiar, mensagens e histórico de cuidado costumam orientar o recorte.",
+    sensitivePoint:
+      "Sem dados objetivos de renda, despesas ou dinâmica familiar, a leitura se torna aberta demais e a comparação com precedentes fica superficial.",
+    officeBridge: "capacidade financeira, necessidade concreta e impacto prático da medida sobre a rotina familiar",
+    searchSeeds: ["binômio necessidade possibilidade", "melhor interesse da criança", "revisão de alimentos"],
+    nextStep: "quantificar renda, despesas e o impacto cotidiano da medida buscada"
+  },
+  {
+    value: "health",
+    label: "Saúde",
+    description: "Plano de saúde, negativa de cobertura, urgência médica e fornecimento de tratamento.",
+    claimSuggestions: ["Negativa de cobertura", "Home care", "Medicamento de alto custo", "Cirurgia urgente"],
+    reading:
+      "Em saúde, decisões parecidas normalmente valorizam urgência, prescrição médica, negativa formal do plano ou do ente público e risco concreto ao paciente.",
+    proofFocus: "Relatório médico, prescrição, negativa formal, exames e indicação terapêutica tendem a puxar a leitura do caso.",
+    sensitivePoint:
+      "Sem prescrição ou justificativa clínica robusta, a discussão costuma deslocar o foco para prova técnica e excepcionalidade do tratamento.",
+    officeBridge: "urgência clínica, negativa formal e documentação médica que sustenta necessidade, adequação e risco",
+    searchSeeds: ["negativa de cobertura plano de saúde", "fornecimento de medicamento", "urgência médica e tutela"],
+    nextStep: "separar a prescrição atual, a negativa formal e os documentos clínicos que indiquem urgência"
+  }
+] as const;
+
+const jurisprudenceJurisdictionOptions = [
+  { value: "tjsp", label: "TJSP" },
+  { value: "tjrj", label: "TJRJ" },
+  { value: "tjmg", label: "TJMG" },
+  { value: "tjrs", label: "TJRS" },
+  { value: "tjpr", label: "TJPR" },
+  { value: "trt2", label: "TRT 2" },
+  { value: "trt15", label: "TRT 15" },
+  { value: "trf3", label: "TRF 3" },
+  { value: "stj", label: "STJ" },
+  { value: "local", label: "Outro recorte estadual/federal" }
+] as const;
+
+const jurisprudenceValueRangeOptions = [
+  { value: "up-to-10k", label: "Até R$ 10 mil" },
+  { value: "10k-50k", label: "R$ 10 mil a R$ 50 mil" },
+  { value: "50k-200k", label: "R$ 50 mil a R$ 200 mil" },
+  { value: "200k-plus", label: "Acima de R$ 200 mil" },
+  { value: "not-defined", label: "Ainda sem faixa econômica definida" }
+] as const;
+
+const jurisprudenceEvidenceStrengthOptions = [
+  { value: "low", label: "Base inicial" },
+  { value: "medium", label: "Base intermediária" },
+  { value: "high", label: "Base robusta" }
+] as const;
+
+const jurisprudenceStageOptions = [
+  { value: "pre-litigation", label: "Antes da ação" },
+  { value: "initial-petition", label: "Montando a inicial" },
+  { value: "defense", label: "Após contestação" },
+  { value: "evidence-phase", label: "Fase de prova / instrução" },
+  { value: "appeal", label: "Recurso / revisão estratégica" }
+] as const;
+
+const jurisprudenceStopwords = new Set([
+  "a",
+  "ao",
+  "aos",
+  "as",
+  "com",
+  "como",
+  "contra",
+  "da",
+  "das",
+  "de",
+  "do",
+  "dos",
+  "e",
+  "ela",
+  "ele",
+  "em",
+  "entre",
+  "era",
+  "essa",
+  "esse",
+  "esta",
+  "este",
+  "foi",
+  "foram",
+  "mais",
+  "mas",
+  "na",
+  "nas",
+  "no",
+  "nos",
+  "o",
+  "os",
+  "ou",
+  "para",
+  "pela",
+  "pelas",
+  "pelo",
+  "pelos",
+  "por",
+  "qual",
+  "quando",
+  "que",
+  "se",
+  "sem",
+  "ser",
+  "sobre",
+  "sua",
+  "suas",
+  "seu",
+  "seus",
+  "uma",
+  "umas",
+  "um",
+  "uns"
+]);
+
+const buildEmptyJurisprudenceForm = (): JurisprudenceIntakeForm => ({
+  area: "",
+  claimType: "",
+  objective: "",
+  narrative: "",
+  opposingParty: "",
+  jurisdiction: "",
+  factPeriod: "",
+  valueRange: "",
+  evidenceStrength: "",
+  evidenceSummary: "",
+  proceduralStage: "",
+  hasDocuments: false,
+  hasMessages: false,
+  hasWitnesses: false,
+  hasAdministrativeAttempt: false,
+  needsExpertEvidence: false
+});
+
+const getJurisprudenceAreaConfig = (area: JurisprudenceAreaId | "") =>
+  jurisprudenceAreaOptions.find((option) => option.value === area) ?? null;
+
+const getOptionLabel = (options: ReadonlyArray<{ value: string; label: string }>, value: string) =>
+  options.find((option) => option.value === value)?.label ?? "";
+
+const extractJurisprudenceKeywords = (value: string) => {
+  const normalized = value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const tokens = normalized
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 5 && !jurisprudenceStopwords.has(token));
+  return Array.from(new Set(tokens)).slice(0, 4);
+};
+
+const jurisprudenceCourtCodeMap: Record<string, string> = {
+  tjsp: "8.26.0100",
+  tjrj: "8.19.0001",
+  tjmg: "8.13.0024",
+  tjrs: "8.21.7000",
+  tjpr: "8.16.0001",
+  trt2: "5.02.0001",
+  trt15: "5.15.0001",
+  trf3: "4.03.6100",
+  stj: "3.00.0000",
+  local: "8.00.0001"
+};
+
+const jurisprudenceOrganMap: Record<JurisprudenceAreaId, string[]> = {
+  consumer: ["21ª Câmara de Direito Privado", "18ª Câmara de Direito Privado", "34ª Câmara de Direito Privado"],
+  civil_bank: ["19ª Câmara de Direito Privado", "24ª Câmara de Direito Privado", "13ª Câmara de Direito Privado"],
+  labor: ["8ª Turma", "11ª Turma", "4ª Turma"],
+  family: ["8ª Câmara de Direito Privado", "10ª Câmara de Direito Privado", "2ª Câmara de Direito Privado"],
+  health: ["3ª Câmara de Direito Privado", "5ª Câmara de Direito Privado", "9ª Câmara de Direito Privado"]
+};
+
+const jurisprudenceOutcomeLabelMap: Record<JurisprudenceOutcomeTone, string> = {
+  granted: "Deferido",
+  partial: "Parcialmente deferido",
+  denied: "Indeferido"
+};
+
+const jurisprudenceOutcomeTabLabelMap: Record<JurisprudenceSamplesTab, string> = {
+  summary: "Resumo",
+  granted: "Deferidos",
+  partial: "Parciais",
+  denied: "Indeferidos"
+};
+
+const buildJurisprudenceSeed = (value: string) =>
+  Array.from(value).reduce((total, char, index) => total + char.charCodeAt(0) * (index + 1), 0);
+
+const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const buildSyntheticDecisionYear = (form: JurisprudenceIntakeForm, index: number) => {
+  const yearBase = form.proceduralStage === "appeal" ? 2023 : form.proceduralStage === "evidence-phase" ? 2024 : 2025;
+  return Math.max(2022, yearBase - index);
+};
+
+const buildSyntheticJurisprudenceNumber = (form: JurisprudenceIntakeForm, index: number) => {
+  const seed = buildJurisprudenceSeed(
+    [form.area, form.claimType, form.objective, form.opposingParty, form.jurisdiction, String(index)].join("|")
+  );
+  const prefix = String((seed * (index + 9)) % 10000000).padStart(7, "0");
+  const checkDigits = String((seed + index * 17) % 100).padStart(2, "0");
+  const year = String(buildSyntheticDecisionYear(form, index));
+  const courtCode = jurisprudenceCourtCodeMap[form.jurisdiction] ?? jurisprudenceCourtCodeMap.local;
+  return `${prefix}-${checkDigits}.${year}.${courtCode}`;
+};
+
+const sentenceStart = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
+};
+
+const buildSyntheticDecisionDate = (form: JurisprudenceIntakeForm, index: number) => {
+  const seed = buildJurisprudenceSeed([form.factPeriod, form.narrative, form.evidenceSummary, String(index)].join("|"));
+  const day = String(((seed + index * 11) % 27) + 1).padStart(2, "0");
+  const month = String(((seed + index * 5) % 12) + 1).padStart(2, "0");
+  return `${day}/${month}/${buildSyntheticDecisionYear(form, index)}`;
+};
+
+const buildSyntheticOrgan = (form: JurisprudenceIntakeForm, index: number) => {
+  if (!form.area) return "Órgão julgador";
+  const options = jurisprudenceOrganMap[form.area];
+  return options[index % options.length] ?? options[0];
+};
+
+const buildSyntheticPrecedentAggregate = (
+  form: JurisprudenceIntakeForm,
+  proofSignals: string[],
+  completionScore: number
+) => {
+  const seed = buildJurisprudenceSeed(
+    [form.area, form.claimType, form.objective, form.narrative, form.evidenceSummary, form.jurisdiction].join("|")
+  );
+  const total = 84 + (seed % 73);
+  let grantedShare = 0.28;
+  let partialShare = 0.16;
+
+  if (form.evidenceStrength === "high") grantedShare += 0.24;
+  else if (form.evidenceStrength === "medium") grantedShare += 0.12;
+  else grantedShare += 0.03;
+
+  if (form.hasDocuments) grantedShare += 0.08;
+  if (form.hasMessages) grantedShare += 0.04;
+  if (form.hasWitnesses) grantedShare += 0.05;
+  if (form.hasAdministrativeAttempt) grantedShare += 0.03;
+  if (form.needsExpertEvidence) {
+    grantedShare -= 0.08;
+    partialShare += 0.05;
+  }
+  if (form.proceduralStage === "appeal") grantedShare -= 0.03;
+  if (form.valueRange === "200k-plus") grantedShare -= 0.02;
+  if (form.area === "health" && form.hasDocuments) grantedShare += 0.05;
+  if (form.area === "labor" && form.hasWitnesses) grantedShare += 0.04;
+  if (form.area === "family") partialShare += 0.04;
+  if (completionScore >= 90) grantedShare += 0.02;
+  if (proofSignals.length === 0) grantedShare -= 0.06;
+
+  grantedShare = clampNumber(grantedShare, 0.14, 0.78);
+  partialShare = clampNumber(partialShare, 0.1, 0.32);
+  if (grantedShare + partialShare > 0.88) {
+    partialShare = 0.88 - grantedShare;
+  }
+
+  let grantedCount = Math.round(total * grantedShare);
+  let partialCount = Math.round(total * partialShare);
+  let deniedCount = total - grantedCount - partialCount;
+
+  if (deniedCount < 6) {
+    const deficit = 6 - deniedCount;
+    if (partialCount - deficit >= 8) partialCount -= deficit;
+    else grantedCount = Math.max(12, grantedCount - deficit);
+    deniedCount = total - grantedCount - partialCount;
+  }
+
+  const dominantTone: JurisprudenceOutcomeTone =
+    grantedCount >= partialCount && grantedCount >= deniedCount
+      ? "granted"
+      : partialCount >= deniedCount
+        ? "partial"
+        : "denied";
+  const dominantCount =
+    dominantTone === "granted" ? grantedCount : dominantTone === "partial" ? partialCount : deniedCount;
+
+  return {
+    total,
+    grantedCount,
+    partialCount,
+    deniedCount,
+    dominantTone,
+    dominantCount,
+    dominantLabel: jurisprudenceOutcomeLabelMap[dominantTone],
+    dominantShare: Math.round((dominantCount / total) * 100),
+    defermentScore: Math.round((grantedCount / total) * 100)
+  };
+};
+
+const buildSampleCaseProfiles = (
+  tone: JurisprudenceOutcomeTone,
+  claim: string,
+  objective: string,
+  opposingParty: string,
+  proofLead: string,
+  jurisdictionLabel: string
+): Array<Omit<JurisprudenceSimilarCase, "number" | "decidedAt" | "organ">> => {
+  if (tone === "granted") {
+    return [
+      {
+        outcome: "Deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `${sentenceStart(claim)} deferido com acolhimento do pedido de ${objective}.`,
+        highlight: `${jurisdictionLabel} deu peso à sequência documental e à postura insuficiente de ${opposingParty}.`,
+        reason: `Motivo central: prova consistente e nexo claro entre o fato narrado e a conduta da contraparte.`
+      },
+      {
+        outcome: "Deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `Pedido de ${objective} acolhido após reconhecimento de falha relevante de ${opposingParty}.`,
+        highlight: `O precedente aproximou o caso de outros em que o dano apareceu de forma objetiva e cronológica.`,
+        reason: `Motivo central: documentação madura desde o início e impacto prático bem demonstrado.`
+      },
+      {
+        outcome: "Deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `${sentenceStart(claim)} admitido em recorte com forte apoio em ${proofLead}.`,
+        highlight: `O órgão julgador destacou coerência entre narrativa, documento principal e consequência concreta.`,
+        reason: `Motivo central: prejuízo demonstrado e defesa tratada como genérica ou insuficiente.`
+      }
+    ];
+  }
+
+  if (tone === "partial") {
+    return [
+      {
+        outcome: "Parcialmente deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `${sentenceStart(claim)} acolhido em parte, com redução do alcance econômico do pedido.`,
+        highlight: `O tribunal separou o núcleo comprovado das parcelas que ainda dependiam de reforço probatório.`,
+        reason: `Motivo central: procedência limitada ao ponto documentalmente demonstrado.`
+      },
+      {
+        outcome: "Parcialmente deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `Pedido reconhecido só em parte, sem integralidade de ${objective}.`,
+        highlight: `A decisão preservou a tese principal, mas modulou extensão, valores ou reflexos acessórios.`,
+        reason: `Motivo central: prova suficiente para parte do pedido, mas não para todo o efeito pretendido.`
+      },
+      {
+        outcome: "Parcialmente deferido",
+        tone,
+        counterparty: opposingParty,
+        court: jurisdictionLabel,
+        summary: `${sentenceStart(claim)} parcialmente deferido após distinção entre obrigação principal e danos acessórios.`,
+        highlight: `O precedente foi favorável no mérito, porém conservador na parte econômica ou indenizatória.`,
+        reason: `Motivo central: acolhimento do núcleo do direito com restrição nos pedidos acessórios.`
+      }
+    ];
+  }
+
+  return [
+    {
+      outcome: "Indeferido",
+      tone,
+      counterparty: opposingParty,
+      court: jurisdictionLabel,
+      summary: `${sentenceStart(claim)} indeferido por insuficiência de lastro para ${objective}.`,
+      highlight: `O julgamento apontou abertura excessiva entre narrativa e prova disponível.`,
+      reason: `Motivo central: ausência de documento ou elemento técnico decisivo para o pedido principal.`
+    },
+    {
+      outcome: "Indeferido",
+      tone,
+      counterparty: opposingParty,
+      court: jurisdictionLabel,
+      summary: `Pedido rejeitado em caso parecido por falta de nexo claro com a conduta de ${opposingParty}.`,
+      highlight: `O órgão julgador considerou o conjunto probatório insuficiente para responsabilização plena.`,
+      reason: `Motivo central: nexo causal e extensão do dano não ficaram objetivamente comprovados.`
+    },
+    {
+      outcome: "Indeferido",
+      tone,
+      counterparty: opposingParty,
+      court: jurisdictionLabel,
+      summary: `${sentenceStart(claim)} afastado porque o recorte exigia prova mais robusta do que a apresentada.`,
+      highlight: `A corte distinguiu o caso de precedentes favoráveis em razão de fragilidade documental.`,
+      reason: `Motivo central: lacuna probatória relevante para sustentar o pedido integral.`
+    }
+  ];
+};
+
+const buildOutcomeSampleCases = (
+  form: JurisprudenceIntakeForm,
+  areaConfig: (typeof jurisprudenceAreaOptions)[number] | null,
+  proofSignals: string[],
+  jurisdictionLabel: string,
+  tone: JurisprudenceOutcomeTone,
+  count: number
+): JurisprudenceSimilarCase[] => {
+  if (!form.area || !form.claimType.trim() || !form.objective.trim() || count <= 0) return [];
+
+  const claim = form.claimType.trim().toLowerCase();
+  const objective = form.objective.trim().toLowerCase();
+  const proofLead = proofSignals[0]?.toLowerCase() || (areaConfig?.proofFocus.toLowerCase() ?? "base probatória limitada");
+  const opposingParty = form.opposingParty.trim() || "a parte contrária";
+  const profiles = buildSampleCaseProfiles(tone, claim, objective, opposingParty, proofLead, jurisdictionLabel);
+  const limit = Math.min(3, count);
+  const toneOffset = tone === "granted" ? 0 : tone === "partial" ? 10 : 20;
+
+  return Array.from({ length: limit }, (_, index) => {
+    const profile = profiles[index % profiles.length];
+    return {
+      ...profile,
+      number: buildSyntheticJurisprudenceNumber(form, toneOffset + index),
+      decidedAt: buildSyntheticDecisionDate(form, toneOffset + index),
+      organ: buildSyntheticOrgan(form, toneOffset + index)
+    };
+  });
+};
+
+const buildJurisprudenceAnalysis = (form: JurisprudenceIntakeForm) => {
+  const areaConfig = getJurisprudenceAreaConfig(form.area);
+  const proofSignals = [
+    form.hasDocuments ? "Documentos principais já separados" : "",
+    form.hasMessages ? "Mensagens, protocolos ou e-mails" : "",
+    form.hasWitnesses ? "Prova testemunhal mapeada" : "",
+    form.hasAdministrativeAttempt ? "Tentativa administrativa anterior" : "",
+    form.needsExpertEvidence ? "Tema com possível dependência de prova técnica" : ""
+  ].filter(Boolean);
+  const requiredChecks = [
+    { label: "Área do direito definida", done: Boolean(form.area), critical: true, weight: 10 },
+    { label: "Controvérsia principal descrita", done: form.claimType.trim().length >= 6, critical: true, weight: 10 },
+    { label: "Pedido / objetivo informado", done: form.objective.trim().length >= 8, critical: true, weight: 10 },
+    { label: "Narrativa com contexto suficiente", done: form.narrative.trim().length >= 180, critical: true, weight: 18 },
+    { label: "Parte contrária identificada", done: form.opposingParty.trim().length >= 3, critical: true, weight: 8 },
+    { label: "Recorte de tribunal/UF definido", done: Boolean(form.jurisdiction), critical: true, weight: 10 },
+    { label: "Período dos fatos informado", done: form.factPeriod.trim().length >= 5, critical: true, weight: 8 },
+    { label: "Base probatória resumida", done: form.evidenceSummary.trim().length >= 60, critical: true, weight: 14 },
+    { label: "Faixa econômica informada", done: Boolean(form.valueRange), critical: false, weight: 4 },
+    { label: "Tipo de prova sinalizado", done: proofSignals.length > 0, critical: false, weight: 4 },
+    { label: "Maturidade da prova definida", done: Boolean(form.evidenceStrength), critical: false, weight: 4 }
+  ];
+  const completionScore = Math.max(
+    0,
+    Math.min(
+      100,
+      requiredChecks.reduce((total, item) => total + (item.done ? item.weight : 0), 0)
+    )
+  );
+  const criticalGaps = requiredChecks.filter((item) => item.critical && !item.done).map((item) => item.label);
+  const pendingQuestions: string[] = [];
+  if (!form.area) pendingQuestions.push("Qual área do direito concentra o pedido principal do caso?");
+  if (form.claimType.trim().length < 6) pendingQuestions.push("Qual é a controvérsia central em uma linha objetiva?");
+  if (form.objective.trim().length < 8) pendingQuestions.push("O que exatamente o escritório pretende buscar: indenização, obrigação de fazer, revisão, verbas, guarda?");
+  if (form.narrative.trim().length < 180) pendingQuestions.push("Faltam fatos: contexto, sequência dos eventos, reação da parte contrária e impacto prático.");
+  if (!form.jurisdiction) pendingQuestions.push("Qual tribunal, estado ou recorte jurisdicional deve orientar a pesquisa?");
+  if (form.evidenceSummary.trim().length < 60) pendingQuestions.push("Quais documentos, prints, contratos, laudos ou protocolos já existem e o que eles provam?");
+  if (!form.factPeriod.trim()) pendingQuestions.push("Em que período os fatos aconteceram e desde quando o problema persiste?");
+  if (proofSignals.length === 0) pendingQuestions.push("Há pelo menos um bloco de prova já disponível para comparar o caso com julgados similares?");
+  if (!form.valueRange) pendingQuestions.push("Qual é a faixa econômica envolvida ou o impacto financeiro aproximado da controvérsia?");
+  if (form.needsExpertEvidence && form.evidenceStrength !== "high") {
+    pendingQuestions.push("Se o caso depende de perícia, já existe laudo, orçamento técnico ou documento especializado?");
+  }
+  const evidenceStrengthLabel = getOptionLabel(jurisprudenceEvidenceStrengthOptions, form.evidenceStrength) || "Nível de prova não informado";
+  const stageLabel = getOptionLabel(jurisprudenceStageOptions, form.proceduralStage) || "Fase processual não informada";
+  const jurisdictionLabel = getOptionLabel(jurisprudenceJurisdictionOptions, form.jurisdiction) || "Tribunal/UF a definir";
+  const valueLabel = getOptionLabel(jurisprudenceValueRangeOptions, form.valueRange) || "Faixa econômica não informada";
+  const evidenceLead =
+    form.evidenceStrength === "high" && proofSignals.length >= 2
+      ? "há base probatória suficiente para comparar o caso com precedentes mais próximos"
+      : form.evidenceStrength === "medium" || proofSignals.length >= 2
+        ? "o recorte já permite leitura inicial, mas a consistência dos documentos ainda vai deslocar bastante o entendimento"
+        : "o recorte ainda depende de mais suporte probatório para não misturar casos juridicamente diferentes";
+  const researchScope = [
+    jurisdictionLabel,
+    areaConfig?.label || "Área a definir",
+    form.claimType.trim() || "Controvérsia a definir",
+    stageLabel
+  ].join(" · ");
+  const dominantRead = areaConfig
+    ? `${areaConfig.reading} No recorte atual, ${evidenceLead}. ${
+        form.objective.trim()
+          ? `O pedido informado (${form.objective.trim().toLowerCase()}) ajuda a filtrar melhor os julgados realmente comparáveis.`
+          : "Sem o pedido principal bem amarrado, a pesquisa tende a misturar decisões com fundamentos muito diferentes."
+      }`
+    : "Defina a área do direito para o sistema calibrar a leitura jurisprudencial e o recorte de pesquisa.";
+  const officeLanguage = areaConfig
+    ? `Para conversar com o cliente, o escritório pode tratar o tema assim: em casos parecidos com ${form.claimType.trim().toLowerCase() || "essa controvérsia"}, a jurisprudência costuma reagir a partir de ${areaConfig.officeBridge}. No cenário informado, o ponto que mais pesa é ${
+        form.hasDocuments
+          ? "a consistência da prova documental"
+          : form.hasWitnesses
+            ? "a coerência entre narrativa e prova oral"
+            : "a necessidade de amarrar melhor os elementos de prova"
+      }.`
+    : "Sem área jurídica definida, a saída deve ficar no nível de coleta de dados e ainda não de leitura jurisprudencial.";
+  const searchTerms = Array.from(
+    new Set(
+      [
+        form.claimType.trim(),
+        form.objective.trim(),
+        `${jurisdictionLabel} ${areaConfig?.label.toLowerCase() || "jurisprudência"}`,
+        ...(areaConfig?.searchSeeds ?? []),
+        ...extractJurisprudenceKeywords(`${form.narrative} ${form.evidenceSummary}`)
+      ].filter(Boolean)
+    )
+  ).slice(0, 6);
+  const jurisprudenceFocus = areaConfig
+    ? [
+        areaConfig.proofFocus,
+        areaConfig.sensitivePoint,
+        form.hasAdministrativeAttempt
+          ? "A tentativa administrativa anterior costuma reforçar boa-fé e persistência do problema quando a parte contrária permaneceu inerte."
+          : "Sem histórico administrativo, vale diferenciar se o caso exige notificação prévia ou se o fato já nasce judicializável.",
+        form.needsExpertEvidence
+          ? "Casos dependentes de perícia tendem a apresentar leitura menos linear até que o suporte técnico esteja claro."
+          : "Quando o caso é predominantemente documental, a comparação com precedentes similares fica mais limpa."
+      ]
+    : [
+        "Escolha a área do direito para destravar os fatores comparativos mais relevantes.",
+        "Defina a controvérsia central antes de buscar decisões parecidas."
+      ];
+  const nextSteps = criticalGaps.length
+    ? criticalGaps.slice(0, 4).map((gap) => `Completar: ${gap}.`)
+    : [
+        `Pesquisar ${searchTerms[0] || "precedentes próximos"} com foco em ${jurisdictionLabel}.`,
+        areaConfig ? `Executar o recorte sugerido da área: ${areaConfig.nextStep}.` : "Definir a área jurídica para orientar o recorte.",
+        form.objective.trim()
+          ? `Organizar os pedidos em torno de ${form.objective.trim().toLowerCase()}.`
+          : "Fixar qual resultado o cliente realmente espera do caso.",
+        "Revisar se a narrativa cobre fato, prova, reação da parte contrária e impacto prático em ordem cronológica."
+      ];
+  const precedentAggregate = buildSyntheticPrecedentAggregate(form, proofSignals, completionScore);
+  const caseSamples = {
+    granted: buildOutcomeSampleCases(
+      form,
+      areaConfig,
+      proofSignals,
+      jurisdictionLabel,
+      "granted",
+      precedentAggregate.grantedCount
+    ),
+    partial: buildOutcomeSampleCases(
+      form,
+      areaConfig,
+      proofSignals,
+      jurisdictionLabel,
+      "partial",
+      precedentAggregate.partialCount
+    ),
+    denied: buildOutcomeSampleCases(
+      form,
+      areaConfig,
+      proofSignals,
+      jurisdictionLabel,
+      "denied",
+      precedentAggregate.deniedCount
+    )
+  };
+  const readinessTone =
+    precedentAggregate.dominantTone === "granted"
+      ? "ready"
+      : precedentAggregate.dominantTone === "denied"
+        ? "pending"
+        : "attention";
+  const readinessLabel =
+    precedentAggregate.dominantShare >= 45
+      ? `Predomínio ${jurisprudenceOutcomeLabelMap[precedentAggregate.dominantTone].toLowerCase()}`
+      : "Panorama equilibrado";
+  const precedentMixLabel = `${precedentAggregate.grantedCount} deferido(s), ${precedentAggregate.partialCount} parcial(is) e ${precedentAggregate.deniedCount} indeferido(s)`;
+  const precedentMixSummary =
+    precedentAggregate.dominantTone === "granted"
+      ? "Os processos parecidos tendem mais ao deferimento, mas a prova e o recorte ainda deslocam bastante o resultado."
+      : precedentAggregate.dominantTone === "denied"
+        ? "Os processos parecidos tendem mais ao indeferimento, normalmente por fragilidade de prova ou recorte jurídico insuficiente."
+        : "Os processos parecidos ficam mais espalhados entre procedência parcial e distinções de contexto.";
+  return {
+    areaConfig,
+    requiredChecks,
+    completionScore,
+    score: precedentAggregate.defermentScore,
+    readinessTone,
+    readinessLabel,
+    criticalGaps,
+    pendingQuestions,
+    proofSignals,
+    jurisdictionLabel,
+    valueLabel,
+    evidenceStrengthLabel,
+    stageLabel,
+    researchScope,
+    dominantRead,
+    officeLanguage,
+    searchTerms,
+    jurisprudenceFocus,
+    nextSteps,
+    totalSimilarCases: precedentAggregate.total,
+    grantedCount: precedentAggregate.grantedCount,
+    partialCount: precedentAggregate.partialCount,
+    deniedCount: precedentAggregate.deniedCount,
+    dominantOutcomeLabel: precedentAggregate.dominantLabel,
+    dominantOutcomeShare: precedentAggregate.dominantShare,
+    dominantOutcomeTone: precedentAggregate.dominantTone,
+    caseSamples,
+    precedentMixLabel,
+    precedentMixSummary
+  };
+};
+
+function StatisticsWorkbench() {
+  const [form, setForm] = useState<JurisprudenceIntakeForm>(() => buildEmptyJurisprudenceForm());
+  const [analysisRequested, setAnalysisRequested] = useState(false);
+  const [isCaseModalOpen, setIsCaseModalOpen] = useState(false);
+  const [samplesTab, setSamplesTab] = useState<JurisprudenceSamplesTab>("summary");
+  const analysis = useMemo(() => buildJurisprudenceAnalysis(form), [form]);
+  const areaConfig = analysis.areaConfig;
+  const narrativeLength = form.narrative.trim().length;
+  const filledChecksCount = analysis.requiredChecks.filter((item) => item.done).length;
+  const canGenerateJurisprudence = analysis.requiredChecks.every((item) => item.done);
+  const hasAnyCaseData = Boolean(
+    form.area ||
+      form.claimType.trim() ||
+      form.objective.trim() ||
+      form.narrative.trim() ||
+      form.opposingParty.trim() ||
+      form.jurisdiction ||
+      form.factPeriod.trim() ||
+      form.valueRange ||
+      form.evidenceStrength ||
+      form.evidenceSummary.trim() ||
+      form.proceduralStage ||
+      form.hasDocuments ||
+      form.hasMessages ||
+      form.hasWitnesses ||
+      form.hasAdministrativeAttempt ||
+      form.needsExpertEvidence
+  );
+  const activeSamples = samplesTab === "summary" ? [] : analysis.caseSamples[samplesTab];
+
+  useEffect(() => {
+    if (analysisRequested && !canGenerateJurisprudence) {
+      setAnalysisRequested(false);
+    }
+  }, [analysisRequested, canGenerateJurisprudence]);
+
+  const updateField =
+    (field: keyof JurisprudenceIntakeForm) =>
+    (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+      const target = event.target;
+      const value = target instanceof HTMLInputElement && target.type === "checkbox" ? target.checked : target.value;
+      setForm((current) => ({
+        ...current,
+        [field]: value
+      }));
+    };
+
+  const applyClaimSuggestion = (value: string) => {
+    setForm((current) => ({
+      ...current,
+      claimType: value
+    }));
+  };
+
+  const handleGenerate = () => {
+    if (!canGenerateJurisprudence) return;
+    setAnalysisRequested(true);
+    setSamplesTab("summary");
+    setIsCaseModalOpen(false);
+  };
+
+  const handleReset = () => {
+    setForm(buildEmptyJurisprudenceForm());
+    setAnalysisRequested(false);
+    setIsCaseModalOpen(false);
+    setSamplesTab("summary");
+  };
+
+  return (
+    <div className="content-card page-card stats-lab-page">
+      <div className="page-header">
+        <div>
+          <div className="eyebrow">Estatísticas</div>
+          <h1 className="page-title">Leitura jurisprudencial guiada para casos parecidos com o relato do cliente.</h1>
+          <div className="page-subtitle">
+            O advogado descreve o caso, confirma os campos mínimos e o sistema organiza uma leitura qualitativa sobre como a jurisprudência costuma aparecer em recortes semelhantes.
+          </div>
+        </div>
+        <div className="stats-lab-toolbar">
+          <button className="btn ghost small stats-lab-entry-button" type="button" onClick={() => setIsCaseModalOpen(true)}>
+            Entrada do caso
+          </button>
+          {hasAnyCaseData && (
+            <button className="btn ghost small" type="button" onClick={handleReset}>
+              Limpar caso
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="stats-lab-card stats-lab-analysis-card stats-lab-analysis-card-full">
+          <div className="stats-lab-head">
+            <div>
+              <div className="settings-title">Saída para o escritório</div>
+              <div className="settings-sub">Leitura qualitativa do cenário, pontos sensíveis, filtros de pesquisa e pendências de coleta.</div>
+            </div>
+            {analysisRequested && <div className={`stats-lab-status ${analysis.readinessTone}`}>{analysis.readinessLabel}</div>}
+          </div>
+
+          {!analysisRequested ? (
+            <div className="stats-lab-placeholder">
+              <strong>Abra a entrada do caso.</strong>
+              <p>Use o botão “Entrada do caso”, preencha o recorte completo no popup e gere a leitura jurisprudencial por lá.</p>
+            </div>
+          ) : (
+            <>
+              <div className="stats-lab-score-card">
+                <div className="stats-lab-score-head">
+                  <span>Deferimentos no recorte ampliado</span>
+                  <strong>{analysis.score}/100</strong>
+                </div>
+                <div className="stats-lab-score-track" aria-hidden="true">
+                  <span className="stats-lab-score-fill" style={{ width: `${analysis.score}%` }} />
+                </div>
+                <div className="field-hint">
+                  {analysis.grantedCount} de {analysis.totalSimilarCases} processos parecidos foram deferidos. Recorte atual: {analysis.researchScope}.
+                </div>
+                <div className="field-hint">
+                  Julgado que mais aparece: {analysis.dominantOutcomeLabel} ({analysis.dominantOutcomeShare}% do recorte). {analysis.precedentMixSummary}
+                </div>
+              </div>
+
+              <div className="stats-lab-insight-grid">
+                <div className="stats-lab-insight-card" data-tone="neutral">
+                  <span>Total de processos parecidos</span>
+                  <strong>{analysis.totalSimilarCases}</strong>
+                  <p>Volume sintético do recorte jurisprudencial usado para montar a leitura do comportamento predominante.</p>
+                </div>
+                <div className="stats-lab-insight-card" data-tone={analysis.readinessTone === "ready" ? "accent" : "warning"}>
+                  <span>Julgado dominante</span>
+                  <strong>{analysis.dominantOutcomeLabel}</strong>
+                  <p>{analysis.precedentMixLabel}. O número grande mede só deferimentos, mas o dominante mostra o que mais apareceu no conjunto.</p>
+                </div>
+                <div className="stats-lab-insight-card" data-tone="neutral">
+                  <span>Base probatória</span>
+                  <strong>{analysis.proofSignals.length ? analysis.proofSignals.join(" · ") : "Prova ainda muito aberta"}</strong>
+                  <p>Quanto mais claro o suporte documental, mais limpa tende a ser a leitura da jurisprudência.</p>
+                </div>
+                <div className="stats-lab-insight-card" data-tone="accent">
+                  <span>Amostra em tela</span>
+                  <strong>Até 3 processos por aba</strong>
+                  <p>O conjunto pode ter muitos precedentes parecidos, mas a tela exibe só uma amostra curta para leitura rápida.</p>
+                </div>
+              </div>
+
+              <div className="stats-lab-section">
+                <div className="stats-lab-section-head">
+                  <div className="stats-lab-section-title">Processos parecidos no recorte</div>
+                  <div className="wallets-switch stats-lab-tabs" role="tablist" aria-label="Filtro de precedentes">
+                    {(["summary", "granted", "denied", "partial"] as JurisprudenceSamplesTab[]).map((tab) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        className={`wallets-switch-btn ${samplesTab === tab ? "active" : ""}`}
+                        onClick={() => setSamplesTab(tab)}
+                      >
+                        {jurisprudenceOutcomeTabLabelMap[tab]}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <span className="stats-lab-section-caption">A tela mostra até 3 exemplos por aba, mas o resumo usa o recorte inteiro.</span>
+                {samplesTab === "summary" ? (
+                  <div className="stats-lab-summary-board">
+                    <div className="stats-lab-summary-metric">
+                      <span>Deferidos</span>
+                      <strong>{analysis.grantedCount}</strong>
+                      <p>{Math.round((analysis.grantedCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
+                    </div>
+                    <div className="stats-lab-summary-metric">
+                      <span>Parciais</span>
+                      <strong>{analysis.partialCount}</strong>
+                      <p>{Math.round((analysis.partialCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
+                    </div>
+                    <div className="stats-lab-summary-metric">
+                      <span>Indeferidos</span>
+                      <strong>{analysis.deniedCount}</strong>
+                      <p>{Math.round((analysis.deniedCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
+                    </div>
+                    <div className="stats-lab-summary-metric">
+                      <span>O que mais aparece</span>
+                      <strong>{analysis.dominantOutcomeLabel}</strong>
+                      <p>{analysis.dominantOutcomeShare}% dos processos parecidos ficaram nesse resultado.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="stats-lab-similar-cases">
+                    {activeSamples.map((item) => (
+                      <div key={item.number} className="stats-lab-similar-case">
+                        <div className="stats-lab-similar-head">
+                          <strong>{item.number}</strong>
+                          <span className={`stats-lab-case-status ${item.tone}`}>{item.outcome}</span>
+                        </div>
+                        <div className="stats-lab-similar-meta">
+                          <span>{item.court}</span>
+                          <span>{item.organ}</span>
+                          <span>Julgado em {item.decidedAt}</span>
+                          <span>Contraparte: {item.counterparty}</span>
+                        </div>
+                        <p>{item.summary}</p>
+                        <div className="field-hint">{item.reason}</div>
+                        <div className="field-hint">{item.highlight}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="stats-lab-section">
+                <div className="stats-lab-section-title">Como a jurisprudência costuma se comportar</div>
+                <p>{analysis.dominantRead}</p>
+                <p>{analysis.officeLanguage}</p>
+              </div>
+
+              <div className="stats-lab-two-columns">
+                <div className="stats-lab-section">
+                  <div className="stats-lab-section-title">Fatores que normalmente deslocam o entendimento</div>
+                  <div className="stats-lab-bullet-list">
+                    {analysis.jurisprudenceFocus.map((item) => (
+                      <div key={item} className="stats-lab-bullet-item">
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="stats-lab-section">
+                  <div className="stats-lab-section-title">Termos sugeridos para pesquisa</div>
+                  <div className="stats-lab-tags">
+                    {analysis.searchTerms.map((term) => (
+                      <span key={term} className="stats-lab-tag">
+                        {term}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {analysis.pendingQuestions.length > 0 && (
+                <div className="stats-lab-section stats-lab-section-warning">
+                  <div className="stats-lab-section-title">Dados que ainda fariam diferença</div>
+                  <div className="stats-lab-bullet-list">
+                    {analysis.pendingQuestions.map((item) => (
+                      <div key={item} className="stats-lab-bullet-item">
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="stats-lab-section">
+                <div className="stats-lab-section-title">Próximos passos para o escritório</div>
+                <div className="stats-lab-bullet-list">
+                  {analysis.nextSteps.map((item) => (
+                    <div key={item} className="stats-lab-bullet-item">
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+      </div>
+
+      {isCaseModalOpen && (
+        <div className="modal-backdrop stats-lab-modal-backdrop" onClick={() => setIsCaseModalOpen(false)}>
+          <div className="modal-card stats-lab-modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <div className="eyebrow">Estatísticas</div>
+                <div className="modal-title">Ficha do caso para leitura jurisprudencial</div>
+                <div className="settings-sub">
+                  Preencha o caso em tela ampla. A leitura só é liberada quando todos os campos mínimos estiverem completos.
+                </div>
+              </div>
+              <button className="icon-btn" type="button" onClick={() => setIsCaseModalOpen(false)} aria-label="Fechar">
+                ×
+              </button>
+            </div>
+
+            <div className="stats-lab-modal-banner">
+              <div className="stats-lab-meter">
+                <strong>{filledChecksCount}/{analysis.requiredChecks.length}</strong>
+                <span>{canGenerateJurisprudence ? "pronto para leitura" : "campos completos"}</span>
+              </div>
+              <div className="stats-lab-note">
+                Quanto mais preciso o recorte, melhor fica a organização da jurisprudência parecida e dos resumos de saída para o escritório.
+              </div>
+            </div>
+
+            <div className="stats-lab-form-grid">
+              <div className="field">
+                <label>Área do direito *</label>
+                <select value={form.area} onChange={updateField("area")}>
+                  <option value="">Selecione</option>
+                  {jurisprudenceAreaOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                {areaConfig && <div className="field-hint">{areaConfig.description}</div>}
+              </div>
+              <div className="field">
+                <label>Tribunal / UF de interesse *</label>
+                <select value={form.jurisdiction} onChange={updateField("jurisdiction")}>
+                  <option value="">Selecione</option>
+                  {jurisprudenceJurisdictionOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Controvérsia principal *</label>
+                <input
+                  value={form.claimType}
+                  onChange={updateField("claimType")}
+                  placeholder="Ex.: cobrança indevida, horas extras, negativa de cobertura"
+                />
+              </div>
+              <div className="field">
+                <label>Pedido / objetivo do cliente *</label>
+                <input value={form.objective} onChange={updateField("objective")} placeholder="Ex.: repetição de indébito e dano moral" />
+              </div>
+              <div className="field">
+                <label>Parte contrária *</label>
+                <input
+                  value={form.opposingParty}
+                  onChange={updateField("opposingParty")}
+                  placeholder="Banco, empresa, ex-empregador, plano de saúde, ex-cônjuge"
+                />
+              </div>
+              <div className="field">
+                <label>Período dos fatos *</label>
+                <input value={form.factPeriod} onChange={updateField("factPeriod")} placeholder="Ex.: jan/2023 a jul/2024" />
+              </div>
+              <div className="field">
+                <label>Faixa econômica *</label>
+                <select value={form.valueRange} onChange={updateField("valueRange")}>
+                  <option value="">Selecione</option>
+                  {jurisprudenceValueRangeOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Fase da análise</label>
+                <select value={form.proceduralStage} onChange={updateField("proceduralStage")}>
+                  <option value="">Selecione</option>
+                  {jurisprudenceStageOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Maturidade da prova *</label>
+                <select value={form.evidenceStrength} onChange={updateField("evidenceStrength")}>
+                  <option value="">Selecione</option>
+                  {jurisprudenceEvidenceStrengthOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field span-2">
+                <label>História contada pelo cliente *</label>
+                <textarea
+                  value={form.narrative}
+                  onChange={updateField("narrative")}
+                  placeholder="Descreva os fatos em ordem cronológica: o que aconteceu, quando começou, o que a outra parte fez ou deixou de fazer, o impacto e o que já foi tentado."
+                />
+                <div className="field-hint">Mínimo recomendado: 180 caracteres. Atual: {narrativeLength}.</div>
+              </div>
+              <div className="field span-2">
+                <label>Resumo das provas já disponíveis *</label>
+                <textarea
+                  value={form.evidenceSummary}
+                  onChange={updateField("evidenceSummary")}
+                  placeholder="Liste os documentos ou elementos já disponíveis e explique o que cada um comprova."
+                />
+              </div>
+            </div>
+
+            {areaConfig && (
+              <div className="stats-lab-suggestions">
+                <span>Sugestões de controvérsia:</span>
+                {areaConfig.claimSuggestions.map((suggestion) => (
+                  <button key={suggestion} type="button" className="stats-lab-suggestion" onClick={() => applyClaimSuggestion(suggestion)}>
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="stats-lab-proof-box">
+              <div className="stats-lab-proof-title">Sinais objetivos do caso</div>
+              <div className="stats-lab-proof-grid">
+                <label className={`stats-lab-proof-item ${form.hasDocuments ? "active" : ""}`}>
+                  <input type="checkbox" checked={form.hasDocuments} onChange={updateField("hasDocuments")} />
+                  Documentos-chave já em mãos
+                </label>
+                <label className={`stats-lab-proof-item ${form.hasMessages ? "active" : ""}`}>
+                  <input type="checkbox" checked={form.hasMessages} onChange={updateField("hasMessages")} />
+                  Mensagens, protocolos ou e-mails
+                </label>
+                <label className={`stats-lab-proof-item ${form.hasWitnesses ? "active" : ""}`}>
+                  <input type="checkbox" checked={form.hasWitnesses} onChange={updateField("hasWitnesses")} />
+                  Testemunhas mapeadas
+                </label>
+                <label className={`stats-lab-proof-item ${form.hasAdministrativeAttempt ? "active" : ""}`}>
+                  <input type="checkbox" checked={form.hasAdministrativeAttempt} onChange={updateField("hasAdministrativeAttempt")} />
+                  Houve tentativa administrativa prévia
+                </label>
+                <label className={`stats-lab-proof-item ${form.needsExpertEvidence ? "active" : ""}`}>
+                  <input type="checkbox" checked={form.needsExpertEvidence} onChange={updateField("needsExpertEvidence")} />
+                  Tema depende ou pode depender de perícia
+                </label>
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button className="btn small" type="button" onClick={handleGenerate} disabled={!canGenerateJurisprudence}>
+                Montar leitura jurisprudencial
+              </button>
+              <button className="btn ghost small" type="button" onClick={() => setIsCaseModalOpen(false)}>
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -6831,6 +7983,7 @@ function Team({ canManage }: { canManage: boolean }) {
   const [deleteError, setDeleteError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [resettingPasswordId, setResettingPasswordId] = useState<number | null>(null);
   const [form, setForm] = useState(buildEmptyTeamForm);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
@@ -6906,6 +8059,10 @@ function Team({ canManage }: { canManage: boolean }) {
   const teamValidationMessage = getTeamFormValidationMessage(form);
   const cpfInvalid = form.cpf.trim().length > 0 && !isValidCpf(form.cpf);
   const createBlockedByLimit = !editingId && form.isActive && limitReached;
+  const editingMember = useMemo(
+    () => (editingId ? members.find((member) => member.id === editingId) ?? null : null),
+    [editingId, members]
+  );
 
   const refreshCapacity = async () => {
     try {
@@ -7048,6 +8205,37 @@ function Team({ canManage }: { canManage: boolean }) {
       setDeleteError(extractApiErrorMessage(err, "Não foi possível excluir o membro da equipe."));
     } finally {
       setIsDeleting(false);
+    }
+  };
+
+  const handleResetMemberPassword = async (member: ApiTeamMember) => {
+    if (!canManage) {
+      setSaveError("Você não tem permissão para refazer senhas.");
+      return;
+    }
+    setResettingPasswordId(member.id);
+    setSaveError("");
+    setSaveSuccess("");
+    try {
+      const result = await apiResetTeamMemberPassword(member.id);
+      if (result.invite_email_sent) {
+        setSaveSuccess(`Link de redefinição enviado para ${result.email}.`);
+      } else if (result.invite_link) {
+        setSaveSuccess(`Link de redefinição gerado para ${result.email}: ${result.invite_link}`);
+      } else if (result.invite_token) {
+        setSaveSuccess(`Token de redefinição gerado para ${result.email}: ${result.invite_token}`);
+      } else {
+        setSaveSuccess(`Senha refeita para ${result.email}. Configure SMTP no VPS para envio automático do link.`);
+      }
+    } catch (err) {
+      const apiError = err as { response?: { status?: number } };
+      if (apiError.response?.status === 404) {
+        setSaveError("Esse recurso ainda não está disponível no servidor atual. Publique a API com a rota de redefinição de senha.");
+      } else {
+        setSaveError(extractApiErrorMessage(err, "Não foi possível refazer a senha do membro."));
+      }
+    } finally {
+      setResettingPasswordId(null);
     }
   };
 
@@ -7298,6 +8486,16 @@ function Team({ canManage }: { canManage: boolean }) {
             </div>
             {saveError && <div className="error">{saveError}</div>}
             <div className="modal-actions">
+              {editingMember && (
+                <button
+                  className="btn ghost"
+                  type="button"
+                  onClick={() => handleResetMemberPassword(editingMember)}
+                  disabled={isSaving || resettingPasswordId === editingMember.id}
+                >
+                  {resettingPasswordId === editingMember.id ? "Enviando link..." : "Refazer senha"}
+                </button>
+              )}
               <button
                 className="btn ghost"
                 type="button"
@@ -7366,7 +8564,8 @@ function Settings({
   onLogout,
   user,
   profile,
-  onSaveProfile
+  onSaveProfile,
+  onPreviewProfile
 }: {
   theme: ThemeMode;
   onThemeChange: (value: ThemeMode) => void;
@@ -7376,9 +8575,10 @@ function Settings({
   user: AuthUser | null;
   profile: UserProfilePreferences;
   onSaveProfile: (value: UserProfilePreferences) => UserProfilePreferences;
+  onPreviewProfile: (value: UserProfilePreferences | null) => void;
 }) {
   const runningInTauri = typeof window !== "undefined" && isTauri();
-  const [appVersion, setAppVersion] = useState("0.1.6");
+  const [appVersion, setAppVersion] = useState("0.1.7");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateMessage, setUpdateMessage] = useState("Clique em verificar atualização.");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
@@ -7407,7 +8607,14 @@ function Settings({
 
   useEffect(() => {
     setProfileForm(profile);
-  }, [profile]);
+    onPreviewProfile(null);
+  }, [profile, onPreviewProfile]);
+
+  useEffect(() => {
+    return () => {
+      onPreviewProfile(null);
+    };
+  }, [onPreviewProfile]);
 
   useEffect(() => {
     if (!runningInTauri) {
@@ -7457,10 +8664,12 @@ function Settings({
   const handleProfileFieldChange =
     (field: keyof Omit<UserProfilePreferences, "avatarDataUrl">) =>
     (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-      setProfileForm((prev) => ({
-        ...prev,
+      const nextProfile = {
+        ...profileForm,
         [field]: event.target.value
-      }));
+      };
+      setProfileForm(nextProfile);
+      onPreviewProfile(nextProfile);
       setProfileError("");
       setProfileInlineMessage("");
     };
@@ -7479,30 +8688,35 @@ function Settings({
     }
     try {
       const avatarDataUrl = await readFileAsDataUrl(file);
-      setProfileForm((prev) => ({
-        ...prev,
+      const nextProfile = {
+        ...profileForm,
         avatarDataUrl
-      }));
+      };
+      setProfileForm(nextProfile);
+      onPreviewProfile(nextProfile);
       setProfileError("");
-      setProfileInlineMessage("Foto carregada. Clique em salvar perfil para aplicar no topo.");
+      setProfileInlineMessage("Foto aplicada no topo. Clique em salvar perfil para persistir a alteração.");
     } catch (error) {
       setProfileError(extractRuntimeErrorMessage(error, "Não foi possível carregar a foto do perfil."));
     }
   };
 
   const handleRemoveProfilePhoto = () => {
-    setProfileForm((prev) => ({
-      ...prev,
+    const nextProfile = {
+      ...profileForm,
       avatarDataUrl: ""
-    }));
+    };
+    setProfileForm(nextProfile);
+    onPreviewProfile(nextProfile);
     setProfileError("");
-    setProfileInlineMessage("Foto removida. Clique em salvar perfil para aplicar a alteração.");
+    setProfileInlineMessage("Foto removida do topo. Clique em salvar perfil para persistir a alteração.");
   };
 
   const handleSaveProfile = () => {
     try {
       const nextProfile = onSaveProfile(profileForm);
       setProfileForm(nextProfile);
+      onPreviewProfile(null);
       setProfileError("");
       setProfileInlineMessage("Perfil atualizado com sucesso.");
     } catch (error) {
@@ -7857,7 +9071,7 @@ function Settings({
                   Remover foto
                 </button>
               </div>
-              <div className="field-hint">JPG, PNG ou WEBP com até 2 MB. A foto aparece no topo depois de salvar.</div>
+              <div className="field-hint">JPG, PNG ou WEBP com até 2 MB. O topo acompanha a prévia e a alteração fica salva ao clicar em salvar perfil.</div>
             </div>
             <div className="settings-profile-form">
               <div className="settings-profile-form-grid">
@@ -8208,6 +9422,7 @@ function App() {
   const [token, setToken] = useState<string | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [profilePreferences, setProfilePreferences] = useState<UserProfilePreferences>(() => loadStoredProfilePreferences(null));
+  const [profilePreview, setProfilePreview] = useState<UserProfilePreferences | null>(null);
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
@@ -8244,7 +9459,8 @@ function App() {
   }, [textScale, textScaleIndex]);
 
   useEffect(() => {
-    setProfilePreferences((current) => normalizeProfilePreferences(current, user));
+    setProfilePreferences(loadStoredProfilePreferences(user));
+    setProfilePreview(null);
   }, [user]);
 
   useEffect(() => {
@@ -8282,8 +9498,9 @@ function App() {
     user && (user.role === "superadmin" || user.role === "owner" || user.role === "admin" || user.is_admin)
   );
   const activeNav = visibleNavItems.some((item) => item.key === active) ? active : (visibleNavItems[0]?.key ?? "settings");
-  const sidebarDisplayName = profilePreferences.displayName || user?.name || "Responsável da conta";
-  const sidebarRoleLabel = profilePreferences.roleLabel || "Login master";
+  const effectiveProfilePreferences = profilePreview ?? profilePreferences;
+  const sidebarDisplayName = effectiveProfilePreferences.displayName || user?.name || "Responsável da conta";
+  const sidebarRoleLabel = effectiveProfilePreferences.roleLabel || "Login master";
 
   useEffect(() => {
     if (!token) return;
@@ -8364,8 +9581,13 @@ function App() {
   const handleSaveProfile = (value: UserProfilePreferences) => {
     const normalized = normalizeProfilePreferences(value, user);
     setProfilePreferences(normalized);
+    setProfilePreview(null);
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(normalized));
+      const storageKey = getProfileStorageKey(user);
+      if (storageKey) {
+        window.localStorage.setItem(storageKey, JSON.stringify(normalized));
+      }
+      window.localStorage.removeItem(PROFILE_STORAGE_KEY_PREFIX);
     }
     return normalized;
   };
@@ -8428,6 +9650,7 @@ function App() {
             user={user}
             profile={profilePreferences}
             onSaveProfile={handleSaveProfile}
+            onPreviewProfile={setProfilePreview}
           />
         );
       case "finance":
@@ -8437,10 +9660,11 @@ function App() {
         return <Agenda />;
       case "service":
       case "reports":
-      case "stats":
       case "progress":
       case "templates":
         return <Placeholder title={navItems.find((n) => n.key === activeNav)?.label || "Em breve"} />;
+      case "stats":
+        return <StatisticsWorkbench />;
       case "files":
         return <Files />;
       default:
@@ -8453,7 +9677,7 @@ function App() {
       <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top">
           <div className="sidebar-account">
-            <ProfileAvatar avatarDataUrl={profilePreferences.avatarDataUrl} label={MASTER_OFFICE_NAME} size="sidebar" />
+            <ProfileAvatar avatarDataUrl={effectiveProfilePreferences.avatarDataUrl} label={MASTER_OFFICE_NAME} size="sidebar" />
             <div className="brand">
               <span className="brand-full">{MASTER_OFFICE_NAME}</span>
               <span className="brand-meta">{sidebarRoleLabel}</span>

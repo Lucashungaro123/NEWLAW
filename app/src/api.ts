@@ -112,6 +112,15 @@ export type ApiTeamMember = {
   invite_token?: string;
 };
 
+export type TeamMemberPasswordResetResult = {
+  status: string;
+  id: number;
+  email: string;
+  invite_email_sent?: boolean;
+  invite_token?: string;
+  invite_link?: string;
+};
+
 export type TeamMembersCapacity = {
   organization_id: number;
   plan_slug?: string | null;
@@ -483,29 +492,41 @@ const isDesktopRemoteApi =
   !baseURL.startsWith("http://127.0.0.1") &&
   !baseURL.startsWith("http://localhost");
 
-export async function deleteCase(caseId: number) {
+type DeleteResponseBody = {
+  detail?: string;
+  status?: string;
+  id?: number;
+};
+
+type DeleteResult = {
+  status: string;
+  id: number;
+};
+
+type TauriDeleteResponse = {
+  status: number;
+  body?: DeleteResponseBody;
+};
+
+async function deleteResource(path: string, failureMessage: string): Promise<DeleteResult> {
   if (isDesktopRemoteApi) {
     const executeDeleteViaTauri = async (token: string | null) => {
       if (!token) return { unauthorized: true as const };
-      type TauriDeleteResponse = {
-        status: number;
-        body?: { detail?: string; status?: string; id?: number };
-      };
       try {
         const response = await invoke<TauriDeleteResponse>("remote_delete_with_auth", {
-          url: `${baseURL}/cases/${caseId}`,
+          url: `${baseURL}${path}`,
           bearerToken: token
         });
         if (response.status === 401) return { unauthorized: true as const };
         if (response.status < 200 || response.status >= 300) {
-          throw buildHttpError(response.status, response.body?.detail || `Falha ao excluir processo (${response.status}).`);
+          throw buildHttpError(response.status, response.body?.detail || `${failureMessage} (${response.status}).`);
         }
-        return response.body as { status: string; id: number };
+        return response.body as DeleteResult;
       } catch (error) {
         if ((error as Error & { response?: { status: number } }).response) {
           throw error;
         }
-        throw new Error((error as Error)?.message || "Falha ao excluir processo.");
+        throw new Error((error as Error)?.message || failureMessage);
       }
     };
 
@@ -528,25 +549,25 @@ export async function deleteCase(caseId: number) {
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), 10000);
     try {
-      const response = await fetch(`${baseURL}/cases/${caseId}`, {
+      const response = await fetch(`${baseURL}${path}`, {
         method: "DELETE",
         headers: token ? { Authorization: `Bearer ${token}` } : undefined,
         signal: controller.signal
       });
       const rawBody = await response.text();
-      let payload: { detail?: string; status?: string; id?: number } | null = null;
+      let payload: DeleteResponseBody | null = null;
       if (rawBody) {
         try {
-          payload = JSON.parse(rawBody) as { detail?: string; status?: string; id?: number };
+          payload = JSON.parse(rawBody) as DeleteResponseBody;
         } catch {
           payload = { detail: rawBody };
         }
       }
       if (response.status === 401) return { unauthorized: true as const };
       if (!response.ok) {
-        throw buildHttpError(response.status, payload?.detail || `Falha ao excluir processo (${response.status}).`);
+        throw buildHttpError(response.status, payload?.detail || `${failureMessage} (${response.status}).`);
       }
-      return payload as { status: string; id: number };
+      return payload as DeleteResult;
     } catch (error) {
       if ((error as Error).name === "AbortError") {
         const timeoutError = new Error("timeout") as Error & { code?: string };
@@ -572,6 +593,10 @@ export async function deleteCase(caseId: number) {
     return secondAttempt;
   }
   return firstAttempt;
+}
+
+export async function deleteCase(caseId: number) {
+  return deleteResource(`/cases/${caseId}`, "Falha ao excluir processo.");
 }
 
 export async function listWallets(organizationId?: number) {
@@ -618,8 +643,12 @@ export async function updateTeamMember(memberId: number, payload: UpdateTeamMemb
 }
 
 export async function deleteTeamMember(memberId: number) {
-  const { data } = await api.delete(`/team-members/${memberId}`);
-  return data as { status: string; id: number };
+  return deleteResource(`/team-members/${memberId}`, "Falha ao excluir membro da equipe.");
+}
+
+export async function resetTeamMemberPassword(memberId: number) {
+  const { data } = await api.post(`/team-members/${memberId}/password-reset`);
+  return data as TeamMemberPasswordResetResult;
 }
 
 export async function listCalendarConnections() {
