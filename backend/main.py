@@ -545,7 +545,7 @@ def build_calendar_oauth_url(provider: str, state: str, redirect_uri: str) -> st
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/calendar.readonly",
+            "scope": "https://www.googleapis.com/auth/calendar.events.readonly",
             "access_type": "offline",
             "prompt": "consent",
             "state": state,
@@ -2323,10 +2323,10 @@ def validate_case_payload(payload: CreateCaseRequest | UpdateCaseRequest) -> dic
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cliente é obrigatório")
     if payload.wallet_id is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Carteira é obrigatória")
-    forum = (payload.forum or "").strip()
+    forum = (payload.forum or "").strip().upper()
     if not forum:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Comarca é obrigatória")
-    court = (payload.court or "").strip()
+    court = (payload.court or "").strip().upper()
     if not court:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Vara é obrigatória")
     status_value = (payload.status or "aberto").strip() or "aberto"

@@ -124,6 +124,7 @@ async fn stop_backend(state: State<'_, BackendProcess>) -> Result<(), String> {
 
 fn main() {
   tauri::Builder::default()
+    .plugin(tauri_plugin_opener::init())
     .plugin(tauri_plugin_updater::Builder::new().build())
     .manage(BackendProcess(Mutex::new(None)))
     .invoke_handler(tauri::generate_handler![start_backend, stop_backend, remote_delete_with_auth])

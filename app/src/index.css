@@ -4429,7 +4429,7 @@ body {
   width: calc(100% - 72px);
   height: 184px;
   pointer-events: none;
-  z-index: 2;
+  z-index: 4;
   overflow: visible;
 }
 
@@ -4453,16 +4453,49 @@ body {
   min-height: 236px;
   padding: 18px 0 6px;
   position: relative;
-  z-index: 1;
+  z-index: 2;
 }
 
 .finance-chart-month {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 8px;
   position: relative;
-  z-index: 1;
+  cursor: pointer;
+  text-align: center;
+}
+
+.finance-chart-month:focus-visible {
+  outline: none;
+}
+
+.finance-chart-month::before {
+  content: "";
+  position: absolute;
+  inset: -8px -4px 18px;
+  border-radius: 18px;
+  border: 1px solid transparent;
+  background: transparent;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+  z-index: -1;
+}
+
+.finance-chart-month:hover::before,
+.finance-chart-month:focus-visible::before {
+  border-color: rgba(144, 175, 239, 0.24);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.finance-chart-month.active::before {
+  border-color: rgba(110, 157, 255, 0.42);
+  background: rgba(92, 136, 227, 0.12);
+  box-shadow: 0 0 0 1px rgba(110, 157, 255, 0.12);
 }
 
 .finance-chart-bars {
@@ -4472,6 +4505,52 @@ body {
   display: grid;
   grid-template-columns: repeat(3, minmax(6px, 1fr));
   gap: 5px;
+  border-radius: 16px;
+  transition: transform 0.16s ease;
+}
+
+.finance-chart-month:hover .finance-chart-bars,
+.finance-chart-month:focus-visible .finance-chart-bars {
+  transform: translateY(-2px);
+}
+
+.finance-chart-tooltip-layer {
+  position: absolute;
+  inset: 18px 0 32px 72px;
+  width: calc(100% - 72px);
+  pointer-events: none;
+  z-index: 7;
+  overflow: visible;
+}
+
+.finance-chart-tooltip {
+  position: absolute;
+  top: 0;
+  min-width: 176px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: 14px;
+  border: 1px solid rgba(132, 164, 231, 0.26);
+  background: rgba(8, 18, 40, 0.96);
+  box-shadow: 0 18px 30px rgba(3, 8, 20, 0.34);
+  color: rgba(234, 241, 255, 0.92);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  transform: translate(-50%, -4px);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.finance-chart-tooltip strong {
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.finance-chart-tooltip span {
+  color: rgba(222, 232, 252, 0.9);
 }
 
 .finance-chart-bars .bar-wrap {
@@ -4706,6 +4785,20 @@ body {
   color: var(--muted);
   font-size: 13px;
   margin-top: 4px;
+}
+
+.finance-table-drilldown {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.finance-table-drilldown strong {
+  color: var(--text-strong);
 }
 
 .finance-overview-toolbar {
@@ -5637,6 +5730,42 @@ body {
   padding: 10px 12px;
   font-size: 13px;
   color: var(--text-strong);
+}
+
+.agenda-inline-link {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent-border);
+  border-radius: 14px;
+  padding: 12px 14px;
+}
+
+.agenda-inline-link-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text-strong);
+}
+
+.agenda-inline-link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.agenda-inline-link-url {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.agenda-inline-link-url:hover {
+  text-decoration: underline;
 }
 
 .agenda-grid {

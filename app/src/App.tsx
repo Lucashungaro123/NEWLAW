@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AgendaItem,
@@ -80,6 +81,10 @@ type ClientRow = {
 };
 type ThemeMode = "dark" | "light";
 type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "installed" | "up-to-date" | "error" | "unavailable";
+type CalendarAuthLinkState = {
+  provider: CalendarProvider;
+  url: string;
+};
 type FileFolderNodeKind = "client-folder" | "case-folder" | "case-section";
 type FileFolderNode = {
   id: string;
@@ -639,6 +644,7 @@ const formatCaseNumber = (value: string) => {
 
 const isCompleteCaseNumber = (value: string) => caseNumberPattern.test(formatCaseNumber(value));
 const formatCounterparty = (value: string) => value.toUpperCase().replace(/[^A-ZÀ-Ÿ0-9\s]/g, "");
+const formatCourtOrRegion = (value: string) => value.toLocaleUpperCase("pt-BR");
 
 const getCaseFormValidationMessage = (form: CaseForm) => {
   if (!isCompleteCaseNumber(form.process)) {
@@ -732,6 +738,31 @@ type FinanceEntry = {
   paidAmount?: number;
   installments?: number;
   attachmentName?: string;
+};
+
+type FinanceChartDrilldown = {
+  key: string;
+  label: string;
+  kind: "month" | "day";
+  year: number;
+  month: number;
+  day?: number;
+};
+
+type FinanceComparisonChartItem = {
+  key: string;
+  label: string;
+  tooltipLabel: string;
+  expected: number;
+  received: number;
+  expense: number;
+  result: number;
+  drilldown: FinanceChartDrilldown;
+};
+
+type FinanceChartHoverState = {
+  item: FinanceComparisonChartItem;
+  index: number;
 };
 
 const revenueCategories = [
@@ -1712,13 +1743,13 @@ function ProcessFormFields({
         <label>
           Vara <span className="required">*</span>
         </label>
-        <input value={form.court} onChange={(e) => onChange("court", e.target.value)} />
+        <input value={form.court} onChange={(e) => onChange("court", formatCourtOrRegion(e.target.value))} />
       </div>
       <div className="field">
         <label>
           Comarca <span className="required">*</span>
         </label>
-        <input value={form.region} onChange={(e) => onChange("region", e.target.value)} />
+        <input value={form.region} onChange={(e) => onChange("region", formatCourtOrRegion(e.target.value))} />
       </div>
       <div className="field">
         <label>Processos associados</label>
@@ -4461,6 +4492,8 @@ function Finance() {
   const [chartView, setChartView] = useState<FinanceChartView>("year");
   const [selectedChartYear, setSelectedChartYear] = useState(() => today.getFullYear());
   const [selectedChartMonth, setSelectedChartMonth] = useState(() => today.getMonth());
+  const [chartDrilldown, setChartDrilldown] = useState<FinanceChartDrilldown | null>(null);
+  const [hoveredChartItem, setHoveredChartItem] = useState<FinanceChartHoverState | null>(null);
   const [showQuickMenu, setShowQuickMenu] = useState(false);
   const [showRevenueModal, setShowRevenueModal] = useState(false);
   const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -4478,12 +4511,18 @@ function Finance() {
   const [revenueForm, setRevenueForm] = useState<RevenueForm>(emptyRevenueForm);
   const [expenseForm, setExpenseForm] = useState<ExpenseForm>(emptyExpenseForm);
   const [financeSettlementForm, setFinanceSettlementForm] = useState<FinanceSettlementForm>(emptyFinanceSettlementForm);
+  const overviewSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!inlineMessage) return;
     const timeout = window.setTimeout(() => setInlineMessage(""), 2800);
     return () => window.clearTimeout(timeout);
   }, [inlineMessage]);
+
+  useEffect(() => {
+    setChartDrilldown(null);
+    setHoveredChartItem(null);
+  }, [chartView, selectedChartMonth, selectedChartYear]);
 
   useEffect(() => {
     const loadFinanceLinks = async () => {
@@ -4598,7 +4637,7 @@ function Finance() {
 
   const receiptRate = expectedRevenue > 0 ? Math.round((receivedRevenue / expectedRevenue) * 100) : 0;
 
-  const annualChartData = useMemo(() => {
+  const annualChartData = useMemo<FinanceComparisonChartItem[]>(() => {
     const expectedByMonth = Array.from({ length: 12 }, () => 0);
     const receivedByMonth = Array.from({ length: 12 }, () => 0);
     const expenseByMonth = Array.from({ length: 12 }, () => 0);
@@ -4618,13 +4657,21 @@ function Finance() {
     return financeMonths.map((label, index) => ({
       key: label,
       label,
+      tooltipLabel: `${financeMonthOptions[index]?.label || label} de ${selectedChartYear}`,
       expected: expectedByMonth[index],
       received: receivedByMonth[index],
       expense: expenseByMonth[index],
-      result: receivedByMonth[index] - expenseByMonth[index]
+      result: receivedByMonth[index] - expenseByMonth[index],
+      drilldown: {
+        key: `year-${selectedChartYear}-${index}`,
+        label: `${financeMonthOptions[index]?.label || label} de ${selectedChartYear}`,
+        kind: "month",
+        year: selectedChartYear,
+        month: index
+      }
     }));
   }, [entries, selectedChartYear]);
-  const monthlyChartData = useMemo(() => {
+  const monthlyChartData = useMemo<FinanceComparisonChartItem[]>(() => {
     const daysInMonth = new Date(selectedChartYear, selectedChartMonth + 1, 0).getDate();
     const highlightedDays = new Set(
       daysInMonth <= 7 ? Array.from({ length: daysInMonth }, (_, index) => index + 1) : [1, 5, 10, 15, 20, 25, daysInMonth]
@@ -4653,10 +4700,19 @@ function Finance() {
       return {
         key: `day-${day}`,
         label: highlightedDays.has(day) ? String(day).padStart(2, "0") : "",
+        tooltipLabel: `${String(day).padStart(2, "0")}/${String(selectedChartMonth + 1).padStart(2, "0")}/${selectedChartYear}`,
         expected,
         received,
         expense,
-        result: received - expense
+        result: received - expense,
+        drilldown: {
+          key: `month-${selectedChartYear}-${selectedChartMonth}-${day}`,
+          label: `${String(day).padStart(2, "0")}/${String(selectedChartMonth + 1).padStart(2, "0")}/${selectedChartYear}`,
+          kind: "day",
+          year: selectedChartYear,
+          month: selectedChartMonth,
+          day
+        }
       };
     });
   }, [entries, selectedChartMonth, selectedChartYear]);
@@ -4722,6 +4778,17 @@ function Finance() {
       bottom: `${((startValue - comparisonChartScale.min) / comparisonChartScale.range) * 100}%`
     };
   };
+  const hoveredChartTooltipLeft = hoveredChartItem
+    ? `${comparisonChartData.length === 1 ? 50 : ((hoveredChartItem.index + 0.5) / comparisonChartData.length) * 100}%`
+    : "50%";
+
+  const handleSelectChartColumn = (item: FinanceComparisonChartItem) => {
+    setPeriodFilter("all");
+    setChartDrilldown((current) => (current?.key === item.drilldown.key ? null : item.drilldown));
+    window.requestAnimationFrame(() => {
+      overviewSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
 
   const filteredEntries = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -4750,7 +4817,14 @@ function Finance() {
       const matchesStatus = statusFilter === "todos" || status === statusFilter;
       let matchesPeriod = true;
 
-      if (periodFilter === "this-month") {
+      if (chartDrilldown) {
+        matchesPeriod = Boolean(
+          dueDate &&
+            dueDate.getFullYear() === chartDrilldown.year &&
+            dueDate.getMonth() === chartDrilldown.month &&
+            (chartDrilldown.kind === "month" || dueDate.getDate() === chartDrilldown.day)
+        );
+      } else if (periodFilter === "this-month") {
         matchesPeriod = Boolean(
           dueDate && dueDate.getFullYear() === todayBase.getFullYear() && dueDate.getMonth() === todayBase.getMonth()
         );
@@ -4768,7 +4842,7 @@ function Finance() {
 
       return matchesType && matchesClient && matchesStatus && matchesPeriod;
     });
-  }, [clientFilter, entryTypeFilter, filteredEntries, periodFilter, statusFilter, today]);
+  }, [chartDrilldown, clientFilter, entryTypeFilter, filteredEntries, periodFilter, statusFilter, today]);
 
   const periodRevenue = useMemo(
     () =>
@@ -5119,21 +5193,24 @@ function Finance() {
                         vectorEffect="non-scaling-stroke"
                       />
                     )}
-                    {comparisonChartResultPoints.map((point, index) => (
-                      <circle
-                        key={`result-${comparisonChartData[index]?.key ?? index}`}
-                        className="finance-chart-result-point"
-                        cx={point.x}
-                        cy={point.y}
-                        r="0.56"
-                        vectorEffect="non-scaling-stroke"
-                      />
-                    ))}
                   </svg>
 
                   <div className="finance-chart-grid" style={comparisonChartGridStyle}>
-                    {comparisonChartData.map((item) => (
-                      <div key={item.key} className="finance-chart-month">
+                    {comparisonChartData.map((item, index) => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        className={`finance-chart-month ${chartDrilldown?.key === item.drilldown.key ? "active" : ""}`}
+                        onClick={() => handleSelectChartColumn(item)}
+                        onMouseEnter={() => setHoveredChartItem({ item, index })}
+                        onMouseLeave={() => setHoveredChartItem((current) => (current?.item.key === item.key ? null : current))}
+                        onFocus={() => setHoveredChartItem({ item, index })}
+                        onBlur={() => setHoveredChartItem((current) => (current?.item.key === item.key ? null : current))}
+                        aria-pressed={chartDrilldown?.key === item.drilldown.key}
+                        aria-label={`${item.tooltipLabel}. Prevista ${formatCurrencyBRL(item.expected)}. Recebida ${formatCurrencyBRL(
+                          item.received
+                        )}. Despesas ${formatCurrencyBRL(item.expense)}. Resultado ${formatCurrencyBRL(item.result)}.`}
+                      >
                         <div className="finance-chart-bars">
                           <span className="bar-wrap">
                             <span className="bar prevista" style={toComparisonBarStyle(item.expected)} />
@@ -5146,9 +5223,20 @@ function Finance() {
                           </span>
                         </div>
                         <div className="finance-chart-label">{item.label}</div>
-                      </div>
+                      </button>
                     ))}
                   </div>
+                  {hoveredChartItem && (
+                    <div className="finance-chart-tooltip-layer" aria-hidden="true">
+                      <div className="finance-chart-tooltip" style={{ left: hoveredChartTooltipLeft }}>
+                        <strong>{hoveredChartItem.item.tooltipLabel}</strong>
+                        <span>Prevista: {formatCurrencyBRL(hoveredChartItem.item.expected)}</span>
+                        <span>Recebida: {formatCurrencyBRL(hoveredChartItem.item.received)}</span>
+                        <span>Despesas: {formatCurrencyBRL(hoveredChartItem.item.expense)}</span>
+                        <span>Resultado: {formatCurrencyBRL(hoveredChartItem.item.result)}</span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -5170,7 +5258,7 @@ function Finance() {
           </section>
         </div>
 
-        <section className="finance-table-card">
+        <section ref={overviewSectionRef} className="finance-table-card">
           <div className="finance-table-head">
             <div>
               <div className="finance-table-title">Visão Geral</div>
@@ -5179,6 +5267,14 @@ function Finance() {
                   ? "Carregando lançamentos da conta..."
                   : `Exibindo ${Math.min(filteredOverviewEntries.length, 25)} de ${filteredOverviewEntries.length} lançamentos`}
               </div>
+              {chartDrilldown && (
+                <div className="finance-table-drilldown">
+                  <span>Recorte do gráfico ativo: <strong>{chartDrilldown.label}</strong></span>
+                  <button type="button" className="btn ghost small" onClick={() => setChartDrilldown(null)}>
+                    Limpar recorte
+                  </button>
+                </div>
+              )}
             </div>
             <div className="finance-overview-toolbar">
               <div className="finance-table-filters">
@@ -6876,10 +6972,10 @@ const toCaseRow = (entry: ApiCase, clientsById: Map<number, string>): CaseRow =>
     walletName: entry.wallet_name || undefined,
     counterparty: parties.passiveParty || "-",
     folder: "GERAL",
-    action: entry.court?.trim() || "Ação judicial",
+    action: entry.court?.trim() ? formatCourtOrRegion(entry.court.trim()) : "Ação judicial",
     area: entry.court?.trim().toUpperCase() || "GERAL",
     number: entry.number,
-    forum: entry.forum?.trim() || "-",
+    forum: entry.forum?.trim() ? formatCourtOrRegion(entry.forum.trim()) : "-",
     lawyer: "-",
     rawStatus: entry.status || "aberto",
     status: normalizeCaseStatus(entry.status)
@@ -7115,8 +7211,8 @@ function Cases() {
         client_id: selectedCreateClient.id,
         wallet_id: createCaseForm.walletId ? Number(createCaseForm.walletId) : undefined,
         status: "aberto",
-        forum: createCaseForm.region.trim() || undefined,
-        court: createCaseForm.court.trim() || undefined
+        forum: formatCourtOrRegion(createCaseForm.region).trim() || undefined,
+        court: formatCourtOrRegion(createCaseForm.court).trim() || undefined
       });
       const createdRow = toCaseRow(created, clientsById);
       setCaseRows((prev) => [createdRow, ...prev]);
@@ -7136,8 +7232,8 @@ function Cases() {
     setEditCaseForm({
       process: formatCaseNumber(selectedCase.number || ""),
       walletId: selectedCase.walletId ? String(selectedCase.walletId) : "",
-      court: selectedCase.action === "Ação judicial" ? "" : selectedCase.action,
-      region: selectedCase.forum === "-" ? "" : selectedCase.forum,
+      court: selectedCase.action === "Ação judicial" ? "" : formatCourtOrRegion(selectedCase.action),
+      region: selectedCase.forum === "-" ? "" : formatCourtOrRegion(selectedCase.forum),
       associated: "",
       counterparty: formatCounterparty(selectedCase.counterparty === "-" ? "" : selectedCase.counterparty),
       counterLawyer: "",
@@ -7166,8 +7262,8 @@ function Cases() {
         client_id: selectedCase.clientId,
         wallet_id: editCaseForm.walletId ? Number(editCaseForm.walletId) : undefined,
         status: selectedCase.rawStatus || "aberto",
-        forum: editCaseForm.region.trim() || undefined,
-        court: editCaseForm.court.trim() || undefined
+        forum: formatCourtOrRegion(editCaseForm.region).trim() || undefined,
+        court: formatCourtOrRegion(editCaseForm.court).trim() || undefined
       };
       const updated = await apiUpdateCase(editCaseId, payload);
       const updatedRow = toCaseRow(updated, clientsById);
@@ -7250,19 +7346,21 @@ function Cases() {
               </button>
             </div>
 
-            <div className="processes-search">
-              <input
-                placeholder="Pesquisar por numero, parte ou tribunal"
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-              />
-              <button type="button" className="icon-btn" aria-label="Pesquisar processos">
-                <svg className="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="7" />
-                  <path d="M20 20l-4-4" />
-                </svg>
-              </button>
-            </div>
+            {(view === "list" || view === "detail") && (
+              <div className="processes-search">
+                <input
+                  placeholder="Pesquisar por numero, parte ou tribunal"
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                />
+                <button type="button" className="icon-btn" aria-label="Pesquisar processos">
+                  <svg className="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="M20 20l-4-4" />
+                  </svg>
+                </button>
+              </div>
+            )}
           </div>
           {casesError && <div className="error">{casesError}</div>}
 
@@ -8578,7 +8676,7 @@ function Settings({
   onPreviewProfile: (value: UserProfilePreferences | null) => void;
 }) {
   const runningInTauri = typeof window !== "undefined" && isTauri();
-  const [appVersion, setAppVersion] = useState("0.1.7");
+  const [appVersion, setAppVersion] = useState("0.1.8");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateMessage, setUpdateMessage] = useState("Clique em verificar atualização.");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
@@ -8588,6 +8686,7 @@ function Settings({
   const [isLoadingCalendarConnections, setIsLoadingCalendarConnections] = useState(true);
   const [calendarConnectionsError, setCalendarConnectionsError] = useState("");
   const [calendarInlineMessage, setCalendarInlineMessage] = useState("");
+  const [calendarAuthLink, setCalendarAuthLink] = useState<CalendarAuthLinkState | null>(null);
   const [connectingProvider, setConnectingProvider] = useState<CalendarProvider | null>(null);
   const [syncingProvider, setSyncingProvider] = useState<CalendarProvider | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<CalendarProvider | null>(null);
@@ -8772,8 +8871,10 @@ function Settings({
       if (!event.data || event.data.type !== "newlaw-calendar-oauth") return;
       if (event.data.status === "success") {
         setCalendarInlineMessage("Conta conectada. Você já pode atualizar a agenda.");
+        setCalendarAuthLink(null);
       } else {
         setCalendarConnectionsError("A conexão com o provedor não foi concluída.");
+        setCalendarAuthLink(null);
       }
       setConnectingProvider(null);
       if (pollIntervalRef.current) {
@@ -8785,6 +8886,17 @@ function Settings({
     window.addEventListener("message", handleOauthDone);
     return () => window.removeEventListener("message", handleOauthDone);
   }, []);
+
+  const openCalendarAuthUrl = async (url: string) => {
+    if (runningInTauri) {
+      await openUrl(url);
+      return;
+    }
+    const popup = window.open(url, "_blank", "noopener,noreferrer");
+    if (!popup) {
+      throw new Error("O navegador bloqueou a abertura automática.");
+    }
+  };
 
   const pollConnectionUntilReady = (provider: CalendarProvider) => {
     if (pollIntervalRef.current) {
@@ -8805,9 +8917,10 @@ function Settings({
         }
         setConnectingProvider(null);
         if (connected) {
+          setCalendarAuthLink(null);
           setCalendarInlineMessage("Conta conectada. Você já pode atualizar a agenda.");
         } else {
-          setCalendarInlineMessage("A conexão não foi concluída no tempo esperado.");
+          setCalendarInlineMessage("A conexão não foi concluída no tempo esperado. Se precisar, use o link abaixo para abrir a autenticação novamente.");
         }
       } catch {
         // A interface pode ser atualizada manualmente.
@@ -8818,30 +8931,23 @@ function Settings({
   const handleConnectProvider = async (provider: CalendarProvider) => {
     setConnectingProvider(provider);
     setCalendarConnectionsError("");
-    const popup = window.open("", "newlaw-calendar-oauth", "width=580,height=760");
-    if (popup) {
-      popup.document.title = "NEWLAW - Conectando calendário";
-      popup.document.body.innerHTML = `
-        <div style="font-family:Arial,sans-serif;padding:24px;color:#0f1e3f">
-          <h2 style="margin:0 0 8px 0">Conectando calendário...</h2>
-          <p style="margin:0">Aguarde, estamos abrindo a autenticação.</p>
-        </div>
-      `;
-      popup.focus();
-    }
+    setCalendarInlineMessage("");
+    setCalendarAuthLink(null);
     try {
       const response = await apiStartCalendarConnection(provider);
-      if (popup && !popup.closed) {
-        popup.location.href = response.auth_url;
-      } else {
-        window.location.href = response.auth_url;
+      setCalendarAuthLink({ provider, url: response.auth_url });
+      try {
+        await openCalendarAuthUrl(response.auth_url);
+        setCalendarInlineMessage(
+          `Navegador aberto para concluir o login ${provider === "google" ? "Google" : "Microsoft"}. Se nada acontecer, use o link abaixo.`
+        );
+      } catch {
+        setCalendarInlineMessage(
+          `A autenticação ${provider === "google" ? "Google" : "Microsoft"} está pronta. Use o link abaixo para abrir no navegador.`
+        );
       }
-      setCalendarInlineMessage(`Conclua o login ${provider === "google" ? "Google" : "Microsoft"} na janela aberta.`);
       pollConnectionUntilReady(provider);
     } catch (err) {
-      if (popup && !popup.closed) {
-        popup.close();
-      }
       setConnectingProvider(null);
       setCalendarConnectionsError(extractApiErrorMessage(err, `Não foi possível iniciar a conexão ${provider}.`));
     }
@@ -8866,6 +8972,7 @@ function Settings({
     setCalendarConnectionsError("");
     try {
       await apiDisconnectCalendarConnection(provider);
+      setCalendarAuthLink((current) => (current?.provider === provider ? null : current));
       setCalendarInlineMessage(`Conta ${provider === "google" ? "Google" : "Microsoft"} desconectada.`);
       await loadCalendarConnections();
     } catch (err) {
@@ -9225,6 +9332,34 @@ function Settings({
           </div>
           {calendarConnectionsError && <div className="error">{calendarConnectionsError}</div>}
           {calendarInlineMessage && <div className="agenda-inline">{calendarInlineMessage}</div>}
+          {calendarAuthLink && (
+            <div className="agenda-inline-link">
+              <div className="agenda-inline-link-title">
+                Link da autenticação {calendarAuthLink.provider === "google" ? "Google" : "Microsoft"}
+              </div>
+              <div className="agenda-inline-link-actions">
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={() => void openCalendarAuthUrl(calendarAuthLink.url)}
+                >
+                  Abrir no navegador
+                </button>
+                <a
+                  href={calendarAuthLink.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="agenda-inline-link-url"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    void openCalendarAuthUrl(calendarAuthLink.url);
+                  }}
+                >
+                  {calendarAuthLink.url}
+                </a>
+              </div>
+            </div>
+          )}
           <div className="agenda-connections-list">
             {agendaProviders.map((config) => {
               const status = calendarConnectionMap[config.provider];

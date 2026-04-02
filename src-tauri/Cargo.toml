@@ -1,6 +1,6 @@
 [package]
 name = "newlaw"
-version = "0.1.7"
+version = "0.1.8"
 description = "NEWLAW desktop app"
 authors = ["lucashungaro"]
 edition = "2021"
@@ -11,6 +11,7 @@ tauri-plugin-updater = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tauri-plugin-opener = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
