@@ -68,6 +68,7 @@ import {
   resetTeamMemberPassword as apiResetTeamMemberPassword,
   runPublicationAutomationNow as apiRunPublicationAutomationNow,
   saveAuthSession,
+  me as apiMe,
   updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
 } from "./api";
 import { NavKey } from "./types";
@@ -6338,24 +6339,33 @@ function Publications({ user }: { user: AuthUser | null }) {
         if (!memberEmail) {
           throw new Error("Não foi possível identificar o e-mail do usuário logado.");
         }
-        const members = await apiListTeamMembers();
-        const currentMember = members.find((member) => member.is_active && member.email.trim().toLowerCase() === memberEmail);
-        if (!currentMember) {
-          throw new Error("Nenhum membro ativo da equipe está vinculado ao e-mail logado.");
+        const sessionUser = loadAuthSession()?.user;
+        const parsedSessionOab = splitStoredOab(user?.oab || sessionUser?.oab || "");
+        if (parsedSessionOab.number.length === 6 && parsedSessionOab.uf) {
+          data = await apiSearchPublicationsByOabLocally({
+            oab_number: parsedSessionOab.number,
+            oab_uf: parsedSessionOab.uf,
+            member_name: user?.name || "Membro da equipe",
+            member_email: memberEmail,
+            publication_date: selectedPublicationDate
+          });
+        } else {
+          data = await apiGetTodayPublications(selectedPublicationDate);
         }
-        const parsedOab = splitStoredOab(currentMember.oab || "");
-        if (parsedOab.number.length !== 6 || !parsedOab.uf) {
-          throw new Error("A OAB do seu cadastro precisa ter 6 números e UF.");
-        }
-        data = await apiSearchPublicationsByOabLocally({
-          oab_number: parsedOab.number,
-          oab_uf: parsedOab.uf,
-          member_name: currentMember.full_name || user?.name || "Membro da equipe",
-          member_email: currentMember.email || memberEmail,
-          publication_date: selectedPublicationDate
-        });
       } else {
         data = await apiGetTodayPublications(selectedPublicationDate);
+      }
+      if (data.oab) {
+        const session = loadAuthSession();
+        if (session?.user && session.user.oab !== data.oab) {
+          saveAuthSession({
+            ...session,
+            user: {
+              ...session.user,
+              oab: data.oab
+            }
+          });
+        }
       }
       const formattedDate = formatBrazilDate(data.publication_date);
       setTodayPublicationResult(data);
@@ -10221,6 +10231,28 @@ function App() {
     setToken(session.accessToken);
     setUser(session.user);
   }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const syncAuthenticatedUser = async () => {
+      try {
+        const nextUser = await apiMe();
+        if (cancelled) return;
+        setUser(nextUser);
+        const session = loadAuthSession();
+        if (session?.accessToken === token) {
+          saveAuthSession({ ...session, user: nextUser });
+        }
+      } catch {
+        // Keep the locally restored session when the API is not reachable.
+      }
+    };
+    void syncAuthenticatedUser();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;

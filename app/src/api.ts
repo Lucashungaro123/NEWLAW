@@ -15,6 +15,7 @@ export type AuthUser = {
   id: number;
   email: string;
   name: string;
+  oab?: string | null;
   role: string;
   organization_id?: number | null;
   is_admin?: boolean;

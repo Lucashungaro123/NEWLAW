@@ -283,7 +283,8 @@ def ensure_nav_access(user: User, nav_key: str) -> None:
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem acesso a este módulo")
 
 
-def serialize_auth_user(user: User) -> dict:
+def serialize_auth_user(session: Session, user: User) -> dict:
+    member = get_team_member_for_user(session, user)
     return {
         "id": user.id,
         "email": user.email,
@@ -292,6 +293,7 @@ def serialize_auth_user(user: User) -> dict:
         "organization_id": user.organization_id,
         "is_admin": bool(user.is_team_admin),
         "allowed_nav_keys": get_effective_user_nav_keys(user),
+        "oab": member.oab if member and member.is_active else None,
     }
 
 
@@ -3998,13 +4000,16 @@ def login(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user=serialize_auth_user(user),
+        user=serialize_auth_user(session, user),
     )
 
 
 @app.get("/auth/me")
-def auth_me(user: Annotated[User, Depends(get_current_user)]) -> dict:
-    return serialize_auth_user(user)
+def auth_me(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict:
+    return serialize_auth_user(session, user)
 
 
 @app.post("/auth/refresh", response_model=TokenPairResponse)
@@ -4045,7 +4050,7 @@ def refresh_token(
         access_token=access_token,
         refresh_token=new_refresh_token,
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user=serialize_auth_user(user),
+        user=serialize_auth_user(session, user),
     )
 
 
@@ -5427,7 +5432,7 @@ def get_today_publications_for_logged_member(
     if not member or not member.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Nenhum membro ativo da equipe está vinculado ao e-mail logado.",
+            detail="Nenhum membro ativo da equipe com OAB cadastrada está vinculado ao e-mail logado.",
         )
 
     parsed_oab = parse_team_member_oab(member.oab)
