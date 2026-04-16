@@ -208,6 +208,28 @@ class PublicationRecord(TimestampMixin, table=True):
     document_storage_path: Optional[str] = None
 
 
+class PublicationHandling(TimestampMixin, table=True):
+    __table_args__ = (UniqueConstraint("organization_id", "source_key", name="uq_publication_handling_org_source"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: int = Field(foreign_key="organization.id", index=True)
+    source_key: str = Field(index=True)
+    title: str
+    publication_date: datetime = Field(index=True)
+    process_number_snapshot: Optional[str] = None
+    case_id: Optional[int] = Field(default=None, index=True)
+    wallet_id: Optional[int] = Field(default=None, index=True)
+    detail_url: Optional[str] = None
+    summary: Optional[str] = None
+    status: str = Field(default="pending", index=True, description="task_created|read_no_action")
+    handled_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    handled_at: Optional[datetime] = Field(default=None, index=True)
+    task_title: Optional[str] = None
+    task_details: Optional[str] = None
+    task_due_at: Optional[datetime] = Field(default=None, index=True)
+    task_assignees: Optional[str] = None
+
+
 class Template(TimestampMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: Optional[int] = Field(default=None, foreign_key="organization.id")

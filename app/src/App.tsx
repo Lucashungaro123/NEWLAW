@@ -16,6 +16,8 @@ import {
   CalendarProvider,
   InternalAgendaEventType,
   LOCAL_API_BASE_URL,
+  PublicationContextItem,
+  PublicationHandlingStatus,
   PublicationAutomationRecord,
   PublicationAutomationSettings,
   TodayPublicationItem,
@@ -37,9 +39,11 @@ import {
   deleteClient as apiDeleteClient,
   deleteFinanceEntry as apiDeleteFinanceEntry,
   disconnectCalendarConnection as apiDisconnectCalendarConnection,
+  getPublicationContext as apiGetPublicationContext,
   getTeamMembersCapacity as apiGetTeamMembersCapacity,
   getPublicationAutomationSettings as apiGetPublicationAutomationSettings,
   getTodayPublications as apiGetTodayPublications,
+  handlePublication as apiHandlePublication,
   searchPublicationsByOabLocally as apiSearchPublicationsByOabLocally,
   listAgendaEvents as apiListAgendaEvents,
   listCalendarConnections as apiListCalendarConnections,
@@ -112,6 +116,16 @@ const textScaleOptions = [
   { label: "Maior", value: 1.15 },
   { label: "Grande", value: 1.2 }
 ] as const;
+
+const filesAllowedUploadExtensions = [".pdf", ".doc", ".docx"];
+const filesAllowedUploadMimeTypes = [
+  "application/pdf",
+  "application/x-pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/zip",
+  "application/octet-stream"
+];
 
 const brazilUfOptions = [
   "AC",
@@ -3591,7 +3605,7 @@ function FilesUploadModal({
           </button>
         </div>
 
-        <div className="modal-note">Envie documentos em PDF com até 10 MB e escolha exatamente em qual pasta eles devem cair.</div>
+        <div className="modal-note">Envie documentos em PDF ou Word com até 10 MB e escolha exatamente em qual pasta eles devem cair.</div>
 
         <div className="modal-grid files-modal-grid">
           <div className="field span-2">
@@ -3623,8 +3637,13 @@ function FilesUploadModal({
           </div>
 
           <div className="field span-2">
-            <label>Arquivo PDF</label>
-            <input key={inputKey} type="file" accept=".pdf,application/pdf" onChange={onFileChange} />
+            <label>Arquivo</label>
+            <input
+              key={inputKey}
+              type="file"
+              accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              onChange={onFileChange}
+            />
           </div>
         </div>
 
@@ -3647,7 +3666,7 @@ function FilesUploadModal({
             Cancelar
           </button>
           <button className="btn" type="button" onClick={onSave} disabled={!selectedFile || saving}>
-            {saving ? "Enviando..." : "Enviar PDF"}
+            {saving ? "Enviando..." : "Enviar arquivo"}
           </button>
         </div>
       </div>
@@ -3983,11 +4002,12 @@ function Files() {
       setSelectedUploadFile(null);
       return;
     }
-    const isPdfByName = nextFile.name.toLowerCase().endsWith(".pdf");
-    const isPdfByType = !nextFile.type || nextFile.type === "application/pdf" || nextFile.type === "application/octet-stream";
-    if (!isPdfByName || !isPdfByType) {
+    const normalizedName = nextFile.name.toLowerCase();
+    const hasAllowedExtension = filesAllowedUploadExtensions.some((extension) => normalizedName.endsWith(extension));
+    const hasAllowedType = !nextFile.type || filesAllowedUploadMimeTypes.includes(nextFile.type);
+    if (!hasAllowedExtension || !hasAllowedType) {
       setSelectedUploadFile(null);
-      setUploadError("Envie apenas arquivos PDF.");
+      setUploadError("Envie apenas arquivos PDF ou Word.");
       event.target.value = "";
       return;
     }
@@ -4062,7 +4082,7 @@ function Files() {
       return;
     }
     if (!selectedUploadFile) {
-      setUploadError("Selecione um PDF para enviar.");
+      setUploadError("Selecione um arquivo PDF ou Word para enviar.");
       return;
     }
     setIsUploadingDocument(true);
@@ -4224,7 +4244,7 @@ function Files() {
                 {selectedClientDetails.city !== "-" && <span className="files-overview-meta-item">{selectedClientDetails.city}</span>}
                 <span className="files-chip">{selectedClientTree.kind === "PF" ? "Pessoa física" : "Pessoa jurídica"}</span>
                 <span className="files-chip">{selectedClientTree.cases.length} processo{selectedClientTree.cases.length === 1 ? "" : "s"}</span>
-                <span className="files-chip">{documents.length} PDF{documents.length === 1 ? "" : "s"}</span>
+                <span className="files-chip">{documents.length} arquivo{documents.length === 1 ? "" : "s"}</span>
               </div>
             ) : (
               <>
@@ -5967,14 +5987,6 @@ function Home() {
   );
 }
 
-type Publication = {
-  id: number;
-  title: string;
-  publicationDate: string;
-  deadlineDays: number;
-  deadlineDate: string;
-};
-
 const weekDays = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"];
 
 const parseLocalDate = (value: string) => {
@@ -6000,50 +6012,317 @@ const splitStoredOab = (value: string) => {
   };
 };
 
+type PublicationTaskFormState = {
+  title: string;
+  details: string;
+  dueDate: string;
+  responsibleEmails: string[];
+};
+
+type PublicationSummaryFilterKey =
+  | "pending_analysis"
+  | "open_deadlines"
+  | "due_today"
+  | "due_tomorrow"
+  | "due_within_five_days"
+  | "expired_deadlines";
+
+type PublicationFallbackContextRecord = PublicationContextItem;
+
+const publicationSourcePrefix = "djen_cnj";
+const publicationFallbackStoragePrefix = "newlaw.publication-handling";
+
+const buildPublicationSourceKey = (publication: TodayPublicationItem) => {
+  const identifier = (publication.hash || String(publication.id || "")).trim();
+  return `${publicationSourcePrefix}:${identifier}`;
+};
+
+const getPublicationFallbackStorageKey = (user: AuthUser | null) => {
+  const identity =
+    user?.organization_id != null
+      ? `org-${user.organization_id}`
+      : user?.id != null
+        ? `user-${user.id}`
+        : user?.email?.trim().toLowerCase() || "anonymous";
+  return `${publicationFallbackStoragePrefix}:${identity}`;
+};
+
+const loadPublicationFallbackContextMap = (user: AuthUser | null): Record<string, PublicationFallbackContextRecord> => {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(getPublicationFallbackStorageKey(user));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, PublicationFallbackContextRecord>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const savePublicationFallbackContextMap = (
+  user: AuthUser | null,
+  value: Record<string, PublicationFallbackContextRecord>
+) => {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(getPublicationFallbackStorageKey(user), JSON.stringify(value));
+};
+
+const normalizeCaseDigits = (value?: string | null) => (value || "").replace(/\D/g, "");
+
+const buildPublicationReference = (processNumber?: string | null) => {
+  const normalized = processNumber ? formatCaseNumber(processNumber) : "";
+  return normalized ? `[Publicação] Processo ${normalized}` : "[Publicação]";
+};
+
+const getAgendaDateKey = (value: string) => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value.slice(0, 10);
+  return formatIsoDate(new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()));
+};
+
+const normalizeLooseText = (value?: string | null) =>
+  (value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+const isPublicationAgendaEvent = (item: AgendaItem) =>
+  item.created_via === "publication" || Boolean(item.publication_source_key) || (item.reference || "").startsWith("[Publicação]");
+
+const getPublicationHandlingLabel = (status?: PublicationHandlingStatus | null) => {
+  if (status === "task_created") return "Providência registrada";
+  if (status === "read_no_action") return "Lida sem providências";
+  return "";
+};
+
+const getPublicationAgendaReferenceLabel = (item: AgendaItem) => {
+  const reference = (item.reference || "").replace(/^\[Publicação\]\s*/, "").trim();
+  if (item.publication_process_number) return `Processo ${item.publication_process_number}`;
+  return reference || "Publicação";
+};
+
+const isPublicationApiUnavailableError = (err: unknown) => {
+  const status = (err as { response?: { status?: number } }).response?.status;
+  return status === 404 || status === 405;
+};
+
+function PublicationTaskModal({
+  open,
+  publication,
+  context,
+  user,
+  form,
+  busy,
+  errorMessage,
+  onClose,
+  onSubmit,
+  onChangeField,
+  onToggleResponsible
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  context: PublicationContextItem | null;
+  user: AuthUser | null;
+  form: PublicationTaskFormState;
+  busy: boolean;
+  errorMessage: string;
+  onClose: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+  onChangeField: (field: keyof PublicationTaskFormState, value: string) => void;
+  onToggleResponsible: (email: string) => void;
+}) {
+  if (!open || !publication) return null;
+
+  const currentUserEmail = user?.email?.trim().toLowerCase() || "";
+  const additionalResponsibles = (context?.allowed_responsibles || []).filter(
+    (item) => item.email.trim().toLowerCase() !== currentUserEmail
+  );
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-task-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Gerar tarefa</h2>
+            <div className="publication-meta">
+              {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        {context?.warning && <div className="publication-warning publication-warning-modal">{context.warning}</div>}
+        {errorMessage && <div className="error">{errorMessage}</div>}
+
+        <form onSubmit={onSubmit}>
+          <div className="modal-grid publication-task-grid">
+            <div className="field">
+              <label>Título *</label>
+              <input value={form.title} onChange={(event) => onChangeField("title", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Data de entrega *</label>
+              <input type="date" value={form.dueDate} onChange={(event) => onChangeField("dueDate", event.target.value)} />
+            </div>
+            <div className="field span-2">
+              <label>Detalhamento</label>
+              <textarea
+                value={form.details}
+                onChange={(event) => onChangeField("details", event.target.value)}
+                placeholder="Descreva o que precisa ser feito."
+              />
+            </div>
+            <div className="field span-2">
+              <label>Responsáveis</label>
+              <div className="publication-task-assignees-note">
+                Seu login será incluído automaticamente: <strong>{user?.name || user?.email || "Usuário atual"}</strong>
+              </div>
+              {context?.wallet_name && <div className="publication-meta">Carteira vinculada: {context.wallet_name}</div>}
+              {context?.allow_additional_responsibles && additionalResponsibles.length > 0 ? (
+                <div className="publication-task-assignee-list">
+                  {additionalResponsibles.map((responsible) => {
+                    const checked = form.responsibleEmails.includes(responsible.email);
+                    return (
+                      <label key={responsible.email} className="publication-task-assignee-option">
+                        <input type="checkbox" checked={checked} onChange={() => onToggleResponsible(responsible.email)} />
+                        <div>
+                          <div className="publication-task-assignee-name">{responsible.name}</div>
+                          <div className="publication-task-assignee-email">{responsible.email}</div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="publication-task-assignees-note">
+                  Sem outros responsáveis disponíveis para esta publicação. A tarefa será criada apenas no seu calendário.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="modal-actions">
+            <button className="btn ghost" type="button" onClick={onClose} disabled={busy}>
+              Cancelar
+            </button>
+            <button className="btn" type="submit" disabled={!form.title.trim() || !form.dueDate || busy}>
+              {busy ? "Gerando..." : "Salvar tarefa"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function Publications({ user }: { user: AuthUser | null }) {
-  const [publications, setPublications] = useState<Publication[]>([]);
-  const [form, setForm] = useState({ title: "", publicationDate: "", deadlineDays: "" });
   const [todayPublicationResult, setTodayPublicationResult] = useState<TodayPublicationsResponse | null>(null);
+  const [publicationContextMap, setPublicationContextMap] = useState<Record<string, PublicationContextItem>>({});
   const [isLoadingTodayPublications, setIsLoadingTodayPublications] = useState(false);
+  const [isLoadingPublicationContext, setIsLoadingPublicationContext] = useState(false);
   const [todayPublicationsError, setTodayPublicationsError] = useState("");
   const [todayPublicationsInlineMessage, setTodayPublicationsInlineMessage] = useState("");
   const [selectedPublicationDate, setSelectedPublicationDate] = useState(() => formatIsoDate(new Date()));
-  const runningInTauri = typeof window !== "undefined" && isTauri();
-  const [month, setMonth] = useState(() => {
-    const today = new Date();
-    return new Date(today.getFullYear(), today.getMonth(), 1);
+  const [publicationAgendaItems, setPublicationAgendaItems] = useState<AgendaItem[]>([]);
+  const [isLoadingPublicationAgenda, setIsLoadingPublicationAgenda] = useState(false);
+  const [publicationAgendaError, setPublicationAgendaError] = useState("");
+  const [activePublication, setActivePublication] = useState<TodayPublicationItem | null>(null);
+  const [activePublicationSummaryFilter, setActivePublicationSummaryFilter] = useState<PublicationSummaryFilterKey | null>(null);
+  const [publicationTaskForm, setPublicationTaskForm] = useState<PublicationTaskFormState>({
+    title: "",
+    details: "",
+    dueDate: formatIsoDate(new Date()),
+    responsibleEmails: []
   });
+  const [publicationTaskError, setPublicationTaskError] = useState("");
+  const [processingPublicationSourceKey, setProcessingPublicationSourceKey] = useState("");
+  const runningInTauri = typeof window !== "undefined" && isTauri();
+  const publicationResultsRef = useRef<HTMLDivElement | null>(null);
 
-  const deadlinePreview = useMemo(() => {
-    if (!form.publicationDate || form.deadlineDays === "") return "";
-    const days = Number(form.deadlineDays);
-    if (Number.isNaN(days)) return "";
-    const baseDate = parseLocalDate(form.publicationDate);
-    const deadline = new Date(baseDate);
-    deadline.setDate(deadline.getDate() + days);
-    return formatIsoDate(deadline);
-  }, [form.deadlineDays, form.publicationDate]);
+  const buildPublicationContextFallback = async (items: TodayPublicationItem[]) => {
+    const storedMap = loadPublicationFallbackContextMap(user);
+    if (items.length === 0) return {};
 
-  const deadlinesByDate = useMemo(() => {
-    return publications.reduce<Record<string, Publication[]>>((acc, publication) => {
-      acc[publication.deadlineDate] = acc[publication.deadlineDate] || [];
-      acc[publication.deadlineDate].push(publication);
+    const [cases, wallets] = await Promise.all([apiListCases(), apiListWallets().catch(() => [])]);
+    const walletMap = new Map<number, ApiWallet>();
+    wallets.forEach((wallet) => walletMap.set(wallet.id, wallet));
+
+    return items.reduce<Record<string, PublicationContextItem>>((acc, publication) => {
+      const sourceKey = buildPublicationSourceKey(publication);
+      const matchedCase =
+        cases.find((entry) => normalizeCaseDigits(entry.number) === normalizeCaseDigits(publication.process_number)) || null;
+      const wallet = matchedCase?.wallet_id ? walletMap.get(matchedCase.wallet_id) || null : null;
+      const allowedResponsibles =
+        wallet?.team_members
+          ?.filter((member) => member.is_active)
+          .map((member) => ({
+            name: member.full_name,
+            email: member.email.trim().toLowerCase()
+          })) || [];
+
+      let warning = "";
+      if (!matchedCase) {
+        warning = "Processo não cadastrado. Você pode gerar apenas um evento no seu calendário.";
+      } else if (!wallet) {
+        warning = "Processo cadastrado sem carteira vinculada. A tarefa ficará apenas no seu calendário.";
+      } else if (allowedResponsibles.length === 0) {
+        warning = "Nenhum outro responsável com acesso à carteira possui login ativo.";
+      }
+
+      const stored = storedMap[sourceKey];
+      acc[sourceKey] = {
+        source_key: sourceKey,
+        status: stored?.status,
+        handled_at: stored?.handled_at,
+        has_registered_case: Boolean(matchedCase),
+        case_id: matchedCase?.id ?? null,
+        case_number: matchedCase?.number || publication.process_number || null,
+        wallet_id: wallet?.id ?? null,
+        wallet_name: wallet?.name || null,
+        allow_additional_responsibles: Boolean(wallet && allowedResponsibles.length > 0),
+        allowed_responsibles: allowedResponsibles,
+        warning
+      };
       return acc;
     }, {});
-  }, [publications]);
+  };
 
-  const orderedDeadlines = useMemo(() => {
-    return [...publications].sort((a, b) => a.deadlineDate.localeCompare(b.deadlineDate));
-  }, [publications]);
+  const persistPublicationFallbackContext = (sourceKey: string, nextContext: PublicationContextItem) => {
+    const current = loadPublicationFallbackContextMap(user);
+    current[sourceKey] = nextContext;
+    savePublicationFallbackContextMap(user, current);
+  };
+
+  const loadPublicationAgenda = async () => {
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 30);
+    const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 90);
+    setIsLoadingPublicationAgenda(true);
+    setPublicationAgendaError("");
+    try {
+      const data = await apiListAgendaEvents({
+        start: `${formatIsoDate(start)}T00:00:00`,
+        end: `${formatIsoDate(end)}T23:59:59`
+      });
+      setPublicationAgendaItems(data);
+    } catch (err) {
+      setPublicationAgendaError(extractApiErrorMessage(err, "Não foi possível carregar os indicadores de publicações."));
+    } finally {
+      setIsLoadingPublicationAgenda(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadPublicationAgenda();
+  }, []);
 
   const handlePublicationSearchDateChange = (value: string) => {
     if (!value) return;
     setSelectedPublicationDate(value);
-    const nextDate = parseLocalDate(value);
-    setMonth(new Date(nextDate.getFullYear(), nextDate.getMonth(), 1));
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
-    setTodayPublicationResult(null);
   };
 
   const handleLoadTodayPublications = async (event?: React.FormEvent) => {
@@ -6051,6 +6330,7 @@ function Publications({ user }: { user: AuthUser | null }) {
     setIsLoadingTodayPublications(true);
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
+    setPublicationTaskError("");
     try {
       let data: TodayPublicationsResponse;
       if (runningInTauri && baseURL !== LOCAL_API_BASE_URL) {
@@ -6079,170 +6359,461 @@ function Publications({ user }: { user: AuthUser | null }) {
       }
       const formattedDate = formatBrazilDate(data.publication_date);
       setTodayPublicationResult(data);
+      if (data.items.length > 0) {
+        setIsLoadingPublicationContext(true);
+        try {
+          const contextResponse = await apiGetPublicationContext({
+            items: data.items.map((publication) => ({
+              source_key: buildPublicationSourceKey(publication),
+              process_number: publication.process_number
+            }))
+          });
+          const storedContextMap = loadPublicationFallbackContextMap(user);
+          setPublicationContextMap(
+            contextResponse.items.reduce<Record<string, PublicationContextItem>>((acc, item) => {
+              const stored = storedContextMap[item.source_key];
+              acc[item.source_key] = item;
+              if (stored?.status) {
+                acc[item.source_key] = {
+                  ...item,
+                  status: stored.status,
+                  handled_at: stored.handled_at
+                };
+              }
+              return acc;
+            }, {})
+          );
+        } catch (err) {
+          if (isPublicationApiUnavailableError(err)) {
+            setPublicationContextMap(await buildPublicationContextFallback(data.items));
+          } else {
+            setPublicationContextMap({});
+          }
+        } finally {
+          setIsLoadingPublicationContext(false);
+        }
+      } else {
+        setPublicationContextMap({});
+      }
       setTodayPublicationsInlineMessage(
         data.count > 0
           ? `${data.count} publicação(ões) encontrada(s) em ${formattedDate} para ${data.oab}.`
           : `Nenhuma publicação encontrada em ${formattedDate} para ${data.oab}.`
       );
     } catch (err) {
+      setPublicationContextMap({});
       setTodayPublicationsError(extractApiErrorMessage(err, "Não foi possível carregar as publicações da data selecionada."));
     } finally {
+      setIsLoadingPublicationContext(false);
       setIsLoadingTodayPublications(false);
     }
   };
 
-  const handleAddPublication = (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!form.title.trim() || !form.publicationDate || !deadlinePreview) return;
-    const deadlineDays = Number(form.deadlineDays);
-    if (Number.isNaN(deadlineDays)) return;
-    const deadlineMonth = parseLocalDate(deadlinePreview);
-    setPublications((prev) => [
-      {
-        id: Date.now(),
-        title: form.title.trim(),
-        publicationDate: form.publicationDate,
-        deadlineDays,
-        deadlineDate: deadlinePreview
-      },
-      ...prev
-    ]);
-    setMonth(new Date(deadlineMonth.getFullYear(), deadlineMonth.getMonth(), 1));
-    setForm((prev) => ({ ...prev, title: "" }));
+  const openPublicationTaskModal = (publication: TodayPublicationItem) => {
+    setActivePublication(publication);
+    setPublicationTaskError("");
+    setPublicationTaskForm({
+      title: publication.process_number ? `Providência do processo ${publication.process_number}` : "Providência da publicação",
+      details: "",
+      dueDate: selectedPublicationDate,
+      responsibleEmails: []
+    });
   };
 
-  const monthLabel = month.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
-  const monthTitle = monthLabel.charAt(0).toUpperCase() + monthLabel.slice(1);
-  const year = month.getFullYear();
-  const monthIndex = month.getMonth();
-  const firstDay = new Date(year, monthIndex, 1);
-  const startOffset = (firstDay.getDay() + 6) % 7;
-  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
-  const totalCells = Math.ceil((startOffset + daysInMonth) / 7) * 7;
+  const closePublicationTaskModal = () => {
+    if (processingPublicationSourceKey) return;
+    setActivePublication(null);
+    setPublicationTaskError("");
+  };
+
+  const handleTogglePublicationResponsible = (email: string) => {
+    setPublicationTaskForm((prev) => ({
+      ...prev,
+      responsibleEmails: prev.responsibleEmails.includes(email)
+        ? prev.responsibleEmails.filter((item) => item !== email)
+        : [...prev.responsibleEmails, email]
+    }));
+  };
+
+  const handlePublicationTaskFormField = (field: keyof PublicationTaskFormState, value: string) => {
+    setPublicationTaskForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const mergePublicationContext = (sourceKey: string, patch: Partial<PublicationContextItem>) => {
+    setPublicationContextMap((prev) => {
+      const current = prev[sourceKey];
+      return {
+        ...prev,
+        [sourceKey]: {
+          source_key: sourceKey,
+          status: current?.status,
+          handled_at: current?.handled_at,
+          has_registered_case: current?.has_registered_case ?? false,
+          case_id: current?.case_id ?? null,
+          case_number: current?.case_number ?? null,
+          wallet_id: current?.wallet_id ?? null,
+          wallet_name: current?.wallet_name ?? null,
+          allow_additional_responsibles: current?.allow_additional_responsibles ?? false,
+          allowed_responsibles: current?.allowed_responsibles ?? [],
+          warning: current?.warning ?? null,
+          ...patch
+        }
+      };
+    });
+  };
+
+  const mergePublicationStatus = (sourceKey: string, status: PublicationHandlingStatus, handledAt: string) => {
+    mergePublicationContext(sourceKey, {
+      status,
+      handled_at: handledAt
+    });
+  };
+
+  const handleSubmitPublicationTask = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!activePublication) return;
+    const sourceKey = buildPublicationSourceKey(activePublication);
+    setProcessingPublicationSourceKey(sourceKey);
+    setPublicationTaskError("");
+    setTodayPublicationsError("");
+    try {
+      const result = await apiHandlePublication({
+        source_key: sourceKey,
+        publication_title: activePublication.title,
+        publication_date: activePublication.publication_date,
+        process_number: activePublication.process_number || undefined,
+        detail_url: activePublication.detail_url,
+        summary: activePublication.summary || undefined,
+        action: "task_created",
+        task_title: publicationTaskForm.title.trim(),
+        task_details: publicationTaskForm.details.trim() || undefined,
+        due_date: publicationTaskForm.dueDate,
+        responsible_emails: publicationTaskForm.responsibleEmails
+      });
+      mergePublicationStatus(sourceKey, result.status, result.handled_at);
+      setTodayPublicationsInlineMessage(result.message);
+      setActivePublication(null);
+      await loadPublicationAgenda();
+    } catch (err) {
+      if (isPublicationApiUnavailableError(err)) {
+        try {
+          const fallbackContext =
+            publicationContextMap[sourceKey] ||
+            (await buildPublicationContextFallback([activePublication]))[sourceKey] || {
+              source_key: sourceKey,
+              has_registered_case: false,
+              allow_additional_responsibles: false,
+              allowed_responsibles: []
+            };
+
+          const responsibleMap = new Map(
+            (fallbackContext.allowed_responsibles || []).map((item) => [item.email.trim().toLowerCase(), item.name])
+          );
+          const selectedEmails = publicationTaskForm.responsibleEmails.map((item) => item.trim().toLowerCase()).filter(Boolean);
+
+          if (!fallbackContext.has_registered_case && selectedEmails.length > 0) {
+            throw new Error("Processo não cadastrado. Não é possível adicionar outros responsáveis.");
+          }
+
+          const invalidEmail = selectedEmails.find((email) => !responsibleMap.has(email));
+          if (invalidEmail) {
+            throw new Error("Os responsáveis adicionais precisam ter acesso à carteira do processo.");
+          }
+
+          const assigneeLabels = [user?.name || user?.email || "Usuário atual", ...selectedEmails.map((email) => responsibleMap.get(email) || email)];
+          await apiCreateAgendaDeadline({
+            title: publicationTaskForm.title.trim(),
+            due_date: publicationTaskForm.dueDate,
+            reference: buildPublicationReference(activePublication.process_number),
+            notes: publicationTaskForm.details.trim() || undefined,
+            event_type: "deadline",
+            assignees: assigneeLabels.join("; "),
+            is_all_day: true
+          });
+
+          const handledAt = new Date().toISOString();
+          const nextContext: PublicationContextItem = {
+            ...fallbackContext,
+            source_key: sourceKey,
+            status: "task_created",
+            handled_at: handledAt
+          };
+          persistPublicationFallbackContext(sourceKey, nextContext);
+          mergePublicationContext(sourceKey, nextContext);
+          setTodayPublicationsInlineMessage("Tarefa criada com sucesso.");
+          setActivePublication(null);
+          await loadPublicationAgenda();
+        } catch (fallbackErr) {
+          setPublicationTaskError(extractApiErrorMessage(fallbackErr, "Não foi possível gerar a tarefa da publicação."));
+        }
+      } else {
+        setPublicationTaskError(extractApiErrorMessage(err, "Não foi possível gerar a tarefa da publicação."));
+      }
+    } finally {
+      setProcessingPublicationSourceKey("");
+    }
+  };
+
+  const handleMarkPublicationAsRead = async (publication: TodayPublicationItem) => {
+    const sourceKey = buildPublicationSourceKey(publication);
+    setProcessingPublicationSourceKey(sourceKey);
+    setTodayPublicationsError("");
+    setTodayPublicationsInlineMessage("");
+    try {
+      const result = await apiHandlePublication({
+        source_key: sourceKey,
+        publication_title: publication.title,
+        publication_date: publication.publication_date,
+        process_number: publication.process_number || undefined,
+        detail_url: publication.detail_url,
+        summary: publication.summary || undefined,
+        action: "read_no_action"
+      });
+      mergePublicationStatus(sourceKey, result.status, result.handled_at);
+      setTodayPublicationsInlineMessage(result.message);
+    } catch (err) {
+      if (isPublicationApiUnavailableError(err)) {
+        try {
+          const fallbackContext =
+            publicationContextMap[sourceKey] ||
+            (await buildPublicationContextFallback([publication]))[sourceKey] || {
+              source_key: sourceKey,
+              has_registered_case: false,
+              allow_additional_responsibles: false,
+              allowed_responsibles: []
+            };
+          const handledAt = new Date().toISOString();
+          const nextContext: PublicationContextItem = {
+            ...fallbackContext,
+            source_key: sourceKey,
+            status: "read_no_action",
+            handled_at: handledAt
+          };
+          persistPublicationFallbackContext(sourceKey, nextContext);
+          mergePublicationContext(sourceKey, nextContext);
+          setTodayPublicationsInlineMessage("Publicação marcada como lida sem providências.");
+        } catch (fallbackErr) {
+          setTodayPublicationsError(extractApiErrorMessage(fallbackErr, "Não foi possível registrar a leitura da publicação."));
+        }
+      } else {
+        setTodayPublicationsError(extractApiErrorMessage(err, "Não foi possível registrar a leitura da publicação."));
+      }
+    } finally {
+      setProcessingPublicationSourceKey("");
+    }
+  };
+
+  const activePublicationContext = activePublication ? publicationContextMap[buildPublicationSourceKey(activePublication)] || null : null;
   const todayKey = formatIsoDate(new Date());
+  const tomorrowKey = formatIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1));
+  const fiveDaysKey = formatIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 5));
+  const publicationDeadlineItems = useMemo(
+    () => publicationAgendaItems.filter((item) => item.kind === "deadline" && isPublicationAgendaEvent(item)),
+    [publicationAgendaItems]
+  );
+  const publicationDeadlinesBySourceKey = useMemo(() => {
+    return publicationDeadlineItems.reduce<Record<string, AgendaItem[]>>((acc, item) => {
+      const sourceKey = item.publication_source_key?.trim();
+      if (!sourceKey) return acc;
+      acc[sourceKey] = acc[sourceKey] || [];
+      acc[sourceKey].push(item);
+      return acc;
+    }, {});
+  }, [publicationDeadlineItems]);
+  const publicationDeadlinesByProcessNumber = useMemo(() => {
+    return publicationDeadlineItems.reduce<Record<string, AgendaItem[]>>((acc, item) => {
+      const processKey = normalizeCaseDigits(item.publication_process_number || item.reference || "");
+      if (!processKey) return acc;
+      acc[processKey] = acc[processKey] || [];
+      acc[processKey].push(item);
+      return acc;
+    }, {});
+  }, [publicationDeadlineItems]);
+  const publicationEntries = useMemo(() => {
+    const items = todayPublicationResult?.items || [];
+    return items.map((publication) => {
+      const sourceKey = buildPublicationSourceKey(publication);
+      const deadlineMap = new Map<string, AgendaItem>();
+
+      (publicationDeadlinesBySourceKey[sourceKey] || []).forEach((item) => {
+        deadlineMap.set(item.id, item);
+      });
+
+      const processKey = normalizeCaseDigits(publication.process_number);
+      if (processKey) {
+        (publicationDeadlinesByProcessNumber[processKey] || []).forEach((item) => {
+          deadlineMap.set(item.id, item);
+        });
+      }
+
+      return {
+        publication,
+        sourceKey,
+        context: publicationContextMap[sourceKey] || null,
+        deadlineItems: Array.from(deadlineMap.values())
+      };
+    });
+  }, [todayPublicationResult, publicationContextMap, publicationDeadlinesByProcessNumber, publicationDeadlinesBySourceKey]);
+  const hearingItems = useMemo(() => {
+    return publicationAgendaItems.filter((item) => {
+      const haystack = normalizeLooseText(`${item.title} ${item.reference || ""} ${item.description || ""}`);
+      return item.event_type === "hearing" || (item.kind === "meeting" && haystack.includes("audiencia"));
+    });
+  }, [publicationAgendaItems]);
+  const futureHearingItems = useMemo(() => {
+    return [...hearingItems]
+      .filter((item) => getAgendaDateKey(item.starts_at) >= todayKey)
+      .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+  }, [hearingItems, todayKey]);
+  const matchesPublicationSummaryFilter = (entry: (typeof publicationEntries)[number], filterKey: PublicationSummaryFilterKey) => {
+    const dueDateKeys = entry.deadlineItems.map((item) => getAgendaDateKey(item.starts_at));
+    if (filterKey === "pending_analysis") return !entry.context?.status;
+    if (filterKey === "open_deadlines") return dueDateKeys.some((dateKey) => dateKey >= todayKey);
+    if (filterKey === "due_today") return dueDateKeys.some((dateKey) => dateKey === todayKey);
+    if (filterKey === "due_tomorrow") return dueDateKeys.some((dateKey) => dateKey === tomorrowKey);
+    if (filterKey === "due_within_five_days") return dueDateKeys.some((dateKey) => dateKey >= todayKey && dateKey <= fiveDaysKey);
+    return entry.context?.status === "read_no_action" || dueDateKeys.some((dateKey) => dateKey < todayKey);
+  };
+  const filteredPublicationEntries = useMemo(() => {
+    if (!activePublicationSummaryFilter) return publicationEntries;
+    return publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, activePublicationSummaryFilter));
+  }, [activePublicationSummaryFilter, publicationEntries]);
+  const citationSummaryRows: { key: PublicationSummaryFilterKey; label: string; value: number }[] = [
+    {
+      key: "pending_analysis",
+      label: "Pendentes para análise",
+      value: publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "pending_analysis")).length
+    },
+    {
+      key: "open_deadlines",
+      label: "Prazos em aberto",
+      value: publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "open_deadlines")).length
+    },
+    {
+      key: "due_tomorrow",
+      label: "Vencendo amanhã",
+      value: publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "due_tomorrow")).length
+    },
+    {
+      key: "due_within_five_days",
+      label: "Vencendo 5 dias",
+      value: publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "due_within_five_days")).length
+    },
+    {
+      key: "expired_deadlines",
+      label: "Decursos de prazo",
+      value: publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "expired_deadlines")).length
+    }
+  ];
+  const dueTodayCount = publicationEntries.filter((entry) => matchesPublicationSummaryFilter(entry, "due_today")).length;
+  const hearingSummaryRows = [
+    { label: "Audiências futuras", value: futureHearingItems.length },
+    {
+      label: "Audiências futuras de conciliação",
+      value: futureHearingItems.filter((item) =>
+        normalizeLooseText(`${item.title} ${item.reference || ""} ${item.description || ""}`).includes("concil")
+      ).length
+    }
+  ];
+  const activePublicationSummaryLabel =
+    citationSummaryRows.find((row) => row.key === activePublicationSummaryFilter)?.label ||
+    (activePublicationSummaryFilter === "due_today" ? "Vencendo hoje" : "");
+
+  const handlePublicationSummaryFilterClick = (filterKey: PublicationSummaryFilterKey) => {
+    setActivePublicationSummaryFilter((current) => (current === filterKey ? null : filterKey));
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        publicationResultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    }
+  };
 
   return (
     <div className="content-card page-card publications-page">
       <div className="page-header">
         <div>
           <div className="eyebrow">Publicações</div>
-          <h1 className="page-title">Calendário de prazos</h1>
-          <div className="page-subtitle">Cadastre publicações e acompanhe automaticamente os prazos no calendário.</div>
+          <h1 className="page-title">Central de publicações</h1>
         </div>
         <div className="pill">Publicações</div>
       </div>
 
-      <div className="publications-grid">
-        <div className="publication-card">
-          <div className="publication-title">Nova publicação</div>
-          <form className="publication-form" onSubmit={handleAddPublication}>
-            <div className="field">
-              <label>Título</label>
-              <input
-                value={form.title}
-                onChange={(event) => setForm((prev) => ({ ...prev, title: event.target.value }))}
-                placeholder="Ex: Intimação processo 1234"
-              />
-            </div>
-            <div className="field">
-              <label>Data da publicação</label>
-              <input
-                type="date"
-                value={form.publicationDate}
-                onChange={(event) => setForm((prev) => ({ ...prev, publicationDate: event.target.value }))}
-              />
-            </div>
-            <div className="field">
-              <label>Prazo (dias)</label>
-              <input
-                type="number"
-                min={0}
-                value={form.deadlineDays}
-                onChange={(event) => setForm((prev) => ({ ...prev, deadlineDays: event.target.value }))}
-                placeholder="Ex: 5"
-              />
-            </div>
-            <div className="publication-actions">
-              <div className="deadline-preview">
-                Prazo final: <strong>{deadlinePreview ? formatBrazilDate(deadlinePreview) : "--/--/----"}</strong>
-              </div>
-              <button className="btn" type="submit" disabled={!form.title.trim() || !form.publicationDate || !deadlinePreview}>
-                Adicionar publicação
-              </button>
-            </div>
-          </form>
+      {publicationAgendaError && <div className="error">{publicationAgendaError}</div>}
 
-          <div className="publication-list">
-            <div className="publication-title">Prazos cadastrados</div>
-            {orderedDeadlines.length === 0 ? (
-              <div className="publication-empty">Nenhuma publicação cadastrada.</div>
-            ) : (
-              orderedDeadlines.map((publication) => (
-                <div key={publication.id} className="publication-item">
-                  <div>
-                    <div className="publication-name">{publication.title}</div>
-                    <div className="publication-meta">
-                      Publicação {formatBrazilDate(publication.publicationDate)} · Prazo {formatBrazilDate(publication.deadlineDate)}
-                    </div>
-                  </div>
-                  <span className="publication-tag">{publication.deadlineDays}d</span>
-                </div>
-              ))
-            )}
+      <div className="publications-grid publication-summary-grid">
+        <div className="publication-card publication-summary-card">
+          <div className="publication-summary-head">
+            <div className="publication-summary-heading citations">Citações/Intimações</div>
+            <button
+              type="button"
+              className={`publication-summary-inline-alert ${activePublicationSummaryFilter === "due_today" ? "active" : ""}`}
+              onClick={() => handlePublicationSummaryFilterClick("due_today")}
+            >
+              Vencendo hoje: {isLoadingPublicationAgenda ? "..." : dueTodayCount}
+            </button>
+          </div>
+          <div className="publication-summary-table-wrap">
+            <table className="publication-summary-table">
+              <thead>
+                <tr>
+                  <th>Tipo</th>
+                  <th>Quantidade</th>
+                </tr>
+              </thead>
+              <tbody>
+                {citationSummaryRows.map((row) => (
+                  <tr
+                    key={row.key}
+                    className={`publication-summary-row clickable ${activePublicationSummaryFilter === row.key ? "active" : ""}`}
+                    onClick={() => handlePublicationSummaryFilterClick(row.key)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handlePublicationSummaryFilterClick(row.key);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={activePublicationSummaryFilter === row.key}
+                  >
+                    <td>{row.label}</td>
+                    <td>{isLoadingPublicationAgenda ? "..." : row.value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
 
-        <div className="calendar-card">
-          <div className="calendar-head">
-            <div className="calendar-title">{monthTitle}</div>
-            <div className="calendar-actions">
-              <button type="button" className="btn ghost" onClick={() => setMonth((prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1))}>
-                Anterior
-              </button>
-              <button type="button" className="btn ghost" onClick={() => setMonth((prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1))}>
-                Próximo
-              </button>
-            </div>
-          </div>
-          <div className="calendar-week">
-            {weekDays.map((label) => (
-              <div key={label} className="calendar-weekday">
-                {label}
-              </div>
-            ))}
-          </div>
-          <div className="calendar-grid">
-            {Array.from({ length: totalCells }).map((_, index) => {
-              const dayNumber = index - startOffset + 1;
-              if (dayNumber < 1 || dayNumber > daysInMonth) {
-                return <div key={`empty-${index}`} className="calendar-cell empty" />;
-              }
-              const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
-              const deadlines = deadlinesByDate[dateKey] || [];
-              const hasDeadline = deadlines.length > 0;
-              const isSelected = dateKey === selectedPublicationDate;
-              return (
-                <button
-                  key={dateKey}
-                  type="button"
-                  className={`calendar-cell calendar-day-btn ${hasDeadline ? "has-deadline" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
-                  onClick={() => handlePublicationSearchDateChange(dateKey)}
-                >
-                  <div className="calendar-day">{dayNumber}</div>
-                  {hasDeadline && <div className="calendar-count">{deadlines.length} prazo{deadlines.length > 1 ? "s" : ""}</div>}
-                </button>
-              );
-            })}
+        <div className="publication-card publication-summary-card">
+          <div className="publication-summary-heading hearings">Audiências/Fóruns de Conciliações/Perícias</div>
+          <div className="publication-summary-table-wrap">
+            <table className="publication-summary-table">
+              <thead>
+                <tr>
+                  <th>Situação</th>
+                  <th>Quantidade</th>
+                </tr>
+              </thead>
+              <tbody>
+                {hearingSummaryRows.map((row) => (
+                  <tr key={row.label}>
+                    <td>{row.label}</td>
+                    <td>{isLoadingPublicationAgenda ? "..." : row.value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
 
-      <div className="publication-card publication-search-card">
+      <div ref={publicationResultsRef} className="publication-card publication-search-card">
         <div className="publication-live-head">
           <div>
             <div className="publication-title">Buscar publicações da minha OAB</div>
             <div className="publication-live-subtitle">
-              Selecione uma data no calendário ou no campo abaixo para consultar o DJEN da OAB vinculada ao seu login.
+              Selecione uma data no campo abaixo para consultar o DJEN da OAB vinculada ao seu login.
             </div>
           </div>
         </div>
@@ -6263,6 +6834,17 @@ function Publications({ user }: { user: AuthUser | null }) {
         </form>
         {todayPublicationsError && <div className="error">{todayPublicationsError}</div>}
         {todayPublicationsInlineMessage && <div className="agenda-inline">{todayPublicationsInlineMessage}</div>}
+        {activePublicationSummaryFilter && (
+          <div className="publication-active-filter">
+            <span>
+              Filtro ativo: <strong>{activePublicationSummaryLabel}</strong>
+            </span>
+            <button className="btn ghost small" type="button" onClick={() => setActivePublicationSummaryFilter(null)}>
+              Limpar filtro
+            </button>
+          </div>
+        )}
+        {isLoadingPublicationContext && <div className="publication-meta">Carregando status e responsáveis da publicação...</div>}
         {todayPublicationResult && (
           <div className="publication-live-meta">
             <span>OAB {todayPublicationResult.oab}</span>
@@ -6271,34 +6853,91 @@ function Publications({ user }: { user: AuthUser | null }) {
           </div>
         )}
         {!todayPublicationResult ? (
-          <div className="publication-empty">Selecione uma data e clique em buscar publicações para consultar o DJEN.</div>
+          <div className="publication-empty">
+            {activePublicationSummaryFilter
+              ? `Selecione uma data e clique em buscar publicações para usar o filtro ${activePublicationSummaryLabel.toLowerCase()}.`
+              : "Selecione uma data e clique em buscar publicações para consultar o DJEN."}
+          </div>
         ) : todayPublicationResult.items.length === 0 ? (
           <div className="publication-empty">Nenhuma publicação encontrada para a data selecionada.</div>
+        ) : filteredPublicationEntries.length === 0 ? (
+          <div className="publication-empty">Nenhuma publicação encontrada para o filtro selecionado.</div>
         ) : (
           <div className="publication-list">
-            {todayPublicationResult.items.map((publication: TodayPublicationItem) => (
-              <div key={publication.hash || publication.id} className="publication-item publication-today-item">
-                <div>
-                  <div className="publication-name">{publication.title}</div>
-                  <div className="publication-meta">
-                    {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
-                    {publication.tribunal ? ` · ${publication.tribunal}` : ""}
-                    {publication.communication_type ? ` · ${publication.communication_type}` : ""}
+            {filteredPublicationEntries.map(({ publication, sourceKey, context }) => {
+              const handled = Boolean(context?.status);
+              const isBusy = processingPublicationSourceKey === sourceKey;
+              return (
+                <div
+                  key={publication.hash || publication.id}
+                  className={`publication-item publication-today-item ${handled ? "handled" : ""} ${
+                    context?.status ? `status-${context.status}` : ""
+                  }`}
+                >
+                  <div>
+                    <div className="publication-name">{publication.title}</div>
+                    <div className="publication-meta">
+                      {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+                      {publication.tribunal ? ` · ${publication.tribunal}` : ""}
+                      {publication.communication_type ? ` · ${publication.communication_type}` : ""}
+                    </div>
+                    {context?.wallet_name && <div className="publication-meta">Carteira: {context.wallet_name}</div>}
+                    {publication.court_name && <div className="publication-meta">{publication.court_name}</div>}
+                    {publication.summary && <div className="publication-summary">{publication.summary}</div>}
+                    {context?.warning && <div className="publication-warning">{context.warning}</div>}
                   </div>
-                  {publication.court_name && <div className="publication-meta">{publication.court_name}</div>}
-                  {publication.summary && <div className="publication-summary">{publication.summary}</div>}
+                  <div className="publication-today-actions">
+                    <div className="publication-today-tags">
+                      {context?.status && (
+                        <span className={`publication-tag publication-status-tag ${context.status}`}>
+                          {getPublicationHandlingLabel(context.status)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="publication-action-buttons">
+                      <button
+                        className="btn ghost small"
+                        type="button"
+                        onClick={() => openPublicationTaskModal(publication)}
+                        disabled={isBusy || isLoadingPublicationContext || context?.status === "task_created"}
+                      >
+                        {context?.status === "task_created" ? "Tarefa gerada" : "Gerar tarefa"}
+                      </button>
+                      <button
+                        className="btn ghost small"
+                        type="button"
+                        onClick={() => void handleMarkPublicationAsRead(publication)}
+                        disabled={
+                          isBusy ||
+                          isLoadingPublicationContext ||
+                          context?.status === "task_created" ||
+                          context?.status === "read_no_action"
+                        }
+                      >
+                        {context?.status === "read_no_action" ? "Sem providências" : "Li e não há providências"}
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <div className="publication-today-actions">
-                  {publication.tribunal && <span className="publication-tag">{publication.tribunal}</span>}
-                  <a className="publication-link" href={publication.detail_url} target="_blank" rel="noreferrer">
-                    Abrir íntegra
-                  </a>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
+
+      <PublicationTaskModal
+        open={Boolean(activePublication)}
+        publication={activePublication}
+        context={activePublicationContext}
+        user={user}
+        form={publicationTaskForm}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        errorMessage={publicationTaskError}
+        onClose={closePublicationTaskModal}
+        onSubmit={handleSubmitPublicationTask}
+        onChangeField={handlePublicationTaskFormField}
+        onToggleResponsible={handleTogglePublicationResponsible}
+      />
     </div>
   );
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import smtplib
 import threading
 import time
 import unicodedata
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from html import escape, unescape
@@ -36,7 +38,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, or_, text
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
 from .models import (
@@ -52,6 +54,7 @@ from .models import (
     Organization,
     Plan,
     PublicationAutomationConfig,
+    PublicationHandling,
     PublicationRecord,
     RefreshToken,
     TeamMember,
@@ -121,7 +124,24 @@ FINANCE_PAYMENT_METHODS = ("pix", "boleto", "cartao", "dinheiro", "transferencia
 FINANCE_RECURRING_OPTIONS = ("nao-recorrente", "mensal", "anual", "personalizado")
 CASE_NUMBER_PATTERN = re.compile(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$")
 FILES_MAX_UPLOAD_BYTES = int(os.getenv("NEWLAW_FILES_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
-FILES_ALLOWED_CONTENT_TYPES = ("application/pdf", "application/x-pdf", "application/octet-stream")
+FILES_ALLOWED_UPLOADS: dict[str, dict[str, Any]] = {
+    ".pdf": {
+        "content_types": ("application/pdf", "application/x-pdf", "application/octet-stream"),
+        "storage_content_type": "application/pdf",
+    },
+    ".doc": {
+        "content_types": ("application/msword", "application/octet-stream"),
+        "storage_content_type": "application/msword",
+    },
+    ".docx": {
+        "content_types": (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/zip",
+            "application/octet-stream",
+        ),
+        "storage_content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    },
+}
 PUBLICATIONS_DEFAULT_SCHEDULE_TIME = os.getenv("NEWLAW_PUBLICATIONS_DEFAULT_SCHEDULE", "06:00")
 PUBLICATIONS_LOOKBACK_DAYS = int(os.getenv("NEWLAW_PUBLICATIONS_LOOKBACK_DAYS", "7"))
 PUBLICATIONS_FOLDER_LABEL = "Publicações"
@@ -1157,6 +1177,10 @@ def parse_internal_agenda_metadata(raw_notes: str | None) -> dict[str, Any]:
         "assignee_id": None,
         "assignee_name": None,
         "is_all_day": True,
+        "publication_source_key": None,
+        "publication_process_number": None,
+        "publication_detail_url": None,
+        "created_via": None,
     }
     if not raw_notes:
         return metadata
@@ -1184,6 +1208,26 @@ def parse_internal_agenda_metadata(raw_notes: str | None) -> dict[str, Any]:
         else None
     )
     metadata["is_all_day"] = bool(parsed.get("is_all_day", True))
+    metadata["publication_source_key"] = (
+        parsed.get("publication_source_key").strip()
+        if isinstance(parsed.get("publication_source_key"), str) and parsed.get("publication_source_key").strip()
+        else None
+    )
+    metadata["publication_process_number"] = (
+        parsed.get("publication_process_number").strip()
+        if isinstance(parsed.get("publication_process_number"), str) and parsed.get("publication_process_number").strip()
+        else None
+    )
+    metadata["publication_detail_url"] = (
+        parsed.get("publication_detail_url").strip()
+        if isinstance(parsed.get("publication_detail_url"), str) and parsed.get("publication_detail_url").strip()
+        else None
+    )
+    metadata["created_via"] = (
+        parsed.get("created_via").strip()
+        if isinstance(parsed.get("created_via"), str) and parsed.get("created_via").strip()
+        else None
+    )
     return metadata
 
 
@@ -1197,6 +1241,10 @@ def serialize_internal_agenda_metadata(
     assignee_id: int | None,
     assignee_name: str | None,
     is_all_day: bool,
+    publication_source_key: str | None = None,
+    publication_process_number: str | None = None,
+    publication_detail_url: str | None = None,
+    created_via: str | None = None,
 ) -> str | None:
     payload = {
         "_agenda_internal": True,
@@ -1208,6 +1256,10 @@ def serialize_internal_agenda_metadata(
         "assignee_id": assignee_id,
         "assignee_name": (assignee_name or "").strip() or None,
         "is_all_day": bool(is_all_day),
+        "publication_source_key": (publication_source_key or "").strip() or None,
+        "publication_process_number": (publication_process_number or "").strip() or None,
+        "publication_detail_url": (publication_detail_url or "").strip() or None,
+        "created_via": (created_via or "").strip() or None,
     }
     if not any(value for key, value in payload.items() if key != "_agenda_internal") and is_all_day:
         return None
@@ -1253,6 +1305,10 @@ def serialize_deadline(deadline: AgendaDeadline) -> dict[str, Any]:
         "event_type": event_type,
         "assignee_name": assignees,
         "assignees": assignees,
+        "publication_source_key": metadata.get("publication_source_key"),
+        "publication_process_number": metadata.get("publication_process_number"),
+        "publication_detail_url": metadata.get("publication_detail_url"),
+        "created_via": metadata.get("created_via"),
     }
 
 
@@ -2008,6 +2064,60 @@ class PublicationSearchByOabRequest(BaseModel):
     publication_date: str
 
 
+class PublicationContextRequestItem(BaseModel):
+    source_key: str
+    process_number: str | None = None
+
+
+class PublicationContextRequest(BaseModel):
+    items: list[PublicationContextRequestItem]
+
+
+class PublicationResponsibleResponse(BaseModel):
+    name: str
+    email: str
+
+
+class PublicationContextResponseItem(BaseModel):
+    source_key: str
+    status: str | None = None
+    handled_at: datetime | None = None
+    has_registered_case: bool = False
+    case_id: int | None = None
+    case_number: str | None = None
+    wallet_id: int | None = None
+    wallet_name: str | None = None
+    allow_additional_responsibles: bool = False
+    allowed_responsibles: list[PublicationResponsibleResponse] = []
+    warning: str | None = None
+
+
+class PublicationContextResponse(BaseModel):
+    items: list[PublicationContextResponseItem]
+
+
+class PublicationHandleRequest(BaseModel):
+    source_key: str
+    publication_title: str
+    publication_date: str
+    process_number: str | None = None
+    detail_url: str
+    summary: str | None = None
+    action: str
+    task_title: str | None = None
+    task_details: str | None = None
+    due_date: str | None = None
+    responsible_emails: list[str] | None = None
+
+
+class PublicationHandleResponse(BaseModel):
+    source_key: str
+    status: str
+    handled_at: datetime
+    created_agenda_items: int = 0
+    message: str
+
+
 def resolve_organization_scope(
     user: User,
     session: Session,
@@ -2458,12 +2568,12 @@ def get_documents_root_path() -> str:
     return root
 
 
-def build_document_storage_relative_path(client: Client, case: Case | None, folder_label: str) -> tuple[str, str]:
+def build_document_storage_relative_path(client: Client, case: Case | None, folder_label: str, extension: str = ".pdf") -> tuple[str, str]:
     if client.id is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Cliente sem identificador")
     organization_segment = f"org_{client.organization_id}" if client.organization_id is not None else "org_shared"
     folder_segment = slugify_storage_segment(folder_label)
-    stored_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(8)}.pdf"
+    stored_name = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(8)}{extension}"
     relative_path = os.path.join(
         organization_segment,
         f"client_{client.id}",
@@ -2474,6 +2584,41 @@ def build_document_storage_relative_path(client: Client, case: Case | None, fold
     absolute_directory = os.path.dirname(os.path.join(get_documents_root_path(), relative_path))
     os.makedirs(absolute_directory, exist_ok=True)
     return stored_name, relative_path
+
+
+def get_allowed_document_extension(original_name: str) -> str | None:
+    extension = os.path.splitext(original_name.lower())[1]
+    if extension in FILES_ALLOWED_UPLOADS:
+        return extension
+    return None
+
+
+def get_document_storage_content_type(extension: str) -> str:
+    config = FILES_ALLOWED_UPLOADS.get(extension)
+    if not config:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de documento não suportado")
+    return str(config["storage_content_type"])
+
+
+def validate_uploaded_document_content(extension: str, content: bytes) -> None:
+    if extension == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um PDF válido")
+        return
+    if extension == ".doc":
+        if not content.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um documento Word válido")
+        return
+    if extension == ".docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                file_names = set(archive.namelist())
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um documento Word válido") from exc
+        if "[Content_Types].xml" not in file_names or "word/document.xml" not in file_names:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um documento Word válido")
+        return
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de documento não suportado")
 
 
 def get_document_absolute_path(storage_relative_path: str) -> str:
@@ -2647,7 +2792,7 @@ def store_internal_client_document_pdf(
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo de publicação inválido")
     label = normalize_document_folder_label(folder_label)
-    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label)
+    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label, ".pdf")
     absolute_path = get_document_absolute_path(storage_relative_path)
     with open(absolute_path, "wb") as buffer:
         buffer.write(content)
@@ -2783,6 +2928,284 @@ def build_publication_client_name_lookup(session: Session, organization_id: int)
         if normalized_name and normalized_name not in lookup:
             lookup[normalized_name] = client
     return lookup
+
+
+PUBLICATION_HANDLING_STATUSES = {"task_created", "read_no_action"}
+
+
+def normalize_publication_source_key(raw_value: str) -> str:
+    value = (raw_value or "").strip()
+    if not value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Identificador da publicação é obrigatório")
+    return value
+
+
+def normalize_publication_handling_status(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip().lower()
+    return value if value in PUBLICATION_HANDLING_STATUSES else None
+
+
+def parse_publication_date_value(raw_value: str) -> datetime:
+    value = (raw_value or "").strip()
+    if not value:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Data da publicação é obrigatória")
+    if len(value) == 10:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Data da publicação inválida") from exc
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Data da publicação inválida")
+    return parsed
+
+
+def get_publication_handling_lookup(
+    session: Session,
+    organization_id: int,
+    source_keys: list[str],
+) -> dict[str, PublicationHandling]:
+    cleaned_source_keys = [normalize_publication_source_key(item) for item in source_keys if (item or "").strip()]
+    if not cleaned_source_keys:
+        return {}
+    records = session.exec(
+        select(PublicationHandling).where(
+            PublicationHandling.organization_id == organization_id,
+            PublicationHandling.source_key.in_(cleaned_source_keys),
+        )
+    ).all()
+    return {record.source_key: record for record in records}
+
+
+def build_publication_responsible_options(
+    session: Session,
+    organization_id: int,
+    members: list[TeamMember],
+) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    seen_emails: set[str] = set()
+    for member in members:
+        if not member.is_active:
+            continue
+        email = normalize_email(member.email)
+        if not email or email in seen_emails:
+            continue
+        linked_user = get_user_by_email(session, email)
+        if not linked_user or linked_user.id is None or not linked_user.is_active or linked_user.organization_id != organization_id:
+            continue
+        seen_emails.add(email)
+        label = (member.full_name or "").strip() or linked_user.full_name or email
+        options.append(PublicationResponsibleResponse(name=label, email=email).model_dump())
+    options.sort(key=lambda item: normalize_publication_match_text(item["name"]))
+    return options
+
+
+def build_publication_context_items(
+    session: Session,
+    organization_id: int,
+    items: list[PublicationContextRequestItem],
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+
+    handling_lookup = get_publication_handling_lookup(session, organization_id, [item.source_key for item in items])
+    case_lookup = build_publication_case_lookup(session, organization_id)
+    matched_cases = [match[0] for match in case_lookup.values() if match and match[0].id is not None]
+    wallet_lookup = get_case_wallet_lookup(session, [case.id for case in matched_cases if case.id is not None])
+    wallet_ids = [wallet.id for wallet in wallet_lookup.values() if wallet.id is not None]
+    wallet_member_lookup = get_wallet_team_member_lookup(session, wallet_ids)
+
+    response_items: list[dict[str, Any]] = []
+    for item in items:
+        source_key = normalize_publication_source_key(item.source_key)
+        handling = handling_lookup.get(source_key)
+        process_digits = normalize_case_number_digits(item.process_number)
+        matched = case_lookup.get(process_digits) if process_digits else None
+        matched_case = matched[0] if matched else None
+        wallet = wallet_lookup.get(matched_case.id) if matched_case and matched_case.id is not None else None
+        allowed_responsibles = (
+            build_publication_responsible_options(session, organization_id, wallet_member_lookup.get(wallet.id, []))
+            if wallet and wallet.id is not None
+            else []
+        )
+
+        warning: str | None = None
+        if matched_case is None:
+            warning = "Processo não cadastrado. Você pode gerar apenas um evento no seu calendário."
+        elif wallet is None:
+            warning = "Processo cadastrado sem carteira vinculada. A tarefa ficará apenas no seu calendário."
+        elif not allowed_responsibles:
+            warning = "Nenhum outro responsável com acesso à carteira possui login ativo."
+
+        response_items.append(
+            PublicationContextResponseItem(
+                source_key=source_key,
+                status=normalize_publication_handling_status(handling.status if handling else None),
+                handled_at=handling.handled_at if handling else None,
+                has_registered_case=matched_case is not None,
+                case_id=matched_case.id if matched_case and matched_case.id is not None else None,
+                case_number=matched_case.number if matched_case else None,
+                wallet_id=wallet.id if wallet and wallet.id is not None else None,
+                wallet_name=wallet.name if wallet else None,
+                allow_additional_responsibles=bool(wallet and allowed_responsibles),
+                allowed_responsibles=allowed_responsibles,
+                warning=warning,
+            ).model_dump()
+        )
+    return response_items
+
+
+def upsert_publication_handling_record(
+    session: Session,
+    *,
+    organization_id: int,
+    source_key: str,
+    publication_title: str,
+    publication_date: datetime,
+    process_number: str | None,
+    detail_url: str,
+    summary: str | None,
+    matched_case: Case | None,
+    wallet: Wallet | None,
+) -> PublicationHandling:
+    record = session.exec(
+        select(PublicationHandling).where(
+            PublicationHandling.organization_id == organization_id,
+            PublicationHandling.source_key == source_key,
+        )
+    ).first()
+    if record is None:
+        record = PublicationHandling(
+            organization_id=organization_id,
+            source_key=source_key,
+            title=publication_title,
+            publication_date=publication_date,
+            process_number_snapshot=(process_number or "").strip() or None,
+            case_id=matched_case.id if matched_case and matched_case.id is not None else None,
+            wallet_id=wallet.id if wallet and wallet.id is not None else None,
+            detail_url=(detail_url or "").strip() or None,
+            summary=(summary or "").strip() or None,
+        )
+    else:
+        record.title = publication_title
+        record.publication_date = publication_date
+        record.process_number_snapshot = (process_number or "").strip() or None
+        record.case_id = matched_case.id if matched_case and matched_case.id is not None else None
+        record.wallet_id = wallet.id if wallet and wallet.id is not None else None
+        record.detail_url = (detail_url or "").strip() or None
+        record.summary = (summary or "").strip() or None
+        record.updated_at = datetime.utcnow()
+    session.add(record)
+    return record
+
+
+def resolve_publication_task_assignees(
+    session: Session,
+    *,
+    organization_id: int,
+    actor_user: User,
+    matched_case: Case | None,
+    wallet: Wallet | None,
+    raw_emails: list[str] | None,
+) -> tuple[list[User], list[str], list[str]]:
+    if actor_user.id is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
+
+    actor_email = normalize_email(actor_user.email)
+    actor_name = (actor_user.full_name or "").strip() or actor_email
+    selected_users = [actor_user]
+    selected_names = [actor_name]
+    selected_emails = [actor_email]
+
+    additional_emails: list[str] = []
+    seen_additional: set[str] = set()
+    for raw_email in raw_emails or []:
+        email = normalize_email(raw_email)
+        if not email or email == actor_email or email in seen_additional:
+            continue
+        seen_additional.add(email)
+        additional_emails.append(email)
+
+    if not additional_emails:
+        return selected_users, selected_names, selected_emails
+
+    if matched_case is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Processo não cadastrado. Não é possível adicionar outros responsáveis.",
+        )
+    if wallet is None or wallet.id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="O processo precisa estar vinculado a uma carteira para compartilhar a tarefa.",
+        )
+
+    allowed_options = build_publication_responsible_options(session, organization_id, get_wallet_team_member_lookup(session, [wallet.id]).get(wallet.id, []))
+    allowed_names = {option["email"]: option["name"] for option in allowed_options}
+    for email in additional_emails:
+        if email not in allowed_names:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Os responsáveis adicionais precisam ter acesso à carteira do processo.",
+            )
+        linked_user = get_user_by_email(session, email)
+        if not linked_user or linked_user.id is None or not linked_user.is_active or linked_user.organization_id != organization_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"O responsável {email} não possui login ativo para receber a tarefa.",
+            )
+        selected_users.append(linked_user)
+        selected_names.append(allowed_names[email])
+        selected_emails.append(email)
+
+    return selected_users, selected_names, selected_emails
+
+
+def create_publication_agenda_deadlines(
+    session: Session,
+    *,
+    assignee_users: list[User],
+    assignee_names: list[str],
+    due_at: datetime,
+    task_title: str,
+    task_details: str | None,
+    source_key: str,
+    process_number: str | None,
+    detail_url: str,
+) -> int:
+    assignees_label = "; ".join(name for name in assignee_names if name)
+    reference = f"[Publicação] Processo {process_number}" if (process_number or "").strip() else "[Publicação]"
+    created_items = 0
+
+    for assignee_user in assignee_users:
+        if assignee_user.id is None:
+            continue
+        deadline = AgendaDeadline(
+            user_id=assignee_user.id,
+            organization_id=None,
+            title=task_title,
+            due_at=due_at,
+            reference=reference,
+            notes=serialize_internal_agenda_metadata(
+                notes=task_details,
+                event_type="deadline",
+                meeting_url=None,
+                assignees=assignees_label or None,
+                end_time=None,
+                assignee_id=assignee_user.id,
+                assignee_name=(assignee_user.full_name or "").strip() or assignee_user.email,
+                is_all_day=True,
+                publication_source_key=source_key,
+                publication_process_number=(process_number or "").strip() or None,
+                publication_detail_url=(detail_url or "").strip() or None,
+                created_via="publication",
+            ),
+            is_completed=False,
+        )
+        session.add(deadline)
+        created_items += 1
+
+    return created_items
 
 
 def request_publications_json(
@@ -3926,7 +4349,7 @@ def list_agenda_deadlines(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
     query = select(AgendaDeadline)
     if user.organization_id is not None:
-        query = query.where(AgendaDeadline.organization_id == user.organization_id)
+        query = query.where(or_(AgendaDeadline.organization_id == user.organization_id, AgendaDeadline.user_id == user.id))
     else:
         query = query.where(AgendaDeadline.user_id == user.id)
     query = query.order_by(AgendaDeadline.due_at.asc())
@@ -4005,7 +4428,7 @@ def list_agenda_events(
 
     deadline_query = select(AgendaDeadline).where(AgendaDeadline.due_at >= window_start, AgendaDeadline.due_at <= window_end)
     if user.organization_id is not None:
-        deadline_query = deadline_query.where(AgendaDeadline.organization_id == user.organization_id)
+        deadline_query = deadline_query.where(or_(AgendaDeadline.organization_id == user.organization_id, AgendaDeadline.user_id == user.id))
     else:
         deadline_query = deadline_query.where(AgendaDeadline.user_id == user.id)
     deadlines = session.exec(deadline_query).all()
@@ -4897,11 +5320,13 @@ async def upload_client_document(
 
     original_name = os.path.basename((file.filename or "").strip())
     if not original_name:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selecione um arquivo PDF")
-    if not original_name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Somente arquivos PDF são aceitos")
-    if file.content_type and file.content_type.lower() not in FILES_ALLOWED_CONTENT_TYPES:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de arquivo inválido. Envie um PDF")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selecione um arquivo PDF ou Word")
+    extension = get_allowed_document_extension(original_name)
+    if not extension:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Somente arquivos PDF ou Word são aceitos")
+    allowed_content_types = tuple(str(value).lower() for value in FILES_ALLOWED_UPLOADS[extension]["content_types"])
+    if file.content_type and file.content_type.lower() not in allowed_content_types:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tipo de arquivo inválido. Envie um PDF ou Word")
 
     label = normalize_document_folder_label(folder_label)
     content = await file.read(FILES_MAX_UPLOAD_BYTES + 1)
@@ -4913,10 +5338,9 @@ async def upload_client_document(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Arquivo excede o limite de {FILES_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
         )
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Arquivo inválido. Envie um PDF válido")
+    validate_uploaded_document_content(extension, content)
 
-    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label)
+    stored_name, storage_relative_path = build_document_storage_relative_path(client, case, label, extension)
     absolute_path = get_document_absolute_path(storage_relative_path)
     with open(absolute_path, "wb") as buffer:
         buffer.write(content)
@@ -4930,7 +5354,7 @@ async def upload_client_document(
         original_name=original_name,
         stored_name=stored_name,
         storage_path=storage_relative_path,
-        content_type="application/pdf",
+        content_type=get_document_storage_content_type(extension),
         size_bytes=len(content),
     )
     session.add(document)
@@ -5064,6 +5488,146 @@ def search_publications_by_oab(payload: PublicationSearchByOabRequest) -> dict[s
         oab_uf=parsed_oab["uf"],
         publication_date=target_date,
     )
+
+
+@app.post("/publications/context", response_model=PublicationContextResponse)
+def get_publication_context(
+    payload: PublicationContextRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "official")
+    organization = resolve_organization_entity(user, session, user.organization_id)
+    organization_id = get_organization_pk(organization)
+    return PublicationContextResponse(
+        items=build_publication_context_items(session, organization_id, payload.items)
+    ).model_dump()
+
+
+@app.post("/publications/handle", response_model=PublicationHandleResponse)
+def handle_publication(
+    payload: PublicationHandleRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    ensure_nav_access(user, "official")
+    if user.id is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
+
+    organization = resolve_organization_entity(user, session, user.organization_id)
+    organization_id = get_organization_pk(organization)
+    action = (payload.action or "").strip().lower()
+    if action not in PUBLICATION_HANDLING_STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ação da publicação inválida")
+
+    source_key = normalize_publication_source_key(payload.source_key)
+    publication_title = (payload.publication_title or "").strip()
+    if not publication_title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título da publicação é obrigatório")
+
+    publication_date = parse_publication_date_value(payload.publication_date)
+    process_number = (payload.process_number or "").strip() or None
+    detail_url = (payload.detail_url or "").strip() or "https://comunica.pje.jus.br/"
+    summary = (payload.summary or "").strip() or None
+
+    case_lookup = build_publication_case_lookup(session, organization_id)
+    matched = case_lookup.get(normalize_case_number_digits(process_number)) if process_number else None
+    matched_case = matched[0] if matched else None
+    wallet = None
+    if matched_case and matched_case.id is not None:
+        wallet = get_case_wallet_lookup(session, [matched_case.id]).get(matched_case.id)
+
+    handling = upsert_publication_handling_record(
+        session,
+        organization_id=organization_id,
+        source_key=source_key,
+        publication_title=publication_title,
+        publication_date=publication_date,
+        process_number=process_number,
+        detail_url=detail_url,
+        summary=summary,
+        matched_case=matched_case,
+        wallet=wallet,
+    )
+
+    current_status = normalize_publication_handling_status(handling.status)
+    handled_at = get_local_now()
+
+    if action == "read_no_action":
+        if current_status == "task_created":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Esta publicação já possui uma providência cadastrada.",
+            )
+        handling.status = "read_no_action"
+        handling.handled_by_user_id = user.id
+        handling.handled_at = handled_at
+        handling.task_title = None
+        handling.task_details = None
+        handling.task_due_at = None
+        handling.task_assignees = None
+        handling.updated_at = datetime.utcnow()
+        session.add(handling)
+        session.commit()
+        return PublicationHandleResponse(
+            source_key=source_key,
+            status=handling.status,
+            handled_at=handled_at,
+            created_agenda_items=0,
+            message="Publicação marcada como lida sem providências.",
+        ).model_dump()
+
+    if current_status == "task_created":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Esta publicação já possui uma providência cadastrada.",
+        )
+
+    task_title = (payload.task_title or "").strip()
+    if not task_title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título da tarefa é obrigatório")
+    if not (payload.due_date or "").strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Data de entrega é obrigatória")
+
+    assignee_users, assignee_names, assignee_emails = resolve_publication_task_assignees(
+        session,
+        organization_id=organization_id,
+        actor_user=user,
+        matched_case=matched_case,
+        wallet=wallet,
+        raw_emails=payload.responsible_emails,
+    )
+    due_at = parse_deadline_due_date(payload.due_date or "")
+    created_agenda_items = create_publication_agenda_deadlines(
+        session,
+        assignee_users=assignee_users,
+        assignee_names=assignee_names,
+        due_at=due_at,
+        task_title=task_title,
+        task_details=(payload.task_details or "").strip() or None,
+        source_key=source_key,
+        process_number=matched_case.number if matched_case else process_number,
+        detail_url=detail_url,
+    )
+
+    handling.status = "task_created"
+    handling.handled_by_user_id = user.id
+    handling.handled_at = handled_at
+    handling.task_title = task_title
+    handling.task_details = (payload.task_details or "").strip() or None
+    handling.task_due_at = due_at
+    handling.task_assignees = "; ".join(assignee_emails)
+    handling.updated_at = datetime.utcnow()
+    session.add(handling)
+    session.commit()
+
+    return PublicationHandleResponse(
+        source_key=source_key,
+        status=handling.status,
+        handled_at=handled_at,
+        created_agenda_items=created_agenda_items,
+        message="Tarefa criada com sucesso a partir da publicação.",
+    ).model_dump()
 
 
 @app.put("/publications/automation", response_model=PublicationAutomationConfigResponse)

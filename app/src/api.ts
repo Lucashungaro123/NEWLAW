@@ -162,6 +162,10 @@ export type AgendaItem = {
   event_type?: InternalAgendaEventType | null;
   assignee_name?: string | null;
   assignees?: string | null;
+  publication_source_key?: string | null;
+  publication_process_number?: string | null;
+  publication_detail_url?: string | null;
+  created_via?: string | null;
 };
 export type CreateAgendaDeadlinePayload = {
   title: string;
@@ -237,6 +241,51 @@ export type TodayPublicationsResponse = {
   publication_date: string;
   count: number;
   items: TodayPublicationItem[];
+};
+export type PublicationHandlingStatus = "task_created" | "read_no_action";
+export type PublicationResponsibleOption = {
+  name: string;
+  email: string;
+};
+export type PublicationContextRequestItem = {
+  source_key: string;
+  process_number?: string | null;
+};
+export type PublicationContextItem = {
+  source_key: string;
+  status?: PublicationHandlingStatus | null;
+  handled_at?: string | null;
+  has_registered_case: boolean;
+  case_id?: number | null;
+  case_number?: string | null;
+  wallet_id?: number | null;
+  wallet_name?: string | null;
+  allow_additional_responsibles: boolean;
+  allowed_responsibles: PublicationResponsibleOption[];
+  warning?: string | null;
+};
+export type PublicationContextResponse = {
+  items: PublicationContextItem[];
+};
+export type HandlePublicationPayload = {
+  source_key: string;
+  publication_title: string;
+  publication_date: string;
+  process_number?: string;
+  detail_url: string;
+  summary?: string;
+  action: PublicationHandlingStatus;
+  task_title?: string;
+  task_details?: string;
+  due_date?: string;
+  responsible_emails?: string[];
+};
+export type HandlePublicationResponse = {
+  source_key: string;
+  status: PublicationHandlingStatus;
+  handled_at: string;
+  created_agenda_items: number;
+  message: string;
 };
 export type PublicationSearchByOabPayload = {
   oab_number: string;
@@ -760,6 +809,20 @@ export async function searchPublicationsByOabLocally(payload: PublicationSearchB
     timeout: 120000
   });
   return data as TodayPublicationsResponse;
+}
+
+export async function getPublicationContext(payload: { items: PublicationContextRequestItem[] }) {
+  const { data } = await api.post("/publications/context", payload, {
+    timeout: 120000
+  });
+  return data as PublicationContextResponse;
+}
+
+export async function handlePublication(payload: HandlePublicationPayload) {
+  const { data } = await api.post("/publications/handle", payload, {
+    timeout: 120000
+  });
+  return data as HandlePublicationResponse;
 }
 
 export async function updatePublicationAutomationSettings(payload: UpdatePublicationAutomationPayload) {
