@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cadastro do Escritório | NEWLAW</title>
+    <meta
+      name="description"
+      content="Crie a conta master do seu escritório e comece a testar o NEWLAW."
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1733;
+        --panel: #172547;
+        --panel-strong: #1d2e58;
+        --border: rgba(110, 148, 225, 0.22);
+        --text: #eef4ff;
+        --muted: #a8b6d9;
+        --accent: #3f7cff;
+        --accent-strong: #5d92ff;
+        --success: #16c47f;
+        --danger: #ff6b6b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(69, 118, 255, 0.22), transparent 32%),
+          linear-gradient(180deg, #0b1530 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .page {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 32px 18px;
+      }
+
+      .shell {
+        width: min(980px, 100%);
+        display: grid;
+        grid-template-columns: minmax(280px, 0.92fr) minmax(360px, 1.08fr);
+        gap: 24px;
+        align-items: stretch;
+      }
+
+      .hero,
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 28px;
+        background: rgba(18, 31, 62, 0.9);
+        box-shadow: 0 24px 70px rgba(4, 12, 29, 0.34);
+        backdrop-filter: blur(14px);
+      }
+
+      .hero {
+        padding: 34px 30px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 28px;
+      }
+
+      .hero-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .hero-brand img {
+        width: 56px;
+        height: 56px;
+        border-radius: 18px;
+        display: block;
+      }
+
+      .hero-brand strong {
+        display: block;
+        font-size: 30px;
+        letter-spacing: -0.04em;
+      }
+
+      .hero-brand span {
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-size: clamp(34px, 5vw, 52px);
+        line-height: 0.98;
+        letter-spacing: -0.05em;
+      }
+
+      .hero h1 em {
+        color: var(--accent-strong);
+        font-style: normal;
+      }
+
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 16px;
+        line-height: 1.7;
+      }
+
+      .hero-points {
+        display: grid;
+        gap: 12px;
+      }
+
+      .hero-point {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: #d8e4ff;
+        font-size: 14px;
+      }
+
+      .hero-point::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 0 6px rgba(63, 124, 255, 0.12);
+      }
+
+      .card {
+        padding: 30px 28px;
+      }
+
+      .card h2 {
+        margin: 0 0 8px;
+        font-size: 34px;
+        letter-spacing: -0.04em;
+      }
+
+      .card p {
+        margin: 0 0 24px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      form {
+        display: grid;
+        gap: 14px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .span-2 {
+        grid-column: span 2;
+      }
+
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 13px;
+        font-weight: 700;
+        color: #dfe8ff;
+      }
+
+      input {
+        width: 100%;
+        min-height: 46px;
+        padding: 0 14px;
+        border-radius: 14px;
+        border: 1px solid rgba(115, 146, 214, 0.24);
+        background: rgba(10, 22, 46, 0.9);
+        color: var(--text);
+        font: inherit;
+        outline: none;
+        transition: border-color 0.16s ease, box-shadow 0.16s ease;
+      }
+
+      input:focus {
+        border-color: rgba(93, 146, 255, 0.9);
+        box-shadow: 0 0 0 4px rgba(63, 124, 255, 0.14);
+      }
+
+      .hint {
+        margin: 4px 0 0;
+        padding: 12px 14px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .checkbox {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+        margin-top: 2px;
+      }
+
+      .checkbox input {
+        width: 18px;
+        min-width: 18px;
+        height: 18px;
+        min-height: 18px;
+        margin-top: 1px;
+        padding: 0;
+      }
+
+      .message {
+        display: none;
+        padding: 13px 14px;
+        border-radius: 14px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .message.show {
+        display: block;
+      }
+
+      .message.error {
+        background: rgba(255, 107, 107, 0.12);
+        color: #ffd2d2;
+        border: 1px solid rgba(255, 107, 107, 0.28);
+      }
+
+      .message.success {
+        background: rgba(22, 196, 127, 0.12);
+        color: #d2ffe8;
+        border: 1px solid rgba(22, 196, 127, 0.26);
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      button,
+      .secondary-link {
+        min-height: 48px;
+        border-radius: 999px;
+        padding: 0 22px;
+        font: inherit;
+        font-weight: 800;
+        border: none;
+        text-decoration: none;
+      }
+
+      button {
+        background: linear-gradient(135deg, var(--accent), #275fe0);
+        color: #fff;
+        cursor: pointer;
+        box-shadow: 0 18px 34px rgba(39, 95, 224, 0.28);
+      }
+
+      button:disabled {
+        opacity: 0.66;
+        cursor: wait;
+        box-shadow: none;
+      }
+
+      .secondary-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: #d9e4ff;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .meta {
+        margin-top: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      @media (max-width: 860px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          padding: 28px 24px;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .page {
+          padding: 18px 12px 28px;
+        }
+
+        .card,
+        .hero {
+          border-radius: 24px;
+        }
+
+        .card {
+          padding: 24px 18px;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .span-2 {
+          grid-column: auto;
+        }
+
+        .actions {
+          flex-direction: column;
+        }
+
+        button,
+        .secondary-link {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <div class="shell">
+        <section class="hero">
+          <div class="hero-brand">
+            <img src="/logo_new_law_teste.png" alt="NEWLAW" />
+            <div>
+              <strong>NEWLAW</strong>
+              <span>Cadastro do escritório</span>
+            </div>
+          </div>
+
+          <div>
+            <h1>Crie a conta <em>master</em> do seu escritório.</h1>
+            <p>
+              Cadastre a organização, defina o responsável principal e entre no sistema logo após a criação.
+            </p>
+          </div>
+
+          <div class="hero-points">
+            <div class="hero-point">Conta master criada na hora</div>
+            <div class="hero-point">Acesso imediato para começar os testes</div>
+            <div class="hero-point">Depois você convida equipe, clientes e carteiras</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Criar conta</h2>
+          <p>Preencha os dados básicos do escritório para gerar a organização e o login principal.</p>
+
+          <form id="signup-form">
+            <div class="grid">
+              <label class="span-2">
+                Nome do escritório *
+                <input id="office_name" name="office_name" placeholder="Ex: Silva & Costa Advogados" required />
+              </label>
+
+              <label>
+                Responsável master *
+                <input id="owner_full_name" name="owner_full_name" placeholder="Nome completo" required />
+              </label>
+
+              <label>
+                Telefone / WhatsApp
+                <input id="owner_phone" name="owner_phone" placeholder="(00) 00000-0000" />
+              </label>
+
+              <label class="span-2">
+                E-mail master *
+                <input
+                  id="owner_email"
+                  name="owner_email"
+                  type="email"
+                  placeholder="responsavel@escritorio.com.br"
+                  required
+                />
+              </label>
+
+              <label>
+                Senha *
+                <input id="owner_password" name="owner_password" type="password" placeholder="Crie uma senha forte" required />
+              </label>
+
+              <label>
+                Confirmar senha *
+                <input id="confirm_password" name="confirm_password" type="password" placeholder="Repita a senha" required />
+              </label>
+            </div>
+
+            <div class="hint">
+              O cadastro cria a organização e já entra na conta master automaticamente neste navegador.
+            </div>
+
+            <label class="checkbox">
+              <input id="accepted_terms" type="checkbox" required />
+              <span>Declaro que tenho autorização para criar a conta master deste escritório.</span>
+            </label>
+
+            <div id="message" class="message" aria-live="polite"></div>
+
+            <div class="actions">
+              <button id="submit-button" type="submit">Criar conta do escritório</button>
+              <a class="secondary-link" href="https://newlaw.app.br/">Voltar ao site</a>
+            </div>
+
+            <div class="meta">
+              <span>API: <strong id="api-base-label"></strong></span>
+              <a href="https://newlaw.app.br/politica-de-privacidade/">Política de Privacidade</a>
+              <a href="https://newlaw.app.br/termos-de-uso/">Termos de Uso</a>
+            </div>
+          </form>
+        </section>
+      </div>
+    </main>
+
+    <script>
+      (function () {
+        var API_BASE =
+          window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+            ? "http://127.0.0.1:8000"
+            : "https://api.newlaw.app.br";
+
+        var STORAGE_KEYS = {
+          access: "newlaw.access_token",
+          refresh: "newlaw.refresh_token",
+          user: "newlaw.user"
+        };
+
+        var form = document.getElementById("signup-form");
+        var message = document.getElementById("message");
+        var submitButton = document.getElementById("submit-button");
+        var apiLabel = document.getElementById("api-base-label");
+        apiLabel.textContent = API_BASE;
+
+        function showMessage(text, type) {
+          message.textContent = text;
+          message.className = "message show " + type;
+        }
+
+        function clearMessage() {
+          message.textContent = "";
+          message.className = "message";
+        }
+
+        function getValue(id) {
+          return document.getElementById(id).value.trim();
+        }
+
+        function setBusy(busy) {
+          submitButton.disabled = busy;
+          submitButton.textContent = busy ? "Criando conta..." : "Criar conta do escritório";
+        }
+
+        function saveSession(data) {
+          window.localStorage.setItem(STORAGE_KEYS.access, data.access_token);
+          window.localStorage.setItem(STORAGE_KEYS.refresh, data.refresh_token);
+          window.localStorage.setItem(STORAGE_KEYS.user, JSON.stringify(data.user));
+        }
+
+        form.addEventListener("submit", async function (event) {
+          event.preventDefault();
+          clearMessage();
+
+          var payload = {
+            office_name: getValue("office_name"),
+            owner_full_name: getValue("owner_full_name"),
+            owner_email: getValue("owner_email").toLowerCase(),
+            owner_password: document.getElementById("owner_password").value,
+            owner_phone: getValue("owner_phone") || undefined
+          };
+
+          var confirmPassword = document.getElementById("confirm_password").value;
+          var acceptedTerms = document.getElementById("accepted_terms").checked;
+
+          if (!payload.office_name) {
+            showMessage("Informe o nome do escritório.", "error");
+            return;
+          }
+
+          if (!payload.owner_full_name) {
+            showMessage("Informe o nome do responsável.", "error");
+            return;
+          }
+
+          if (!payload.owner_email) {
+            showMessage("Informe o e-mail do responsável.", "error");
+            return;
+          }
+
+          if (!payload.owner_password) {
+            showMessage("Defina uma senha para a conta master.", "error");
+            return;
+          }
+
+          if (payload.owner_password !== confirmPassword) {
+            showMessage("A confirmação de senha não confere.", "error");
+            return;
+          }
+
+          if (!acceptedTerms) {
+            showMessage("Você precisa aceitar os termos para criar a conta.", "error");
+            return;
+          }
+
+          setBusy(true);
+
+          try {
+            var response = await fetch(API_BASE + "/auth/register-office", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify(payload)
+            });
+
+            var data = await response.json().catch(function () {
+              return {};
+            });
+
+            if (!response.ok) {
+              var detail = data && data.detail;
+              var detailText = Array.isArray(detail)
+                ? detail.map(function (item) { return item.msg || "Campo inválido."; }).join(" ")
+                : detail || "Não foi possível criar a conta do escritório.";
+              throw new Error(detailText);
+            }
+
+            saveSession(data);
+            showMessage("Conta criada com sucesso. Redirecionando...", "success");
+            window.setTimeout(function () {
+              window.location.href = "/";
+            }, 700);
+          } catch (error) {
+            showMessage(error && error.message ? error.message : "Não foi possível criar a conta do escritório.", "error");
+          } finally {
+            setBusy(false);
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

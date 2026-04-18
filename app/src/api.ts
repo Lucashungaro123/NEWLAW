@@ -22,6 +22,13 @@ export type AuthUser = {
   allowed_nav_keys?: string[];
 };
 export type AuthSession = { accessToken: string; refreshToken: string; user: AuthUser };
+export type RegisterOfficePayload = {
+  office_name: string;
+  owner_full_name: string;
+  owner_email: string;
+  owner_password: string;
+  owner_phone?: string;
+};
 export type ApiClient = {
   id: number;
   organization_id?: number | null;
@@ -280,6 +287,8 @@ export type HandlePublicationPayload = {
   task_details?: string;
   due_date?: string;
   responsible_emails?: string[];
+  include_actor_responsible?: boolean;
+  allow_office_wide_responsibles?: boolean;
 };
 export type HandlePublicationResponse = {
   source_key: string;
@@ -477,6 +486,11 @@ export async function ping() {
 
 export async function login(username: string, password: string) {
   const { data } = await api.post("/auth/login", { username, password });
+  return data;
+}
+
+export async function registerOffice(payload: RegisterOfficePayload) {
+  const { data } = await api.post("/auth/register-office", payload);
   return data;
 }
 

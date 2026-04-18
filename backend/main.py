@@ -38,7 +38,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from sqlalchemy import inspect, or_, text
+from sqlalchemy import func, inspect, or_, text
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
 from .models import (
@@ -80,6 +80,8 @@ DEV_RETURN_RESET_TOKEN = os.getenv("NEWLAW_DEV_RETURN_RESET_TOKEN", "0") == "1"
 DEV_RETURN_INVITE_TOKEN = os.getenv("NEWLAW_DEV_RETURN_INVITE_TOKEN", "0") == "1"
 INVITE_TOKEN_EXPIRE_HOURS = int(os.getenv("NEWLAW_INVITE_TOKEN_HOURS", "48"))
 INVITE_BASE_URL = os.getenv("NEWLAW_INVITE_BASE_URL", "https://api.newlaw.app.br/invite")
+PUBLIC_SIGNUP_ENABLED = os.getenv("NEWLAW_PUBLIC_SIGNUP_ENABLED", "1") == "1"
+PUBLIC_SIGNUP_PLAN_SLUG = os.getenv("NEWLAW_PUBLIC_SIGNUP_PLAN_SLUG", "basic").strip() or "basic"
 SMTP_HOST = os.getenv("NEWLAW_SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("NEWLAW_SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("NEWLAW_SMTP_USERNAME", "")
@@ -112,7 +114,6 @@ NAV_PERMISSION_KEYS = (
     "reports",
     "stats",
     "official",
-    "progress",
     "files",
     "settings",
 )
@@ -215,6 +216,10 @@ def normalize_email(value: str) -> str:
     return value.strip().lower()
 
 
+def normalize_organization_name(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def parse_nav_keys(value: str | None) -> list[str]:
     if not value:
         return []
@@ -223,6 +228,8 @@ def parse_nav_keys(value: str | None) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in items:
+        if item == "progress":
+            item = "official"
         if not item or item not in valid or item in seen:
             continue
         seen.add(item)
@@ -239,6 +246,8 @@ def normalize_nav_keys(raw: list[str] | None, *, is_admin: bool) -> list[str]:
         seen: set[str] = set()
         for key in raw:
             clean = key.strip()
+            if clean == "progress":
+                clean = "official"
             if clean not in valid or clean in seen:
                 continue
             seen.add(clean)
@@ -1499,6 +1508,28 @@ def create_refresh_token(
     return token
 
 
+def issue_auth_tokens(
+    session: Session,
+    user: User,
+    request: Request,
+    user_agent: Optional[str],
+) -> TokenPairResponse:
+    access_token = create_access_token(user)
+    refresh_token = create_refresh_token(user, session, user_agent, get_client_ip(request))
+    user.last_login_at = datetime.utcnow()
+    user.failed_login_count = 0
+    user.locked_until = None
+    user.updated_at = datetime.utcnow()
+    session.add(user)
+    session.commit()
+    return TokenPairResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=serialize_auth_user(session, user),
+    )
+
+
 def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -1795,6 +1826,14 @@ class CreateOrganizationRequest(BaseModel):
     owner_full_name: str
     owner_phone: str | None = None
     user_limit_override: int | None = None
+
+
+class PublicOfficeSignupRequest(BaseModel):
+    office_name: str
+    owner_full_name: str
+    owner_email: str
+    owner_password: str
+    owner_phone: str | None = None
 
 
 class CreateUserRequest(BaseModel):
@@ -2110,6 +2149,8 @@ class PublicationHandleRequest(BaseModel):
     task_details: str | None = None
     due_date: str | None = None
     responsible_emails: list[str] | None = None
+    include_actor_responsible: bool = True
+    allow_office_wide_responsibles: bool = False
 
 
 class PublicationHandleResponse(BaseModel):
@@ -3109,42 +3150,84 @@ def resolve_publication_task_assignees(
     matched_case: Case | None,
     wallet: Wallet | None,
     raw_emails: list[str] | None,
+    include_actor_responsible: bool = True,
+    allow_office_wide_responsibles: bool = False,
 ) -> tuple[list[User], list[str], list[str]]:
     if actor_user.id is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
 
     actor_email = normalize_email(actor_user.email)
     actor_name = (actor_user.full_name or "").strip() or actor_email
-    selected_users = [actor_user]
-    selected_names = [actor_name]
-    selected_emails = [actor_email]
+    requested_emails: list[str] = []
+    seen_requested: set[str] = set()
 
-    additional_emails: list[str] = []
-    seen_additional: set[str] = set()
+    if include_actor_responsible and actor_email:
+        requested_emails.append(actor_email)
+        seen_requested.add(actor_email)
+
     for raw_email in raw_emails or []:
         email = normalize_email(raw_email)
-        if not email or email == actor_email or email in seen_additional:
+        if not email or email in seen_requested:
             continue
-        seen_additional.add(email)
-        additional_emails.append(email)
+        seen_requested.add(email)
+        requested_emails.append(email)
 
-    if not additional_emails:
+    if not requested_emails:
+        requested_emails = [actor_email]
+
+    selected_users: list[User] = []
+    selected_names: list[str] = []
+    selected_emails: list[str] = []
+
+    if allow_office_wide_responsibles:
+        team_member_lookup = {
+            normalize_email(member.email): member
+            for member in session.exec(select(TeamMember).where(TeamMember.organization_id == organization_id)).all()
+            if member.email
+        }
+        for email in requested_emails:
+            linked_user = actor_user if email == actor_email else get_user_by_email(session, email)
+            if not linked_user or linked_user.id is None or not linked_user.is_active or linked_user.organization_id != organization_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"O responsável {email} não possui login ativo para receber o prazo.",
+                )
+            member = team_member_lookup.get(email)
+            label = (member.full_name or "").strip() if member else ""
+            label = label or (linked_user.full_name or "").strip() or email
+            selected_users.append(linked_user)
+            selected_names.append(label)
+            selected_emails.append(email)
         return selected_users, selected_names, selected_emails
 
-    if matched_case is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Processo não cadastrado. Não é possível adicionar outros responsáveis.",
-        )
-    if wallet is None or wallet.id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="O processo precisa estar vinculado a uma carteira para compartilhar a tarefa.",
-        )
+    additional_emails = [email for email in requested_emails if email != actor_email]
+    if additional_emails:
+        if matched_case is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Processo não cadastrado. Não é possível adicionar outros responsáveis.",
+            )
+        if wallet is None or wallet.id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="O processo precisa estar vinculado a uma carteira para compartilhar a tarefa.",
+            )
 
-    allowed_options = build_publication_responsible_options(session, organization_id, get_wallet_team_member_lookup(session, [wallet.id]).get(wallet.id, []))
-    allowed_names = {option["email"]: option["name"] for option in allowed_options}
-    for email in additional_emails:
+    allowed_names: dict[str, str] = {}
+    if additional_emails and wallet and wallet.id is not None:
+        allowed_options = build_publication_responsible_options(
+            session,
+            organization_id,
+            get_wallet_team_member_lookup(session, [wallet.id]).get(wallet.id, []),
+        )
+        allowed_names = {option["email"]: option["name"] for option in allowed_options}
+
+    for email in requested_emails:
+        if email == actor_email:
+            selected_users.append(actor_user)
+            selected_names.append(actor_name)
+            selected_emails.append(email)
+            continue
         if email not in allowed_names:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -3987,21 +4070,68 @@ def login(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciais inválidas")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuário inativo")
+    return issue_auth_tokens(session, user, request, user_agent)
 
-    access_token = create_access_token(user)
-    refresh_token = create_refresh_token(user, session, user_agent, get_client_ip(request))
-    user.last_login_at = datetime.utcnow()
-    user.failed_login_count = 0
-    user.locked_until = None
-    user.updated_at = datetime.utcnow()
-    session.add(user)
-    session.commit()
-    return TokenPairResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        user=serialize_auth_user(session, user),
+
+@app.post("/auth/register-office", response_model=TokenPairResponse)
+def register_office(
+    payload: PublicOfficeSignupRequest,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    user_agent: Annotated[str | None, Header()] = None,
+) -> TokenPairResponse:
+    if not PUBLIC_SIGNUP_ENABLED:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cadastro público indisponível no momento")
+
+    office_name = normalize_organization_name(payload.office_name)
+    owner_name = normalize_organization_name(payload.owner_full_name)
+    owner_email = normalize_email(payload.owner_email)
+    owner_phone = payload.owner_phone.strip() if payload.owner_phone else None
+
+    if len(office_name) < 3:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe o nome do escritório")
+    if len(owner_name) < 3:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe o nome do responsável")
+    if not owner_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe o e-mail do responsável")
+    if session.exec(select(User).where(User.email == owner_email)).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email já cadastrado")
+    existing_organization = session.exec(select(Organization).where(func.lower(Organization.name) == office_name.lower())).first()
+    if existing_organization:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Já existe um escritório com esse nome")
+
+    validate_password_strength(payload.owner_password)
+
+    plan = session.exec(select(Plan).where(Plan.slug == PUBLIC_SIGNUP_PLAN_SLUG, Plan.is_active == True)).first()  # noqa: E712
+    if not plan:
+        plan = session.exec(select(Plan).where(Plan.is_active == True)).first()  # noqa: E712
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Nenhum plano disponível para cadastro")
+
+    organization = Organization(
+        name=office_name,
+        plan_id=plan.id,
+        is_active=True,
     )
+    session.add(organization)
+    session.commit()
+    session.refresh(organization)
+
+    owner = User(
+        organization_id=organization.id,
+        email=owner_email,
+        hashed_password=hash_password(payload.owner_password),
+        full_name=owner_name,
+        phone=owner_phone,
+        role="owner",
+        is_active=True,
+        email_verified=False,
+    )
+    session.add(owner)
+    session.commit()
+    session.refresh(owner)
+
+    return issue_auth_tokens(session, owner, request, user_agent)
 
 
 @app.get("/auth/me")
@@ -5601,6 +5731,8 @@ def handle_publication(
         matched_case=matched_case,
         wallet=wallet,
         raw_emails=payload.responsible_emails,
+        include_actor_responsible=payload.include_actor_responsible,
+        allow_office_wide_responsibles=payload.allow_office_wide_responsibles,
     )
     due_at = parse_deadline_due_date(payload.due_date or "")
     created_agenda_items = create_publication_agenda_deadlines(

@@ -62,12 +62,12 @@ import {
   updateFinanceEntry as apiUpdateFinanceEntry,
   updateWallet as apiUpdateWallet,
   loadAuthSession,
-  login as apiLogin,
   logout as apiLogout,
   ping,
   resetTeamMemberPassword as apiResetTeamMemberPassword,
   runPublicationAutomationNow as apiRunPublicationAutomationNow,
   saveAuthSession,
+  registerOffice as apiRegisterOffice,
   me as apiMe,
   updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
 } from "./api";
@@ -109,6 +109,16 @@ type ClientFileTree = {
 type FilesFolderTarget =
   | { scope: "client"; folderLabel: string }
   | { scope: "case"; caseId: number; folderLabel: string };
+
+const emptyOfficeSignupForm = {
+  officeName: "",
+  ownerName: "",
+  ownerPhone: "",
+  ownerEmail: "",
+  password: "",
+  confirmPassword: "",
+  acceptedTerms: false
+};
 
 const textScaleOptions = [
   { label: "Normal", value: 1 },
@@ -5908,82 +5918,1075 @@ function Finance() {
   );
 }
 
-function Home() {
-  const quickPrompts = [
-    "Quais prazos vencem esta semana?",
-    "Resumo do processo do Cliente X",
-    "Intimações recebidas hoje",
-    "Prazos urgentes nas próximas 48h"
-  ];
+type AssistantMessage = {
+  id: string;
+  role: "assistant" | "user";
+  text: string;
+};
+
+const assistantQuickPrompts = [
+  "Quais prazos vencem hoje?",
+  "Me mostre as audiências da semana",
+  "Como está o painel financeiro?",
+  "Quero revisar um processo específico"
+] as const;
+
+const createAssistantMessage = (role: AssistantMessage["role"], text: string): AssistantMessage => ({
+  id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  role,
+  text
+});
+
+const buildAssistantWelcomeMessage = (userName?: string | null) => {
+  const firstName = userName?.trim().split(/\s+/)[0];
+  return firstName
+    ? `Olá, ${firstName}. Sou o NewLaw AI. Posso organizar perguntas rápidas sobre prazos, agenda, publicações e processos sem tirar você da tela atual.`
+    : "Olá. Sou o NewLaw AI. Posso organizar perguntas rápidas sobre prazos, agenda, publicações e processos sem tirar você da tela atual.";
+};
+
+const buildAssistantReply = (question: string) => {
+  const normalized = question.trim().toLowerCase();
+  if (!normalized) {
+    return "Me diga o tema principal e eu organizo o próximo passo dentro do NEWLAW.";
+  }
+  if (normalized.includes("prazo") || normalized.includes("venc")) {
+    return "Para prazos, eu priorizaria a Agenda e a Home semanal. Posso te orientar a localizar vencimentos do dia, destacar itens fatais e separar por processo ou responsável.";
+  }
+  if (normalized.includes("audi") || normalized.includes("sess")) {
+    return "As audiências ficam mais claras na visão semanal da Home e na Agenda. Se você quiser, eu posso te guiar por data, tribunal ou responsável antes de abrir a tela certa.";
+  }
+  if (normalized.includes("publica") || normalized.includes("intima")) {
+    return "Para publicações e intimações, o fluxo ideal é abrir Publicações, revisar os itens do dia e gerar tarefa ou prazo direto dali. Posso te orientar nesse passo a passo.";
+  }
+  if (normalized.includes("finance") || normalized.includes("receita") || normalized.includes("despesa")) {
+    return "No Financeiro e no Dashboard, eu consigo te direcionar entre receita ativa, despesas, recebimentos previstos e evolução mensal. Se quiser, começamos pelos indicadores principais.";
+  }
+  if (normalized.includes("process") || normalized.includes("caso")) {
+    return "Se você me passar o número do processo ou o cliente, eu organizo a busca e te direciono para andamentos, agenda e documentos relacionados.";
+  }
+  if (normalized.includes("cliente") || normalized.includes("pessoa")) {
+    return "Para cliente, eu sugiro começar por Pessoas ou Processos. A partir dali dá para localizar contato, casos ativos, responsáveis e pendências abertas.";
+  }
+  return "Posso te apoiar com prazos, audiências, publicações, processos, clientes e indicadores do sistema. Me diga o foco principal e eu estruturo o próximo passo.";
+};
+
+function NewLawAssistantModal({
+  open,
+  onClose,
+  userName
+}: {
+  open: boolean;
+  onClose: () => void;
+  userName?: string | null;
+}) {
+  const [draft, setDraft] = useState("");
+  const [messages, setMessages] = useState<AssistantMessage[]>(() => [createAssistantMessage("assistant", buildAssistantWelcomeMessage(userName))]);
+  const [isTyping, setIsTyping] = useState(false);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const replyTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [onClose, open]);
+
+  useEffect(
+    () => () => {
+      if (replyTimeoutRef.current) {
+        window.clearTimeout(replyTimeoutRef.current);
+      }
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    window.setTimeout(() => {
+      transcriptRef.current?.scrollTo({
+        top: transcriptRef.current.scrollHeight,
+        behavior: "smooth"
+      });
+    }, 0);
+  }, [isTyping, messages, open]);
+
+  const handleSendMessage = (rawValue?: string) => {
+    const value = (rawValue ?? draft).trim();
+    if (!value || isTyping) return;
+    if (replyTimeoutRef.current) {
+      window.clearTimeout(replyTimeoutRef.current);
+      replyTimeoutRef.current = null;
+    }
+    setMessages((current) => [...current, createAssistantMessage("user", value)]);
+    setDraft("");
+    setIsTyping(true);
+    replyTimeoutRef.current = window.setTimeout(() => {
+      setMessages((current) => [...current, createAssistantMessage("assistant", buildAssistantReply(value))]);
+      setIsTyping(false);
+      replyTimeoutRef.current = null;
+    }, 420);
+  };
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    handleSendMessage();
+  };
+
+  if (!open) return null;
 
   return (
-    <div className="content-card page-card home-card">
-      <div className="page-header home-header">
-        <div>
-          <div className="eyebrow">Home</div>
-          <h1 className="page-title">Central inteligente do escritório</h1>
-          <div className="page-subtitle">Pergunte sobre prazos e publicações sem sair do painel.</div>
-        </div>
-        <div className="pill">Preview</div>
-      </div>
-      <div className="home-ai">
-        <div className="home-ai-header">
-          <div className="home-ai-icon" aria-hidden="true">
-            <svg
-              className="home-ai-svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M12 3l1.8 4.7L18 9.2l-4.2 1.5L12 16l-1.8-5.3L6 9.2l4.2-1.5L12 3z" />
-              <path d="M19 13l.9 2.3L22 16l-2.1.7L19 19l-.9-2.3L16 16l2.1-.7L19 13z" />
-            </svg>
-          </div>
-          <div>
-            <div className="home-ai-title">NewLaw AI</div>
-            <div className="home-ai-subtitle">Assistente jurídico inteligente</div>
-          </div>
-        </div>
-        <div className="home-ai-panel">
-          <div className="home-ai-bubble">
-            Olá! Sou o assistente inteligente do NewLaw. Me diga o período ou o cliente e eu retorno os prazos.
-          </div>
-          <div className="home-ai-empty">
-            <div className="home-ai-empty-title">Sem consultas ainda</div>
-            <div className="home-ai-empty-subtitle">
-              Quando você perguntar, a resposta aparece aqui com datas e processos.
+    <div className="assistant-backdrop" onClick={onClose}>
+      <div className="assistant-popup" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label="NewLaw AI">
+        <div className="assistant-head">
+          <div className="assistant-brand">
+            <div className="assistant-brand-icon" aria-hidden="true">
+              <svg className="assistant-brand-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 3l1.8 4.7L18 9.2l-4.2 1.5L12 16l-1.8-5.3L6 9.2l4.2-1.5L12 3z" />
+                <path d="M19 13l.9 2.3L22 16l-2.1.7L19 19l-.9-2.3L16 16l2.1-.7L19 13z" />
+              </svg>
+            </div>
+            <div className="assistant-brand-copy">
+              <div className="assistant-brand-title">NewLaw AI</div>
+              <div className="assistant-brand-subtitle">Assistente virtual do escritório em qualquer tela.</div>
             </div>
           </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar assistente">
+            X
+          </button>
         </div>
-        <div className="home-ai-suggestions">
-          {quickPrompts.map((prompt) => (
-            <button key={prompt} className="home-ai-chip" type="button">
+
+        <div className="assistant-status-pill">Assistente virtual</div>
+
+        <div className="assistant-transcript scroll-area" ref={transcriptRef}>
+          {messages.map((message) => (
+            <div
+              key={message.id}
+              className={`assistant-message ${message.role === "assistant" ? "assistant-message-assistant" : "assistant-message-user"}`}
+            >
+              <div className="assistant-message-label">{message.role === "assistant" ? "NewLaw AI" : "Você"}</div>
+              <div className="assistant-message-bubble">{message.text}</div>
+            </div>
+          ))}
+
+          {isTyping && (
+            <div className="assistant-message assistant-message-assistant">
+              <div className="assistant-message-label">NewLaw AI</div>
+              <div className="assistant-message-bubble assistant-message-bubble-typing">
+                <span />
+                <span />
+                <span />
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="assistant-prompts">
+          {assistantQuickPrompts.map((prompt) => (
+            <button key={prompt} className="assistant-prompt" type="button" onClick={() => handleSendMessage(prompt)} disabled={isTyping}>
               {prompt}
             </button>
           ))}
         </div>
-        <div className="home-ai-input">
-          <input aria-label="Pergunta para a IA" placeholder="Pergunte algo sobre seus prazos..." />
-          <button className="home-ai-send" type="button" aria-label="Enviar pergunta">
-            <svg
-              className="home-ai-send-icon"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
+
+        <form className="assistant-compose" onSubmit={handleSubmit}>
+          <input
+            aria-label="Pergunta para o NewLaw AI"
+            placeholder="Pergunte sobre prazos, audiências, clientes ou processos..."
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button className="assistant-send" type="submit" disabled={!draft.trim() || isTyping} aria-label="Enviar pergunta">
+            <svg className="assistant-send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M5 12h14" />
               <path d="M13 6l6 6-6 6" />
             </svg>
           </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function Home() {
+  const [clock, setClock] = useState(() => new Date());
+  const [events, setEvents] = useState<AgendaItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setClock(new Date()), 30000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  const today = new Date(clock.getFullYear(), clock.getMonth(), clock.getDate());
+  const todayKey = formatIsoDate(today);
+  const weekStart = useMemo(() => {
+    const start = new Date(today);
+    const day = start.getDay();
+    const diffToMonday = day === 0 ? -6 : 1 - day;
+    start.setDate(start.getDate() + diffToMonday);
+    start.setHours(0, 0, 0, 0);
+    return start;
+  }, [todayKey]);
+  const weekEnd = useMemo(() => {
+    const end = new Date(weekStart);
+    end.setDate(end.getDate() + 6);
+    end.setHours(23, 59, 59, 999);
+    return end;
+  }, [todayKey, weekStart]);
+  const weekStartKey = formatIsoDate(weekStart);
+  const weekEndKey = formatIsoDate(weekEnd);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadHomeAgenda = async () => {
+      setIsLoading(true);
+      setError("");
+      try {
+        const agendaData = await apiListAgendaEvents({
+          start: `${weekStartKey}T00:00:00`,
+          end: `${weekEndKey}T23:59:59`
+        });
+        if (cancelled) return;
+        setEvents(agendaData);
+      } catch (err) {
+        if (cancelled) return;
+        setError(extractApiErrorMessage(err, "Não foi possível carregar os dados da Home."));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    void loadHomeAgenda();
+    return () => {
+      cancelled = true;
+    };
+  }, [weekEndKey, weekStartKey]);
+
+  const titleCaseLabel = (value: string) =>
+    value.replace(/\b([a-zà-ÿ])/gi, (match) => match.toUpperCase());
+
+  const weekdayTitle = titleCaseLabel(today.toLocaleDateString("pt-BR", { weekday: "long" }));
+  const currentDateLabel = today.toLocaleDateString("pt-BR", {
+    day: "numeric",
+    month: "long",
+    year: "numeric"
+  });
+  const currentTimeLabel = clock.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+
+  const internalWeekItems = useMemo(
+    () =>
+      events
+        .filter((item) => item.source === "internal")
+        .sort((left, right) => new Date(left.starts_at).getTime() - new Date(right.starts_at).getTime()),
+    [events]
+  );
+
+  const isAgendaItemDone = (item: AgendaItem) => (item.status || "").trim().toLowerCase() === "concluido";
+  const homeMetaLabel = (item: AgendaItem) => {
+    const labels = [item.reference, agendaEventAssigneesLabel(item), item.location].filter(Boolean);
+    return labels.join(" · ");
+  };
+
+  const deadlinesToday = internalWeekItems.filter(
+    (item) => item.event_type === "deadline" && getAgendaDateKey(item.starts_at) === todayKey
+  );
+  const hearingsWeek = internalWeekItems.filter((item) => item.event_type === "hearing");
+  const deadlinesWeek = internalWeekItems.filter((item) => {
+    const dateKey = getAgendaDateKey(item.starts_at);
+    return item.event_type === "deadline" && dateKey > todayKey && dateKey <= weekEndKey;
+  });
+  const tasksToday = internalWeekItems
+    .filter((item) => {
+      const isTaskType =
+        item.event_type === "meeting" ||
+        item.event_type === "audit" ||
+        (item.kind === "meeting" && item.event_type !== "hearing");
+      return isTaskType && getAgendaDateKey(item.starts_at) === todayKey;
+    })
+    .sort((left, right) => Number(isAgendaItemDone(left)) - Number(isAgendaItemDone(right)));
+
+  const completedTodayCount = internalWeekItems.filter(
+    (item) => getAgendaDateKey(item.starts_at) === todayKey && isAgendaItemDone(item)
+  ).length;
+  const weekDayItems = useMemo(
+    () =>
+      Array.from({ length: 7 }, (_, index) => {
+        const date = new Date(weekStart);
+        date.setDate(weekStart.getDate() + index);
+        const dateKey = formatIsoDate(date);
+        const items = internalWeekItems.filter((item) => getAgendaDateKey(item.starts_at) === dateKey);
+        const hasDeadline = items.some((item) => item.event_type === "deadline");
+        const hasHearing = items.some((item) => item.event_type === "hearing");
+        const hasTask = items.some(
+          (item) =>
+            item.event_type === "meeting" ||
+            item.event_type === "audit" ||
+            (item.kind === "meeting" && item.event_type !== "hearing")
+        );
+        const tone = hasDeadline ? "red" : hasHearing ? "blue" : hasTask ? "green" : "muted";
+        return {
+          key: dateKey,
+          label: weekDays[index],
+          dayNumber: String(date.getDate()).padStart(2, "0"),
+          count: items.length,
+          tone,
+          isToday: dateKey === todayKey
+        };
+      }),
+    [internalWeekItems, todayKey, weekStartKey]
+  );
+
+  const homeKpis = [
+    {
+      id: "fatal",
+      tone: "red",
+      value: deadlinesToday.filter((item) => !isAgendaItemDone(item)).length,
+      label: "Prazos fatais hoje"
+    },
+    {
+      id: "hearings",
+      tone: "amber",
+      value: hearingsWeek.length,
+      label: "Audiências na semana"
+    },
+    {
+      id: "deadlines",
+      tone: "blue",
+      value: deadlinesWeek.filter((item) => !isAgendaItemDone(item)).length,
+      label: "Prazos na semana"
+    },
+    {
+      id: "tasks",
+      tone: "violet",
+      value: tasksToday.filter((item) => !isAgendaItemDone(item)).length,
+      label: "Tarefas pendentes"
+    },
+    {
+      id: "done",
+      tone: "green",
+      value: completedTodayCount,
+      label: "Encerrados hoje"
+    }
+  ];
+
+  return (
+    <div className="content-card page-card home-card">
+      <div className="home-ops-board">
+        <div className="home-ops-head">
+          <div className="home-ops-date">
+            <div className="home-ops-day">{today.getDate()}</div>
+            <div className="home-ops-copy">
+              <div className="home-ops-title">{weekdayTitle}</div>
+              <div className="home-ops-subtitle">{currentDateLabel}</div>
+            </div>
+          </div>
+          <div className="home-clock-pill">{currentTimeLabel}</div>
+        </div>
+
+        <div className="home-week-strip">
+          <div className="home-week-label">Semana</div>
+          {weekDayItems.map((item) => (
+            <div key={item.key} className={`home-week-day ${item.isToday ? "active" : ""}`}>
+              <span className="home-week-day-label">{item.label}</span>
+              <strong>{item.dayNumber}</strong>
+              <span className={`home-week-dot tone-${item.tone}`}>{item.count > 0 ? item.count : "•"}</span>
+            </div>
+          ))}
         </div>
       </div>
+
+      {error && <div className="error">{error}</div>}
+
+      {isLoading ? (
+        <div className="home-loading">Carregando visão operacional...</div>
+      ) : (
+        <>
+          <div className="home-kpi-grid">
+            {homeKpis.map((item) => (
+              <article key={item.id} className={`home-kpi-card tone-${item.tone}`}>
+                <div className="home-kpi-icon" />
+                <div>
+                  <div className="home-kpi-value">{item.value}</div>
+                  <div className="home-kpi-label">{item.label}</div>
+                </div>
+              </article>
+            ))}
+          </div>
+
+          <div className="home-focus-grid">
+            <section className="home-focus-card">
+              <div className="home-focus-head tone-red">
+                <span className="home-focus-dot" />
+                <strong>Prazos Fatais — Hoje</strong>
+              </div>
+              <div className="home-focus-list">
+                {deadlinesToday.length > 0 ? (
+                  deadlinesToday.map((item) => (
+                    <div key={item.id} className="home-focus-item">
+                      <div className="home-focus-main">
+                        <span className="home-focus-pill danger">Fatal</span>
+                        <div>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Prazo interno do escritório"}</div>
+                        </div>
+                      </div>
+                      <div className="home-focus-side">{formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}</div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="home-focus-empty">Nenhum prazo fatal vencendo hoje.</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-focus-card">
+              <div className="home-focus-head tone-blue">
+                <span className="home-focus-dot" />
+                <strong>Audiências da Semana</strong>
+              </div>
+              <div className="home-focus-list">
+                {hearingsWeek.length > 0 ? (
+                  hearingsWeek.map((item) => (
+                    <div key={item.id} className="home-focus-item">
+                      <div className="home-focus-main">
+                        <span className="home-focus-pill blue">{agendaEventTagLabel(item).slice(0, 3).toUpperCase()}</span>
+                        <div>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Audiência vinculada à agenda"}</div>
+                        </div>
+                      </div>
+                      <div className="home-focus-side">
+                        {weekDays[new Date(item.starts_at).getDay() === 0 ? 6 : new Date(item.starts_at).getDay() - 1]} ·{" "}
+                        {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="home-focus-empty">Nenhuma audiência cadastrada nesta semana.</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-focus-card">
+              <div className="home-focus-head tone-amber">
+                <span className="home-focus-dot" />
+                <strong>Prazos da Semana</strong>
+              </div>
+              <div className="home-focus-list">
+                {deadlinesWeek.length > 0 ? (
+                  deadlinesWeek.map((item) => (
+                    <div key={item.id} className="home-focus-item">
+                      <div className="home-focus-main">
+                        <span className="home-focus-pill amber">
+                          {weekDays[new Date(item.starts_at).getDay() === 0 ? 6 : new Date(item.starts_at).getDay() - 1]}
+                        </span>
+                        <div>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Prazo planejado para a semana"}</div>
+                        </div>
+                      </div>
+                      <div className="home-focus-side">{formatBrazilDate(getAgendaDateKey(item.starts_at))}</div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="home-focus-empty">Nenhum prazo adicional programado nesta semana.</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-focus-card">
+              <div className="home-focus-head tone-green">
+                <span className="home-focus-dot" />
+                <strong>Tarefas do Dia</strong>
+              </div>
+              <div className="home-focus-list">
+                {tasksToday.length > 0 ? (
+                  tasksToday.map((item) => {
+                    const done = isAgendaItemDone(item);
+                    return (
+                      <div key={item.id} className={`home-task-item ${done ? "done" : ""}`}>
+                        <span className={`home-task-check ${done ? "done" : ""}`}>{done ? "✓" : ""}</span>
+                        <div className={`home-task-copy ${done ? "done" : ""}`}>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Tarefa operacional do dia"}</div>
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="home-focus-empty">Nenhuma tarefa do dia cadastrada para hoje.</div>
+                )}
+              </div>
+            </section>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+const dashboardPalette = ["#e1ba3b", "#54c3c1", "#5f95e6", "#ff6b6b", "#a256ed", "#37c978"];
+
+const formatDashboardTrend = (value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value)) return "sem base";
+  const rounded = value.toFixed(Math.abs(value) >= 10 ? 0 : 1).replace(".", ",");
+  return `${value > 0 ? "+" : ""}${rounded}%`;
+};
+
+const buildDashboardConicGradient = (items: Array<{ value: number; color: string }>) => {
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  if (total <= 0) return "conic-gradient(rgba(255,255,255,0.08) 0 100%)";
+  let cursor = 0;
+  const stops = items.map((item) => {
+    const start = cursor;
+    cursor += (item.value / total) * 100;
+    return `${item.color} ${start}% ${cursor}%`;
+  });
+  return `conic-gradient(${stops.join(", ")})`;
+};
+
+function Dashboard() {
+  const [entries, setEntries] = useState<FinanceEntry[]>([]);
+  const [cases, setCases] = useState<ApiCase[]>([]);
+  const [clients, setClients] = useState<ApiClient[]>([]);
+  const [members, setMembers] = useState<ApiTeamMember[]>([]);
+  const [agendaItems, setAgendaItems] = useState<AgendaItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadDashboard = async () => {
+      setIsLoading(true);
+      setError("");
+
+      const now = new Date();
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 30);
+
+      const [financeResult, casesResult, clientsResult, teamResult, agendaResult] = await Promise.allSettled([
+        apiListFinanceEntries(),
+        apiListCases(),
+        apiListClients(),
+        apiListTeamMembers(),
+        apiListAgendaEvents({ start: formatIsoDate(start), end: formatIsoDate(end) })
+      ]);
+
+      if (cancelled) return;
+
+      const failedAreas: string[] = [];
+
+      if (financeResult.status === "fulfilled") {
+        setEntries(financeResult.value.map(toFinanceEntry));
+      } else {
+        setEntries([]);
+        failedAreas.push("financeiro");
+      }
+
+      if (casesResult.status === "fulfilled") {
+        setCases(casesResult.value);
+      } else {
+        setCases([]);
+        failedAreas.push("processos");
+      }
+
+      if (clientsResult.status === "fulfilled") {
+        setClients(clientsResult.value);
+      } else {
+        setClients([]);
+        failedAreas.push("clientes");
+      }
+
+      if (teamResult.status === "fulfilled") {
+        setMembers(teamResult.value);
+      } else {
+        setMembers([]);
+        failedAreas.push("equipe");
+      }
+
+      if (agendaResult.status === "fulfilled") {
+        setAgendaItems(agendaResult.value);
+      } else {
+        setAgendaItems([]);
+        failedAreas.push("agenda");
+      }
+
+      if (failedAreas.length === 5) {
+        setError("Não foi possível carregar os dados do dashboard.");
+      } else if (failedAreas.length > 0) {
+        setError(`Alguns blocos não puderam ser atualizados: ${failedAreas.join(", ")}.`);
+      }
+
+      setIsLoading(false);
+    };
+
+    void loadDashboard();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const revenueEntries = useMemo(() => entries.filter((entry) => entry.entryType === "receita"), [entries]);
+  const expectedRevenue = useMemo(
+    () => revenueEntries.reduce((sum, entry) => sum + entry.amount, 0),
+    [revenueEntries]
+  );
+  const receivedRevenue = useMemo(
+    () => revenueEntries.reduce((sum, entry) => sum + getFinanceSettledAmount(entry), 0),
+    [revenueEntries]
+  );
+  const overdueRevenue = useMemo(
+    () =>
+      revenueEntries.reduce((sum, entry) => {
+        return getFinanceStatus(entry) === "Vencido" ? sum + entry.amount : sum;
+      }, 0),
+    [revenueEntries]
+  );
+  const receiptRate = expectedRevenue > 0 ? Math.round((receivedRevenue / expectedRevenue) * 100) : 0;
+  const casesById = useMemo(() => new Map(cases.map((item) => [item.id, item] as const)), [cases]);
+  const casesByNumber = useMemo(
+    () => new Map(cases.map((item) => [normalizeCaseDigits(item.number), item] as const)),
+    [cases]
+  );
+  const normalizedCaseRows = useMemo(
+    () =>
+      cases.map((item) => ({
+        status: normalizeCaseStatus(item.status),
+        walletName: item.wallet_name?.trim() || item.wallet_nickname?.trim() || "Sem carteira",
+        area: item.court?.trim() ? formatCourtOrRegion(item.court.trim()) : "Sem área"
+      })),
+    [cases]
+  );
+  const activeCases = normalizedCaseRows.filter((item) => item.status !== "Arquivado").length;
+  const statusDistribution = useMemo(() => {
+    const counts = new Map<string, number>([
+      ["Ativo", 0],
+      ["Em andamento", 0],
+      ["Arquivado", 0]
+    ]);
+    normalizedCaseRows.forEach((item) => {
+      counts.set(item.status, (counts.get(item.status) || 0) + 1);
+    });
+    return [
+      { label: "Ativos", value: counts.get("Ativo") || 0, color: "#5f95e6" },
+      { label: "Em andamento", value: counts.get("Em andamento") || 0, color: "#37c978" },
+      { label: "Arquivados", value: counts.get("Arquivado") || 0, color: "#ffb020" }
+    ];
+  }, [normalizedCaseRows]);
+  const totalStatusCases = statusDistribution.reduce((sum, item) => sum + item.value, 0);
+  const donutGradient = useMemo(() => buildDashboardConicGradient(statusDistribution), [statusDistribution]);
+
+  const activeMembers = members.filter((member) => member.is_active).length;
+  const activeTeamsCount = new Set(
+    members
+      .filter((member) => member.is_active)
+      .map((member) => member.team_name.trim())
+      .filter(Boolean)
+  ).size;
+  const membersByTeam = useMemo(() => {
+    const counts = new Map<string, number>();
+    members.forEach((member) => {
+      if (!member.is_active) return;
+      const label = member.team_name.trim() || member.role_title.trim() || "Sem equipe";
+      counts.set(label, (counts.get(label) || 0) + 1);
+    });
+    return [...counts.entries()]
+      .map(([label, value], index) => ({
+        label,
+        value,
+        color: dashboardPalette[index % dashboardPalette.length]
+      }))
+      .sort((left, right) => right.value - left.value)
+      .slice(0, 6);
+  }, [members]);
+  const maxMembersByTeam = Math.max(...membersByTeam.map((item) => item.value), 1);
+
+  const successByWallet = useMemo(() => {
+    const buckets = new Map<string, { expected: number; received: number }>();
+    revenueEntries.forEach((entry) => {
+      const linkedCase =
+        (entry.caseId ? casesById.get(entry.caseId) : undefined) ||
+        casesByNumber.get(normalizeCaseDigits(entry.process));
+      const walletLabel = linkedCase?.wallet_name?.trim() || linkedCase?.wallet_nickname?.trim() || "Sem carteira";
+      const current = buckets.get(walletLabel) || { expected: 0, received: 0 };
+      current.expected += entry.amount;
+      current.received += getFinanceSettledAmount(entry);
+      buckets.set(walletLabel, current);
+    });
+    const output = [...buckets.entries()]
+      .filter(([, values]) => values.expected > 0)
+      .map(([label, values], index) => ({
+        label,
+        rate: Math.round((values.received / values.expected) * 100),
+        expected: values.expected,
+        received: values.received,
+        color: dashboardPalette[index % dashboardPalette.length]
+      }))
+      .sort((left, right) => right.rate - left.rate)
+      .slice(0, 5);
+    if (output.length > 0) return output;
+    return [
+      {
+        label: "Geral",
+        rate: receiptRate,
+        expected: expectedRevenue,
+        received: receivedRevenue,
+        color: dashboardPalette[0]
+      }
+    ];
+  }, [casesById, casesByNumber, expectedRevenue, receiptRate, receivedRevenue, revenueEntries]);
+
+  const monthlyRevenueSeries = useMemo(() => {
+    const now = new Date();
+    const buckets = Array.from({ length: 12 }, (_, index) => {
+      const date = new Date(now.getFullYear(), now.getMonth() - 11 + index, 1);
+      return {
+        key: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`,
+        label: financeMonths[date.getMonth()],
+        value: 0
+      };
+    });
+
+    const indexByKey = new Map(buckets.map((item, index) => [item.key, index] as const));
+    revenueEntries.forEach((entry) => {
+      const settledAmount = getFinanceSettledAmount(entry);
+      if (settledAmount <= 0) return;
+      const reference = toDateStart(entry.paymentDate || entry.dueDate);
+      if (!reference) return;
+      const key = `${reference.getFullYear()}-${String(reference.getMonth() + 1).padStart(2, "0")}`;
+      const bucketIndex = indexByKey.get(key);
+      if (bucketIndex == null) return;
+      buckets[bucketIndex].value += settledAmount;
+    });
+
+    return buckets;
+  }, [revenueEntries]);
+  const monthlyRevenueValues = monthlyRevenueSeries.map((item) => item.value);
+  const monthlyRevenueScale = useMemo(() => buildNiceChartScale(monthlyRevenueValues, 5), [monthlyRevenueValues]);
+  const monthlyRevenueTicks = useMemo(
+    () =>
+      [...monthlyRevenueScale.ticks].reverse().map((tick) => ({
+        value: tick,
+        label: formatCurrencyAxis(tick),
+        top: `${((monthlyRevenueScale.max - tick) / monthlyRevenueScale.range) * 100}%`
+      })),
+    [monthlyRevenueScale]
+  );
+  const monthlyRevenuePoints = useMemo(
+    () =>
+      monthlyRevenueValues.map((value, index) => ({
+        value,
+        x: monthlyRevenueValues.length === 1 ? 50 : (index / (monthlyRevenueValues.length - 1)) * 100,
+        y: ((monthlyRevenueScale.max - value) / monthlyRevenueScale.range) * 100
+      })),
+    [monthlyRevenueScale, monthlyRevenueValues]
+  );
+  const monthlyRevenueLine = useMemo(() => buildSmoothChartPath(monthlyRevenuePoints), [monthlyRevenuePoints]);
+  const monthlyRevenueArea = useMemo(() => {
+    if (!monthlyRevenuePoints.length) return "";
+    const first = monthlyRevenuePoints[0];
+    const last = monthlyRevenuePoints[monthlyRevenuePoints.length - 1];
+    return `${monthlyRevenueLine} L ${last.x} 100 L ${first.x} 100 Z`;
+  }, [monthlyRevenueLine, monthlyRevenuePoints]);
+  const currentMonthRevenue = monthlyRevenueSeries[monthlyRevenueSeries.length - 1]?.value || 0;
+  const previousMonthRevenue = monthlyRevenueSeries[monthlyRevenueSeries.length - 2]?.value || 0;
+  const revenueTrend = previousMonthRevenue > 0 ? ((currentMonthRevenue - previousMonthRevenue) / previousMonthRevenue) * 100 : null;
+
+  const criticalDeadlinesCount = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return agendaItems.filter((item) => {
+      if (item.source !== "internal") return false;
+      if (item.event_type !== "deadline" && item.event_type !== "hearing") return false;
+      if ((item.status || "").toLowerCase() === "concluido") return false;
+      const startsAt = new Date(item.starts_at);
+      if (Number.isNaN(startsAt.getTime())) return false;
+      const due = new Date(startsAt.getFullYear(), startsAt.getMonth(), startsAt.getDate());
+      const diff = Math.floor((due.getTime() - today.getTime()) / (24 * 60 * 60 * 1000));
+      return diff >= 0 && diff <= 7;
+    }).length;
+  }, [agendaItems]);
+
+  const paidClients = new Set(
+    revenueEntries
+      .filter((entry) => getFinanceSettledAmount(entry) > 0)
+      .map((entry) => entry.client.trim().toLowerCase())
+      .filter(Boolean)
+  ).size;
+  const averageTicket = paidClients > 0 ? receivedRevenue / paidClients : 0;
+  const activeMemberShare = members.length > 0 ? Math.round((activeMembers / members.length) * 100) : 0;
+  const indicators = [
+    { label: "Receita prevista", value: formatCurrencyBRL(expectedRevenue), note: "Base de 12 meses" },
+    { label: "Receita em atraso", value: formatCurrencyBRL(overdueRevenue), note: "Lançamentos vencidos" },
+    { label: "Ticket médio", value: formatCurrencyBRL(averageTicket), note: "Por cliente pagante" },
+    { label: "Equipe ativa", value: `${activeMemberShare}%`, note: `${activeMembers}/${members.length || 0} membros ativos` }
+  ];
+
+  const kpis = [
+    {
+      id: "revenue",
+      icon: "R$",
+      tone: "gold",
+      value: formatCurrencyAxis(receivedRevenue),
+      label: "Receita recebida",
+      note: "Últimos 12 meses",
+      trend: formatDashboardTrend(revenueTrend)
+    },
+    {
+      id: "success",
+      icon: "EX",
+      tone: "green",
+      value: `${receiptRate}%`,
+      label: "Taxa de êxito",
+      note: "Recebido sobre previsto",
+      trend: `${formatCurrencyAxis(receivedRevenue)} de ${formatCurrencyAxis(expectedRevenue)}`
+    },
+    {
+      id: "cases",
+      icon: "PC",
+      tone: "blue",
+      value: String(activeCases),
+      label: "Processos ativos",
+      note: `${cases.length} cadastrados`,
+      trend: `${statusDistribution[2]?.value || 0} arquivados`
+    },
+    {
+      id: "deadlines",
+      icon: "PR",
+      tone: "red",
+      value: String(criticalDeadlinesCount),
+      label: "Prazos críticos",
+      note: "Próximos 7 dias",
+      trend: "Agenda interna"
+    },
+    {
+      id: "team",
+      icon: "EQ",
+      tone: "violet",
+      value: String(activeMembers),
+      label: "Membros ativos",
+      note: `${activeTeamsCount} equipes`,
+      trend: `${members.length} cadastrados`
+    },
+    {
+      id: "clients",
+      icon: "CL",
+      tone: "amber",
+      value: String(clients.length),
+      label: "Clientes cadastrados",
+      note: `${paidClients} pagantes`,
+      trend: `Ticket ${formatCurrencyAxis(averageTicket)}`
+    }
+  ];
+
+  return (
+    <div className="content-card page-card dashboard-page">
+      <div className="page-header dashboard-header">
+        <div>
+          <div className="eyebrow">Dashboard</div>
+          <h1 className="page-title">Indicadores do escritório</h1>
+          <div className="page-subtitle">
+            Receita, equipe, status do acervo e sinais operacionais em um painel consolidado.
+          </div>
+        </div>
+        <div className="pill">Operacional</div>
+      </div>
+
+      {error && <div className="error">{error}</div>}
+
+      {isLoading ? (
+        <div className="publication-empty">Carregando indicadores...</div>
+      ) : (
+        <>
+          <div className="dashboard-kpi-grid">
+            {kpis.map((item) => (
+              <article key={item.id} className={`dashboard-kpi-card tone-${item.tone}`}>
+                <div className="dashboard-kpi-head">
+                  <span className="dashboard-kpi-icon">{item.icon}</span>
+                  <span className="dashboard-kpi-trend">{item.trend}</span>
+                </div>
+                <div className="dashboard-kpi-value">{item.value}</div>
+                <div className="dashboard-kpi-label">{item.label}</div>
+                <div className="dashboard-kpi-note">{item.note}</div>
+              </article>
+            ))}
+          </div>
+
+          <div className="dashboard-main-grid">
+            <section className="dashboard-panel dashboard-panel-wide">
+              <div className="dashboard-panel-head">
+                <div>
+                  <div className="dashboard-panel-title">Evolução mensal de receita</div>
+                  <div className="dashboard-panel-caption">Receitas efetivamente recebidas nos últimos 12 meses.</div>
+                </div>
+                <div className="dashboard-panel-highlight">
+                  <strong>{formatCurrencyBRL(currentMonthRevenue)}</strong>
+                  <span>mês atual</span>
+                </div>
+              </div>
+
+              {monthlyRevenueSeries.some((item) => item.value > 0) ? (
+                <div className="dashboard-line-shell">
+                  <div className="dashboard-line-yaxis" aria-hidden="true">
+                    {monthlyRevenueTicks.map((tick) => (
+                      <span key={tick.value} style={{ top: tick.top }}>
+                        {tick.label}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="dashboard-line-plot">
+                    <div className="dashboard-line-area">
+                      {monthlyRevenueTicks.map((tick) => (
+                        <div key={tick.value} className="dashboard-line-gridline" style={{ top: tick.top }} />
+                      ))}
+                      <svg className="dashboard-line-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                        <defs>
+                          <linearGradient id="dashboardRevenueFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="rgba(225, 186, 59, 0.34)" />
+                            <stop offset="100%" stopColor="rgba(225, 186, 59, 0.02)" />
+                          </linearGradient>
+                        </defs>
+                        {monthlyRevenueArea && <path d={monthlyRevenueArea} fill="url(#dashboardRevenueFill)" />}
+                        {monthlyRevenueLine && <path d={monthlyRevenueLine} className="dashboard-line-path" />}
+                        {monthlyRevenuePoints.map((point) => (
+                          <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="1.8" className="dashboard-line-point" />
+                        ))}
+                      </svg>
+                    </div>
+                    <div className="dashboard-line-months">
+                      {monthlyRevenueSeries.map((item) => (
+                        <span key={item.key}>{item.label}</span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="dashboard-empty">Cadastre receitas para visualizar a evolução mensal.</div>
+              )}
+            </section>
+
+            <section className="dashboard-panel">
+              <div className="dashboard-panel-head">
+                <div>
+                  <div className="dashboard-panel-title">Êxito por carteira</div>
+                  <div className="dashboard-panel-caption">Percentual de recebimento por carteira vinculada aos lançamentos.</div>
+                </div>
+              </div>
+              <div className="dashboard-bar-list">
+                {successByWallet.map((item) => (
+                  <div key={item.label} className="dashboard-bar-item">
+                    <div className="dashboard-bar-head">
+                      <span>{item.label}</span>
+                      <strong>{item.rate}%</strong>
+                    </div>
+                    <div className="dashboard-bar-track">
+                      <div
+                        className="dashboard-bar-fill"
+                        style={{ width: `${Math.min(item.rate, 100)}%`, background: item.color }}
+                      />
+                    </div>
+                    <div className="dashboard-bar-note">
+                      {formatCurrencyAxis(item.received)} recebidos de {formatCurrencyAxis(item.expected)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+
+          <div className="dashboard-secondary-grid">
+            <section className="dashboard-panel">
+              <div className="dashboard-panel-head">
+                <div>
+                  <div className="dashboard-panel-title">Processos por status</div>
+                  <div className="dashboard-panel-caption">Distribuição atual do acervo processual.</div>
+                </div>
+              </div>
+
+              {totalStatusCases > 0 ? (
+                <div className="dashboard-donut-shell">
+                  <div className="dashboard-donut-chart" style={{ background: donutGradient }}>
+                    <div className="dashboard-donut-hole">
+                      <strong>{activeCases}</strong>
+                      <span>ativos</span>
+                    </div>
+                  </div>
+                  <div className="dashboard-donut-legend">
+                    {statusDistribution.map((item) => (
+                      <div key={item.label} className="dashboard-donut-legend-item">
+                        <span className="dashboard-donut-color" style={{ background: item.color }} />
+                        <div>
+                          <strong>{item.label}</strong>
+                          <span>
+                            {item.value} processo(s) · {Math.round((item.value / totalStatusCases) * 100)}%
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="dashboard-empty">Cadastre processos para acompanhar a distribuição por status.</div>
+              )}
+            </section>
+
+            <section className="dashboard-panel dashboard-panel-wide">
+              <div className="dashboard-panel-head">
+                <div>
+                  <div className="dashboard-panel-title">Membros da equipe</div>
+                  <div className="dashboard-panel-caption">Distribuição de usuários ativos por equipe ou núcleo.</div>
+                </div>
+              </div>
+
+              {membersByTeam.length > 0 ? (
+                <div className="dashboard-bar-list">
+                  {membersByTeam.map((item) => (
+                    <div key={item.label} className="dashboard-bar-item">
+                      <div className="dashboard-bar-head">
+                        <span>{item.label}</span>
+                        <strong>{item.value}</strong>
+                      </div>
+                      <div className="dashboard-bar-track">
+                        <div
+                          className="dashboard-bar-fill"
+                          style={{ width: `${(item.value / maxMembersByTeam) * 100}%`, background: item.color }}
+                        />
+                      </div>
+                      <div className="dashboard-bar-note">{item.value} membro(s) ativo(s)</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="dashboard-empty">Cadastre membros para visualizar a composição da equipe.</div>
+              )}
+            </section>
+          </div>
+
+          <section className="dashboard-panel">
+            <div className="dashboard-panel-head">
+              <div>
+                <div className="dashboard-panel-title">Indicadores rápidos</div>
+                <div className="dashboard-panel-caption">Sinais complementares para leitura executiva do escritório.</div>
+              </div>
+            </div>
+            <div className="dashboard-indicators-grid">
+              {indicators.map((item) => (
+                <div key={item.label} className="dashboard-indicator-card">
+                  <span>{item.label}</span>
+                  <strong>{item.value}</strong>
+                  <p>{item.note}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
     </div>
   );
 }
@@ -6013,11 +7016,26 @@ const splitStoredOab = (value: string) => {
   };
 };
 
+type PublicationActionMode = "task" | "deadline" | "register";
+
 type PublicationTaskFormState = {
   title: string;
   details: string;
   dueDate: string;
   responsibleEmails: string[];
+};
+
+type PublicationDeadlinePriority = "low" | "medium" | "high";
+type PublicationDeadlineReminder = "1" | "3" | "7";
+
+type PublicationDeadlineFormState = {
+  action: string;
+  termDays: string;
+  dueDate: string;
+  responsibleEmail: string;
+  priority: PublicationDeadlinePriority;
+  reminderDays: PublicationDeadlineReminder;
+  observations: string;
 };
 
 type PublicationSummaryFilterKey =
@@ -6087,6 +7105,415 @@ const normalizeLooseText = (value?: string | null) =>
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
 
+const publicationClaimantRoleTokens = new Set(
+  [
+    "autor",
+    "autora",
+    "requerente",
+    "apelante",
+    "agravante",
+    "recorrente",
+    "embargante",
+    "exequente",
+    "impetrante",
+    "inventariante",
+    "demandante",
+    "promovente",
+    "interessado",
+    "interessada"
+  ].map((label) => normalizeLooseText(label).replace(/[^a-z]/g, ""))
+);
+
+const publicationDefendantRoleTokens = new Set(
+  [
+    "reu",
+    "réu",
+    "requerido",
+    "requerida",
+    "apelado",
+    "apelada",
+    "agravado",
+    "agravada",
+    "recorrido",
+    "recorrida",
+    "embargado",
+    "embargada",
+    "executado",
+    "executada",
+    "impetrado",
+    "impetrada",
+    "demandado",
+    "demandada",
+    "promovido",
+    "promovida"
+  ].map((label) => normalizeLooseText(label).replace(/[^a-z]/g, ""))
+);
+
+const publicationRolePatternSource = [
+  "AUTORA?",
+  "R(?:É|E)U",
+  "REQUERENTE",
+  "REQUERID[OA]",
+  "APELANTE",
+  "APELAD[OA]",
+  "AGRAVANTE",
+  "AGRAVAD[OA]",
+  "RECORRENTE",
+  "RECORRID[OA]",
+  "EMBARGANTE",
+  "EMBARGAD[OA]",
+  "EXEQUENTE",
+  "EXECUTAD[OA]",
+  "IMPETRANTE",
+  "IMPETRAD[OA]",
+  "INVENTARIANTE",
+  "INTERESSAD[OA]",
+  "DEMANDANTE",
+  "DEMANDAD[OA]",
+  "PROMOVENTE",
+  "PROMOVID[OA]"
+].join("|");
+
+const publicationNarrativeBoundaryPatternSource = [
+  "DESPACHO",
+  "DECIS[AÃ]O",
+  "SENTEN[CÇ]A",
+  "AC[OÓ]RD[AÃ]O",
+  "CERTID[AÃ]O",
+  "INTIMA[CÇ][AÃ]O",
+  "INTIMEM-SE",
+  "PUBLIQUE-SE",
+  "CUMPRA-SE",
+  "SEM\\s+PREJU[IÍ]ZO",
+  "VISTOS"
+].join("|");
+
+const publicationCompanyNameHints = [
+  "LTDA",
+  "S/A",
+  "SA",
+  "EIRELI",
+  "ME",
+  "MEI",
+  "EPP",
+  "EMPRESA",
+  "COMERCIO",
+  "COMÉRCIO",
+  "INDUSTRIA",
+  "INDÚSTRIA",
+  "COOPERATIVA",
+  "BANCO",
+  "CONDOMINIO",
+  "CONDOMÍNIO",
+  "ASSOCIACAO",
+  "ASSOCIAÇÃO",
+  "FUNDACAO",
+  "FUNDAÇÃO",
+  "INSTITUTO",
+  "HOLDING"
+];
+
+const normalizePublicationRoleToken = (value: string) => normalizeLooseText(value).replace(/[^a-z]/g, "");
+
+const publicationPartyCapturePattern = new RegExp(
+  `\\b(${publicationRolePatternSource})\\s*:\\s*([\\s\\S]*?)(?=\\b(?:ADVOGAD[OA]\\s+DO\\(A\\)\\s+)?(?:${publicationRolePatternSource})\\s*:|\\b(?:${publicationNarrativeBoundaryPatternSource})\\b|$)`,
+  "gi"
+);
+
+const publicationLawyerCapturePattern = new RegExp(
+  `ADVOGAD[OA]\\s+DO\\(A\\)\\s+(${publicationRolePatternSource})\\s*:\\s*([\\s\\S]*?)(?=\\bADVOGAD[OA]\\s+DO\\(A\\)\\s+(?:${publicationRolePatternSource})\\s*:|\\b(?:${publicationRolePatternSource})\\s*:|\\b(?:${publicationNarrativeBoundaryPatternSource})\\b|$)`,
+  "gi"
+);
+
+const stripPublicationParticipantDetails = (value: string) =>
+  value
+    .replace(/\((?:[^)]*(?:oab|cpf|cnpj|represent)[^)]*)\)/gi, "")
+    .replace(/\b(?:cpf|cnpj)\s*[:\-]?\s*\d[\d./-]*/gi, "")
+    .replace(/\b(?:despacho|decis[aã]o|senten[cç]a|ac[oó]rd[aã]o|certid[aã]o|intima[cç][aã]o|intimem-se|publique-se|cumpra-se|sem preju[ií]zo|vistos)\b.*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[,;:\-\s]+|[,;:\-\s]+$/g, "")
+    .trim();
+
+const extractPublicationDocumentInfo = (value: string): { formatted: string; kind: ClientKind | null } => {
+  const cnpjMatch = value.match(/\b\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{4}-?\d{2}\b/);
+  if (cnpjMatch) {
+    const digits = cnpjMatch[0].replace(/\D/g, "");
+    if (isValidCnpj(digits)) {
+      return { formatted: formatCnpj(digits), kind: "PJ" };
+    }
+  }
+  const cpfMatch = value.match(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}-?\d{2}\b/);
+  if (cpfMatch) {
+    const digits = cpfMatch[0].replace(/\D/g, "");
+    if (isValidCpf(digits)) {
+      return { formatted: formatCpf(digits), kind: "PF" };
+    }
+  }
+  return { formatted: "", kind: null };
+};
+
+const stripPublicationDocumentInfo = (value: string) =>
+  value
+    .replace(/\b\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{4}-?\d{2}\b/g, "")
+    .replace(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}-?\d{2}\b/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[,;:\-\s]+|[,;:\-\s]+$/g, "")
+    .trim();
+
+const inferPublicationClientKind = (name: string, document: string) => {
+  const resolved = resolveClientKind(document);
+  if (document.replace(/\D/g, "").length > 0) return resolved;
+  const normalizedName = normalizeLooseText(name);
+  return publicationCompanyNameHints.some((hint) => normalizedName.includes(normalizeLooseText(hint))) ? "PJ" : "PF";
+};
+
+const formatPublicationClientName = (value: string, kind: ClientKind) => {
+  const sanitized = value
+    .replace(/\s+/g, " ")
+    .replace(kind === "PF" ? /[^A-Za-zÀ-ÿ\s]/g : /[^A-Za-zÀ-ÿ0-9\s.&/()-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sanitized.toUpperCase();
+};
+
+const extractPublicationPartySuggestions = (publication: TodayPublicationItem, user: AuthUser | null) => {
+  const text = [publication.summary, publication.title].filter(Boolean).join(";\n");
+  const claimants: string[] = [];
+  const defendants: string[] = [];
+  const others: string[] = [];
+  const seen = new Set<string>();
+  const currentOab = splitStoredOab(user?.oab || "");
+  const normalizedUserName = normalizeLooseText(user?.name || "");
+  let representedSide: "claimant" | "defendant" | null = null;
+
+  for (const match of text.matchAll(new RegExp(publicationPartyCapturePattern.source, publicationPartyCapturePattern.flags))) {
+    const matchIndex = match.index ?? 0;
+    const prefixExcerpt = normalizeLooseText(text.slice(Math.max(0, matchIndex - 24), matchIndex));
+    if (prefixExcerpt.includes("advogado do(a)") || prefixExcerpt.includes("advogada do(a)")) continue;
+    const roleToken = normalizePublicationRoleToken(match[1] || "");
+    const partyValue = stripPublicationParticipantDetails(match[2] || "");
+    const dedupeKey = normalizeLooseText(`${roleToken}:${partyValue}`);
+    if (!partyValue || seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    if (publicationClaimantRoleTokens.has(roleToken)) {
+      claimants.push(partyValue);
+      continue;
+    }
+    if (publicationDefendantRoleTokens.has(roleToken)) {
+      defendants.push(partyValue);
+      continue;
+    }
+    others.push(partyValue);
+  }
+
+  for (const match of text.matchAll(new RegExp(publicationLawyerCapturePattern.source, publicationLawyerCapturePattern.flags))) {
+    const roleToken = normalizePublicationRoleToken(match[1] || "");
+    const lawyerValue = normalizeLooseText(match[2] || "");
+    const oabMatch = currentOab.number
+      ? lawyerValue.includes(currentOab.number) && (!currentOab.uf || lawyerValue.includes(currentOab.uf.toLowerCase()))
+      : false;
+    const nameMatch = normalizedUserName ? lawyerValue.includes(normalizedUserName) : false;
+    if (!oabMatch && !nameMatch) continue;
+    if (publicationClaimantRoleTokens.has(roleToken)) {
+      representedSide = "claimant";
+      break;
+    }
+    if (publicationDefendantRoleTokens.has(roleToken)) {
+      representedSide = "defendant";
+      break;
+    }
+  }
+
+  const preferredParty =
+    representedSide === "defendant"
+      ? defendants[0] || claimants[0] || others[0] || ""
+      : claimants[0] || defendants[0] || others[0] || "";
+  const documentInfo = extractPublicationDocumentInfo(preferredParty);
+  const cleanClientName = stripPublicationDocumentInfo(preferredParty);
+  const clientKind = inferPublicationClientKind(cleanClientName, documentInfo.formatted);
+  const oppositeSide =
+    representedSide === "defendant" ? claimants : defendants.length ? defendants : claimants.slice(1);
+  const counterpartyRaw = oppositeSide.find((party) => normalizeLooseText(party) !== normalizeLooseText(preferredParty)) || "";
+  const counterpartyKind = inferPublicationClientKind(counterpartyRaw, "");
+
+  return {
+    clientName: formatPublicationClientName(cleanClientName, clientKind),
+    clientDocument: documentInfo.formatted,
+    clientKind,
+    counterparty: formatPublicationClientName(stripPublicationDocumentInfo(counterpartyRaw), counterpartyKind)
+  };
+};
+
+const extractSuggestedPublicationCourt = (publication: TodayPublicationItem) => {
+  const haystack = [publication.summary, publication.court_name].filter(Boolean).join("; ");
+  const patterns = [
+    /\b(\d+ª?\s+vara[^;,.]+)/i,
+    /\b(vara[^;,.]+)/i,
+    /\b(juizado[^;,.]+)/i,
+    /\b(c[aâ]mara[^;,.]+)/i,
+    /\b(turma[^;,.]+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = haystack.match(pattern);
+    if (match?.[1]) {
+      const normalized = match[1].replace(/\s+de\s+[^;,.]+$/i, "").trim();
+      return formatCourtOrRegion(normalized).trim();
+    }
+  }
+  const fallback = (publication.court_name || "").trim();
+  return fallback ? formatCourtOrRegion(fallback.replace(/\s+de\s+[^;,.]+$/i, "").trim()) : "";
+};
+
+const extractSuggestedPublicationRegion = (publication: TodayPublicationItem) => {
+  const haystack = [publication.summary, publication.court_name].filter(Boolean).join("; ");
+  const patterns = [
+    /\bforo\s+de\s+([^;,.]+)/i,
+    /\bcomarca\s+de\s+([^;,.]+)/i,
+    /\bsubsec[aã]o\s+judici[aá]ria\s+de\s+([^;,.]+)/i,
+    /\bsec[aã]o\s+judici[aá]ria\s+de\s+([^;,.]+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = haystack.match(pattern);
+    if (match?.[1]) return formatCourtOrRegion(match[1]).trim();
+  }
+  const courtName = (publication.court_name || "").trim();
+  const trailingLocationMatch = courtName.match(/\s+de\s+([^;,.]+)$/i);
+  if (trailingLocationMatch?.[1]) return formatCourtOrRegion(trailingLocationMatch[1]).trim();
+  return "";
+};
+
+const publicationDeadlineKeywordHints = [
+  "prazo",
+  "vencimento",
+  "vence",
+  "manifest",
+  "contest",
+  "impugn",
+  "contrarrazo",
+  "contrarazo",
+  "apresente",
+  "apresentar",
+  "comprove",
+  "recolha",
+  "regularize",
+  "emende",
+  "cumpra",
+  "responda"
+];
+
+const publicationDeadlinePriorityOptions: { value: PublicationDeadlinePriority; label: string }[] = [
+  { value: "low", label: "Baixa" },
+  { value: "medium", label: "Média" },
+  { value: "high", label: "Alta" }
+];
+
+const publicationDeadlinePriorityLabels: Record<PublicationDeadlinePriority, string> = {
+  low: "Baixa",
+  medium: "Média",
+  high: "Alta"
+};
+
+const publicationDeadlineReminderOptions: { value: PublicationDeadlineReminder; label: string }[] = [
+  { value: "1", label: "1 dia" },
+  { value: "3", label: "3 dias" },
+  { value: "7", label: "7 dias" }
+];
+
+const publicationDeadlineReminderLabels: Record<PublicationDeadlineReminder, string> = {
+  "1": "1 dia antes",
+  "3": "3 dias antes",
+  "7": "7 dias antes"
+};
+
+const buildValidIsoDate = (year: number, month: number, day: number) => {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const candidate = new Date(year, month - 1, day);
+  if (candidate.getFullYear() !== year || candidate.getMonth() !== month - 1 || candidate.getDate() !== day) {
+    return null;
+  }
+  return formatIsoDate(candidate);
+};
+
+const normalizePublicationDateMatch = (match: RegExpExecArray) => {
+  if (match[1] && match[2] && match[3]) {
+    const parsedYear = Number(match[3]);
+    const year = match[3].length === 2 ? 2000 + parsedYear : parsedYear;
+    return buildValidIsoDate(year, Number(match[2]), Number(match[1]));
+  }
+  if (match[4] && match[5] && match[6]) {
+    return buildValidIsoDate(Number(match[4]), Number(match[5]), Number(match[6]));
+  }
+  return null;
+};
+
+const extractSuggestedPublicationDueDate = (publication: TodayPublicationItem) => {
+  const haystack = [publication.title, publication.summary, publication.communication_type, publication.court_name]
+    .filter(Boolean)
+    .join(" ");
+  if (!haystack.trim()) return null;
+
+  const explicitDatePattern = /\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b|\b(\d{4})-(\d{2})-(\d{2})\b/g;
+
+  for (const match of haystack.matchAll(explicitDatePattern)) {
+    const index = match.index ?? 0;
+    const excerptStart = Math.max(0, index - 72);
+    const excerptEnd = Math.min(haystack.length, index + match[0].length + 72);
+    const excerpt = normalizeLooseText(haystack.slice(excerptStart, excerptEnd));
+    const hasDeadlineHint = publicationDeadlineKeywordHints.some((keyword) => excerpt.includes(keyword));
+    if (!hasDeadlineHint) continue;
+    const isoDate = normalizePublicationDateMatch(match);
+    if (isoDate) return isoDate;
+  }
+
+  return null;
+};
+
+const extractSuggestedPublicationTermDays = (publication: TodayPublicationItem) => {
+  const haystack = normalizeLooseText(
+    [publication.title, publication.summary, publication.communication_type, publication.court_name]
+      .filter(Boolean)
+      .join(" ")
+  );
+  if (!haystack.trim()) return "";
+
+  for (const match of haystack.matchAll(/\b(\d{1,3})\s*dias?\b/g)) {
+    const index = match.index ?? 0;
+    const excerptStart = Math.max(0, index - 72);
+    const excerptEnd = Math.min(haystack.length, index + match[0].length + 72);
+    const excerpt = haystack.slice(excerptStart, excerptEnd);
+    const hasDeadlineHint = publicationDeadlineKeywordHints.some((keyword) => excerpt.includes(keyword));
+    if (hasDeadlineHint) return match[1];
+  }
+
+  return "";
+};
+
+const formatPublicationDeadlineTermLabel = (termDays: string) => {
+  const numeric = Number(termDays);
+  if (!Number.isFinite(numeric) || numeric <= 0) return termDays.trim();
+  return `${numeric} dia${numeric === 1 ? "" : "s"}`;
+};
+
+const buildPublicationDeadlineTaskTitle = (form: PublicationDeadlineFormState) => {
+  const action = form.action.trim();
+  if (action) return action;
+  const termLabel = formatPublicationDeadlineTermLabel(form.termDays);
+  return termLabel ? `Prazo ${termLabel}` : "Prazo";
+};
+
+const buildPublicationDeadlineTaskDetails = (form: PublicationDeadlineFormState) => {
+  const lines = [
+    `Prazo: ${formatPublicationDeadlineTermLabel(form.termDays)}`,
+    `Prioridade: ${publicationDeadlinePriorityLabels[form.priority]}`,
+    `Lembrete: ${publicationDeadlineReminderLabels[form.reminderDays]}`
+  ];
+  if (form.observations.trim()) {
+    lines.push(`Observações: ${form.observations.trim()}`);
+  }
+  return lines.join("\n");
+};
+
 const isPublicationAgendaEvent = (item: AgendaItem) =>
   item.created_via === "publication" || Boolean(item.publication_source_key) || (item.reference || "").startsWith("[Publicação]");
 
@@ -6154,7 +7581,6 @@ function PublicationTaskModal({
           </button>
         </div>
 
-        {context?.warning && <div className="publication-warning publication-warning-modal">{context.warning}</div>}
         {errorMessage && <div className="error">{errorMessage}</div>}
 
         <form onSubmit={onSubmit}>
@@ -6218,6 +7644,139 @@ function PublicationTaskModal({
   );
 }
 
+function PublicationDeadlineModal({
+  open,
+  publication,
+  user,
+  form,
+  officeResponsibleOptions,
+  busy,
+  errorMessage,
+  onClose,
+  onSubmit,
+  onChangeField
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  user: AuthUser | null;
+  form: PublicationDeadlineFormState;
+  officeResponsibleOptions: Array<{ value: string; label: string; note: string }>;
+  busy: boolean;
+  errorMessage: string;
+  onClose: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+  onChangeField: <K extends keyof PublicationDeadlineFormState>(field: K, value: PublicationDeadlineFormState[K]) => void;
+}) {
+  if (!open || !publication) return null;
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-task-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Gerar prazo</h2>
+            <div className="publication-meta">
+              {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        {errorMessage && <div className="error">{errorMessage}</div>}
+
+        <form onSubmit={onSubmit}>
+          <div className="modal-grid publication-task-grid">
+            <div className="field span-2">
+              <label>Providência *</label>
+              <textarea
+                className="publication-deadline-providence"
+                value={form.action}
+                onChange={(event) => onChangeField("action", event.target.value)}
+                placeholder="Descreva o que precisa ser feito para cumprir este prazo"
+              />
+            </div>
+            <div className="field">
+              <label>Prazo *</label>
+              <div className="input-with-hint">
+                <input
+                  inputMode="numeric"
+                  value={form.termDays}
+                  onChange={(event) => onChangeField("termDays", event.target.value.replace(/\D/g, ""))}
+                  placeholder="Apenas números"
+                />
+                <span className="hint">dias</span>
+              </div>
+            </div>
+            <div className="field">
+              <label>Data de entrega *</label>
+              <input type="date" value={form.dueDate} onChange={(event) => onChangeField("dueDate", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Responsável</label>
+              <select value={form.responsibleEmail} onChange={(event) => onChangeField("responsibleEmail", event.target.value)}>
+                {officeResponsibleOptions.map((option) => (
+                  <option key={`${option.value || "self"}-${option.note}`} value={option.value}>
+                    {option.note ? `${option.label} · ${option.note}` : option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>Prioridade</label>
+              <div className="publication-choice-group" role="group" aria-label="Prioridade">
+                {publicationDeadlinePriorityOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`publication-choice-btn ${form.priority === option.value ? "active" : ""}`}
+                    onClick={() => onChangeField("priority", option.value)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="field span-2">
+              <label>Lembretes</label>
+              <div className="publication-choice-group" role="group" aria-label="Lembretes">
+                {publicationDeadlineReminderOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`publication-choice-btn ${form.reminderDays === option.value ? "active" : ""}`}
+                    onClick={() => onChangeField("reminderDays", option.value)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="field span-2">
+              <label>Observações</label>
+              <textarea
+                value={form.observations}
+                onChange={(event) => onChangeField("observations", event.target.value)}
+                placeholder="Adicione observações complementares"
+              />
+            </div>
+          </div>
+
+          <div className="modal-actions">
+            <button className="btn ghost" type="button" onClick={onClose} disabled={busy}>
+              Cancelar
+            </button>
+            <button className="btn" type="submit" disabled={!form.action.trim() || !form.termDays || !form.dueDate || busy}>
+              {busy ? "Gerando..." : "Salvar prazo"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function Publications({ user }: { user: AuthUser | null }) {
   const [todayPublicationResult, setTodayPublicationResult] = useState<TodayPublicationsResponse | null>(null);
   const [publicationContextMap, setPublicationContextMap] = useState<Record<string, PublicationContextItem>>({});
@@ -6230,14 +7789,34 @@ function Publications({ user }: { user: AuthUser | null }) {
   const [isLoadingPublicationAgenda, setIsLoadingPublicationAgenda] = useState(false);
   const [publicationAgendaError, setPublicationAgendaError] = useState("");
   const [activePublication, setActivePublication] = useState<TodayPublicationItem | null>(null);
+  const [activePublicationAction, setActivePublicationAction] = useState<PublicationActionMode | null>(null);
   const [activePublicationSummaryFilter, setActivePublicationSummaryFilter] = useState<PublicationSummaryFilterKey | null>(null);
+  const [publicationOfficeMembers, setPublicationOfficeMembers] = useState<ApiTeamMember[]>([]);
+  const [publicationWallets, setPublicationWallets] = useState<ApiWallet[]>([]);
   const [publicationTaskForm, setPublicationTaskForm] = useState<PublicationTaskFormState>({
     title: "",
     details: "",
     dueDate: formatIsoDate(new Date()),
     responsibleEmails: []
   });
-  const [publicationTaskError, setPublicationTaskError] = useState("");
+  const [publicationDeadlineForm, setPublicationDeadlineForm] = useState<PublicationDeadlineFormState>({
+    action: "",
+    termDays: "",
+    dueDate: "",
+    responsibleEmail: "",
+    priority: "medium",
+    reminderDays: "3",
+    observations: ""
+  });
+  const [publicationActionError, setPublicationActionError] = useState("");
+  const [publicationRegistrationClientForm, setPublicationRegistrationClientForm] = useState<ClientForm>(emptyClientForm);
+  const [publicationRegistrationCaseForm, setPublicationRegistrationCaseForm] = useState<CaseForm>(emptyCaseForm);
+  const [publicationRegistrationClient, setPublicationRegistrationClient] = useState<ApiClient | null>(null);
+  const [publicationRegistrationCepError, setPublicationRegistrationCepError] = useState("");
+  const [publicationRegistrationClientError, setPublicationRegistrationClientError] = useState("");
+  const [publicationRegistrationCaseError, setPublicationRegistrationCaseError] = useState("");
+  const [isSavingPublicationRegistrationClient, setIsSavingPublicationRegistrationClient] = useState(false);
+  const [isSavingPublicationRegistrationCase, setIsSavingPublicationRegistrationCase] = useState(false);
   const [processingPublicationSourceKey, setProcessingPublicationSourceKey] = useState("");
   const runningInTauri = typeof window !== "undefined" && isTauri();
   const publicationResultsRef = useRef<HTMLDivElement | null>(null);
@@ -6319,6 +7898,109 @@ function Publications({ user }: { user: AuthUser | null }) {
     void loadPublicationAgenda();
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadPublicationOfficeMembers = async () => {
+      try {
+        const data = await apiListTeamMembers();
+        if (cancelled) return;
+        setPublicationOfficeMembers(
+          data
+            .filter((member) => member.is_active && member.email.trim())
+            .sort((a, b) => a.full_name.localeCompare(b.full_name, "pt-BR", { sensitivity: "base" }))
+        );
+      } catch {
+        if (cancelled) return;
+        setPublicationOfficeMembers([]);
+      }
+    };
+    void loadPublicationOfficeMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const publicationOfficeResponsibleOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const options: Array<{ value: string; label: string; note: string }> = [];
+
+    publicationOfficeMembers.forEach((member) => {
+      const email = member.email.trim().toLowerCase();
+      if (!email || seen.has(email)) return;
+      seen.add(email);
+      options.push({
+        value: email,
+        label: member.full_name,
+        note: member.email
+      });
+    });
+
+    const currentUserEmail = user?.email?.trim().toLowerCase() || "";
+    if (currentUserEmail && !seen.has(currentUserEmail)) {
+      options.unshift({
+        value: currentUserEmail,
+        label: user?.name || currentUserEmail,
+        note: user?.email || currentUserEmail
+      });
+    }
+
+    if (!options.length) {
+      options.push({
+        value: currentUserEmail,
+        label: user?.name || "Usuário atual",
+        note: user?.email || ""
+      });
+    }
+
+    return options;
+  }, [publicationOfficeMembers, user]);
+
+  const ensurePublicationWalletsLoaded = async () => {
+    if (publicationWallets.length > 0) return publicationWallets;
+    const data = await apiListWallets();
+    setPublicationWallets(data);
+    return data;
+  };
+
+  const resetPublicationRegistrationState = () => {
+    setPublicationRegistrationClientForm(emptyClientForm);
+    setPublicationRegistrationCaseForm(emptyCaseForm);
+    setPublicationRegistrationClient(null);
+    setPublicationRegistrationCepError("");
+    setPublicationRegistrationClientError("");
+    setPublicationRegistrationCaseError("");
+    setIsSavingPublicationRegistrationClient(false);
+    setIsSavingPublicationRegistrationCase(false);
+  };
+
+  const refreshPublicationContextItem = async (publication: TodayPublicationItem) => {
+    const sourceKey = buildPublicationSourceKey(publication);
+    try {
+      const response = await apiGetPublicationContext({
+        items: [{ source_key: sourceKey, process_number: publication.process_number }]
+      });
+      const nextContext = response.items[0] || null;
+      if (nextContext) {
+        mergePublicationContext(sourceKey, nextContext);
+        persistPublicationFallbackContext(sourceKey, nextContext);
+        return nextContext;
+      }
+    } catch {
+      // Fallback handled below.
+    }
+
+    try {
+      const fallbackContext = (await buildPublicationContextFallback([publication]))[sourceKey] || null;
+      if (fallbackContext) {
+        mergePublicationContext(sourceKey, fallbackContext);
+        persistPublicationFallbackContext(sourceKey, fallbackContext);
+      }
+      return fallbackContext;
+    } catch {
+      return null;
+    }
+  };
+
   const handlePublicationSearchDateChange = (value: string) => {
     if (!value) return;
     setSelectedPublicationDate(value);
@@ -6331,7 +8013,7 @@ function Publications({ user }: { user: AuthUser | null }) {
     setIsLoadingTodayPublications(true);
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
-    setPublicationTaskError("");
+    setPublicationActionError("");
     try {
       let data: TodayPublicationsResponse;
       if (runningInTauri && baseURL !== LOCAL_API_BASE_URL) {
@@ -6419,21 +8101,60 @@ function Publications({ user }: { user: AuthUser | null }) {
     }
   };
 
-  const openPublicationTaskModal = (publication: TodayPublicationItem) => {
+  const openPublicationActionModal = (publication: TodayPublicationItem, mode: PublicationActionMode) => {
     setActivePublication(publication);
-    setPublicationTaskError("");
-    setPublicationTaskForm({
-      title: publication.process_number ? `Providência do processo ${publication.process_number}` : "Providência da publicação",
-      details: "",
-      dueDate: selectedPublicationDate,
-      responsibleEmails: []
+    setActivePublicationAction(mode);
+    setPublicationActionError("");
+    setTodayPublicationsError("");
+    setTodayPublicationsInlineMessage("");
+    if (mode === "task") {
+      setPublicationTaskForm({
+        title: publication.process_number ? `Providência do processo ${publication.process_number}` : "Providência da publicação",
+        details: "",
+        dueDate: selectedPublicationDate,
+        responsibleEmails: []
+      });
+      return;
+    }
+    if (mode === "register") {
+      const partySuggestions = extractPublicationPartySuggestions(publication, user);
+      resetPublicationRegistrationState();
+      setPublicationRegistrationClientForm({
+        ...emptyClientForm,
+        kind: partySuggestions.clientKind,
+        name: partySuggestions.clientName,
+        cpf: partySuggestions.clientKind === "PF" ? partySuggestions.clientDocument : "",
+        cnpj: partySuggestions.clientKind === "PJ" ? partySuggestions.clientDocument : ""
+      });
+      setPublicationRegistrationCaseForm({
+        ...emptyCaseForm,
+        process: publication.process_number ? formatCaseNumber(publication.process_number) : "",
+        court: extractSuggestedPublicationCourt(publication),
+        region: extractSuggestedPublicationRegion(publication),
+        counterparty: partySuggestions.counterparty
+      });
+      void ensurePublicationWalletsLoaded().catch((err) => {
+        setPublicationRegistrationCaseError(extractApiErrorMessage(err, "Não foi possível carregar as carteiras do escritório."));
+      });
+      return;
+    }
+    setPublicationDeadlineForm({
+      action: "",
+      termDays: extractSuggestedPublicationTermDays(publication),
+      dueDate: extractSuggestedPublicationDueDate(publication) || "",
+      responsibleEmail: publicationOfficeResponsibleOptions[0]?.value || user?.email?.trim().toLowerCase() || "",
+      priority: "medium",
+      reminderDays: "3",
+      observations: ""
     });
   };
 
-  const closePublicationTaskModal = () => {
-    if (processingPublicationSourceKey) return;
+  const closePublicationActionModal = () => {
+    if (processingPublicationSourceKey || isSavingPublicationRegistrationClient || isSavingPublicationRegistrationCase) return;
     setActivePublication(null);
-    setPublicationTaskError("");
+    setActivePublicationAction(null);
+    setPublicationActionError("");
+    resetPublicationRegistrationState();
   };
 
   const handleTogglePublicationResponsible = (email: string) => {
@@ -6447,6 +8168,134 @@ function Publications({ user }: { user: AuthUser | null }) {
 
   const handlePublicationTaskFormField = (field: keyof PublicationTaskFormState, value: string) => {
     setPublicationTaskForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handlePublicationDeadlineFormField = <K extends keyof PublicationDeadlineFormState>(
+    field: K,
+    value: PublicationDeadlineFormState[K]
+  ) => {
+    setPublicationDeadlineForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handlePublicationRegistrationClientFormField = (field: keyof ClientForm, value: ClientForm[keyof ClientForm]) => {
+    if (field === "cep") setPublicationRegistrationCepError("");
+    if (publicationRegistrationClientError) setPublicationRegistrationClientError("");
+    setPublicationRegistrationClientForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handlePublicationRegistrationCaseFormField = (field: keyof CaseForm, value: string) => {
+    if (publicationRegistrationCaseError) setPublicationRegistrationCaseError("");
+    setPublicationRegistrationCaseForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handleLookupPublicationRegistrationCep = async (cepDigits: string) => {
+    if (cepDigits.length !== 8) return;
+    setPublicationRegistrationCepError("");
+    try {
+      const resp = await fetch(`https://viacep.com.br/ws/${cepDigits}/json/`);
+      const data = await resp.json();
+      if (!data || data.erro) {
+        setPublicationRegistrationCepError("CEP não encontrado.");
+        return;
+      }
+      setPublicationRegistrationClientForm((prev) => ({
+        ...prev,
+        cep: `${cepDigits.slice(0, 5)}-${cepDigits.slice(5)}`,
+        address: data.logradouro || prev.address,
+        neighborhood: data.bairro || prev.neighborhood,
+        city: data.localidade || prev.city,
+        state: data.uf || prev.state
+      }));
+    } catch {
+      setPublicationRegistrationCepError("Falha ao buscar CEP.");
+    }
+  };
+
+  const handleSavePublicationRegistrationClient = async () => {
+    const validationMessage = getClientFormValidationMessage(publicationRegistrationClientForm);
+    if (validationMessage) {
+      setPublicationRegistrationClientError(validationMessage);
+      return;
+    }
+    const payload = buildClientPayload(publicationRegistrationClientForm);
+    const document = (payload.document || "").trim();
+    if (!publicationRegistrationClientForm.name.trim() || !document) return;
+
+    setIsSavingPublicationRegistrationClient(true);
+    setPublicationRegistrationClientError("");
+    try {
+      const created = await apiCreateClient(payload);
+      setPublicationRegistrationClient(created);
+      try {
+        await ensurePublicationWalletsLoaded();
+      } catch (err) {
+        setPublicationRegistrationCaseError(extractApiErrorMessage(err, "Não foi possível carregar as carteiras do escritório."));
+      }
+    } catch (err) {
+      setPublicationRegistrationClientError(extractApiErrorMessage(err, "Não foi possível salvar o cliente na API."));
+    } finally {
+      setIsSavingPublicationRegistrationClient(false);
+    }
+  };
+
+  const handleSavePublicationRegistrationCase = async () => {
+    if (!activePublication || !publicationRegistrationClient) return;
+    const validationMessage = getCaseFormValidationMessage(publicationRegistrationCaseForm);
+    if (validationMessage) {
+      setPublicationRegistrationCaseError(validationMessage);
+      return;
+    }
+
+    setIsSavingPublicationRegistrationCase(true);
+    setPublicationRegistrationCaseError("");
+    try {
+      const counterparty = formatCounterparty(publicationRegistrationCaseForm.counterparty).trim() || "Parte contrária";
+      const formattedProcess = formatCaseNumber(publicationRegistrationCaseForm.process);
+      const created = await apiCreateCase({
+        number: formattedProcess,
+        title: `${publicationRegistrationClient.name} x ${counterparty}`,
+        client_id: publicationRegistrationClient.id,
+        wallet_id: publicationRegistrationCaseForm.walletId ? Number(publicationRegistrationCaseForm.walletId) : undefined,
+        status: "aberto",
+        forum: formatCourtOrRegion(publicationRegistrationCaseForm.region).trim() || undefined,
+        court: formatCourtOrRegion(publicationRegistrationCaseForm.court).trim() || undefined
+      });
+
+      const sourceKey = buildPublicationSourceKey(activePublication);
+      const selectedWallet = publicationWallets.find((wallet) => wallet.id === created.wallet_id) || null;
+      const allowedResponsibles =
+        selectedWallet?.team_members
+          ?.filter((member) => member.is_active)
+          .map((member) => ({
+            name: member.full_name,
+            email: member.email.trim().toLowerCase()
+          })) || [];
+      const nextContext: PublicationContextItem = {
+        source_key: sourceKey,
+        status: publicationContextMap[sourceKey]?.status,
+        handled_at: publicationContextMap[sourceKey]?.handled_at,
+        has_registered_case: true,
+        case_id: created.id,
+        case_number: created.number || activePublication.process_number || null,
+        wallet_id: created.wallet_id ?? selectedWallet?.id ?? null,
+        wallet_name: created.wallet_name || selectedWallet?.name || null,
+        allow_additional_responsibles: Boolean((created.wallet_id ?? selectedWallet?.id) && allowedResponsibles.length > 0),
+        allowed_responsibles: allowedResponsibles,
+        warning: allowedResponsibles.length === 0 ? "Nenhum outro responsável com acesso à carteira possui login ativo." : ""
+      };
+
+      mergePublicationContext(sourceKey, nextContext);
+      persistPublicationFallbackContext(sourceKey, nextContext);
+      void refreshPublicationContextItem(activePublication);
+      setTodayPublicationsInlineMessage("Cliente e processo cadastrados com sucesso a partir da publicação.");
+      setActivePublication(null);
+      setActivePublicationAction(null);
+      resetPublicationRegistrationState();
+    } catch (err) {
+      setPublicationRegistrationCaseError(extractApiErrorMessage(err, "Não foi possível salvar o processo na API."));
+    } finally {
+      setIsSavingPublicationRegistrationCase(false);
+    }
   };
 
   const mergePublicationContext = (sourceKey: string, patch: Partial<PublicationContextItem>) => {
@@ -6479,12 +8328,29 @@ function Publications({ user }: { user: AuthUser | null }) {
     });
   };
 
-  const handleSubmitPublicationTask = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!activePublication) return;
+  const submitPublicationGeneratedAction = async ({
+    taskTitle,
+    taskDetails,
+    dueDate,
+    responsibleEmails,
+    includeActorResponsible = true,
+    allowOfficeWideResponsibles = false,
+    successMessage,
+    failureMessage
+  }: {
+    taskTitle: string;
+    taskDetails?: string;
+    dueDate: string;
+    responsibleEmails: string[];
+    includeActorResponsible?: boolean;
+    allowOfficeWideResponsibles?: boolean;
+    successMessage: string;
+    failureMessage: string;
+  }) => {
+    if (!activePublication || !activePublicationAction) return;
     const sourceKey = buildPublicationSourceKey(activePublication);
     setProcessingPublicationSourceKey(sourceKey);
-    setPublicationTaskError("");
+    setPublicationActionError("");
     setTodayPublicationsError("");
     try {
       const result = await apiHandlePublication({
@@ -6495,14 +8361,17 @@ function Publications({ user }: { user: AuthUser | null }) {
         detail_url: activePublication.detail_url,
         summary: activePublication.summary || undefined,
         action: "task_created",
-        task_title: publicationTaskForm.title.trim(),
-        task_details: publicationTaskForm.details.trim() || undefined,
-        due_date: publicationTaskForm.dueDate,
-        responsible_emails: publicationTaskForm.responsibleEmails
+        task_title: taskTitle,
+        task_details: taskDetails,
+        due_date: dueDate,
+        responsible_emails: responsibleEmails,
+        include_actor_responsible: includeActorResponsible,
+        allow_office_wide_responsibles: allowOfficeWideResponsibles
       });
       mergePublicationStatus(sourceKey, result.status, result.handled_at);
-      setTodayPublicationsInlineMessage(result.message);
+      setTodayPublicationsInlineMessage(successMessage);
       setActivePublication(null);
+      setActivePublicationAction(null);
       await loadPublicationAgenda();
     } catch (err) {
       if (isPublicationApiUnavailableError(err)) {
@@ -6519,7 +8388,7 @@ function Publications({ user }: { user: AuthUser | null }) {
           const responsibleMap = new Map(
             (fallbackContext.allowed_responsibles || []).map((item) => [item.email.trim().toLowerCase(), item.name])
           );
-          const selectedEmails = publicationTaskForm.responsibleEmails.map((item) => item.trim().toLowerCase()).filter(Boolean);
+          const selectedEmails = responsibleEmails.map((item) => item.trim().toLowerCase()).filter(Boolean);
 
           if (!fallbackContext.has_registered_case && selectedEmails.length > 0) {
             throw new Error("Processo não cadastrado. Não é possível adicionar outros responsáveis.");
@@ -6532,10 +8401,10 @@ function Publications({ user }: { user: AuthUser | null }) {
 
           const assigneeLabels = [user?.name || user?.email || "Usuário atual", ...selectedEmails.map((email) => responsibleMap.get(email) || email)];
           await apiCreateAgendaDeadline({
-            title: publicationTaskForm.title.trim(),
-            due_date: publicationTaskForm.dueDate,
+            title: taskTitle,
+            due_date: dueDate,
             reference: buildPublicationReference(activePublication.process_number),
-            notes: publicationTaskForm.details.trim() || undefined,
+            notes: taskDetails,
             event_type: "deadline",
             assignees: assigneeLabels.join("; "),
             is_all_day: true
@@ -6550,18 +8419,48 @@ function Publications({ user }: { user: AuthUser | null }) {
           };
           persistPublicationFallbackContext(sourceKey, nextContext);
           mergePublicationContext(sourceKey, nextContext);
-          setTodayPublicationsInlineMessage("Tarefa criada com sucesso.");
+          setTodayPublicationsInlineMessage(successMessage);
           setActivePublication(null);
+          setActivePublicationAction(null);
           await loadPublicationAgenda();
         } catch (fallbackErr) {
-          setPublicationTaskError(extractApiErrorMessage(fallbackErr, "Não foi possível gerar a tarefa da publicação."));
+          setPublicationActionError(extractApiErrorMessage(fallbackErr, failureMessage));
         }
       } else {
-        setPublicationTaskError(extractApiErrorMessage(err, "Não foi possível gerar a tarefa da publicação."));
+        setPublicationActionError(extractApiErrorMessage(err, failureMessage));
       }
     } finally {
       setProcessingPublicationSourceKey("");
     }
+  };
+
+  const handleSubmitPublicationTask = async (event: React.FormEvent) => {
+    event.preventDefault();
+    await submitPublicationGeneratedAction({
+      taskTitle: publicationTaskForm.title.trim(),
+      taskDetails: publicationTaskForm.details.trim() || undefined,
+      dueDate: publicationTaskForm.dueDate,
+      responsibleEmails: publicationTaskForm.responsibleEmails,
+      includeActorResponsible: true,
+      allowOfficeWideResponsibles: false,
+      successMessage: "Tarefa criada com sucesso a partir da publicação.",
+      failureMessage: "Não foi possível gerar a tarefa da publicação."
+    });
+  };
+
+  const handleSubmitPublicationDeadline = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const selectedResponsible = publicationDeadlineForm.responsibleEmail.trim().toLowerCase();
+    await submitPublicationGeneratedAction({
+      taskTitle: buildPublicationDeadlineTaskTitle(publicationDeadlineForm),
+      taskDetails: buildPublicationDeadlineTaskDetails(publicationDeadlineForm),
+      dueDate: publicationDeadlineForm.dueDate,
+      responsibleEmails: selectedResponsible ? [selectedResponsible] : [],
+      includeActorResponsible: false,
+      allowOfficeWideResponsibles: true,
+      successMessage: "Prazo criado com sucesso a partir da publicação.",
+      failureMessage: "Não foi possível gerar o prazo da publicação."
+    });
   };
 
   const handleMarkPublicationAsRead = async (publication: TodayPublicationItem) => {
@@ -6908,10 +8807,26 @@ function Publications({ user }: { user: AuthUser | null }) {
                       <button
                         className="btn ghost small"
                         type="button"
-                        onClick={() => openPublicationTaskModal(publication)}
+                        onClick={() => openPublicationActionModal(publication, "register")}
+                        disabled={isBusy || isLoadingPublicationContext || context?.has_registered_case}
+                      >
+                        {context?.has_registered_case ? "Processo cadastrado" : "Cadastrar cliente/processo"}
+                      </button>
+                      <button
+                        className="btn ghost small"
+                        type="button"
+                        onClick={() => openPublicationActionModal(publication, "task")}
                         disabled={isBusy || isLoadingPublicationContext || context?.status === "task_created"}
                       >
-                        {context?.status === "task_created" ? "Tarefa gerada" : "Gerar tarefa"}
+                        {context?.status === "task_created" ? "Providência registrada" : "Gerar tarefa"}
+                      </button>
+                      <button
+                        className="btn ghost small"
+                        type="button"
+                        onClick={() => openPublicationActionModal(publication, "deadline")}
+                        disabled={isBusy || isLoadingPublicationContext || context?.status === "task_created"}
+                      >
+                        {context?.status === "task_created" ? "Providência registrada" : "Gerar prazo"}
                       </button>
                       <button
                         className="btn ghost small"
@@ -6936,17 +8851,53 @@ function Publications({ user }: { user: AuthUser | null }) {
       </div>
 
       <PublicationTaskModal
-        open={Boolean(activePublication)}
+        open={Boolean(activePublication && activePublicationAction === "task")}
         publication={activePublication}
         context={activePublicationContext}
         user={user}
         form={publicationTaskForm}
         busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
-        errorMessage={publicationTaskError}
-        onClose={closePublicationTaskModal}
+        errorMessage={publicationActionError}
+        onClose={closePublicationActionModal}
         onSubmit={handleSubmitPublicationTask}
         onChangeField={handlePublicationTaskFormField}
         onToggleResponsible={handleTogglePublicationResponsible}
+      />
+      <PublicationDeadlineModal
+        open={Boolean(activePublication && activePublicationAction === "deadline")}
+        publication={activePublication}
+        user={user}
+        form={publicationDeadlineForm}
+        officeResponsibleOptions={publicationOfficeResponsibleOptions}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        errorMessage={publicationActionError}
+        onClose={closePublicationActionModal}
+        onSubmit={handleSubmitPublicationDeadline}
+        onChangeField={handlePublicationDeadlineFormField}
+      />
+      <AddClientModal
+        open={Boolean(activePublication && activePublicationAction === "register" && !publicationRegistrationClient)}
+        form={publicationRegistrationClientForm}
+        saving={isSavingPublicationRegistrationClient}
+        title="Cadastrar cliente da publicação"
+        saveLabel="Salvar cliente e continuar"
+        errorMessage={publicationRegistrationClientError}
+        onClose={closePublicationActionModal}
+        onChange={handlePublicationRegistrationClientFormField}
+        onSave={handleSavePublicationRegistrationClient}
+        onLookupCep={handleLookupPublicationRegistrationCep}
+        cepError={publicationRegistrationCepError}
+      />
+      <AddProcessModal
+        open={Boolean(activePublication && activePublicationAction === "register" && publicationRegistrationClient)}
+        clientName={publicationRegistrationClient?.name || publicationRegistrationClientForm.name}
+        form={publicationRegistrationCaseForm}
+        wallets={publicationWallets}
+        saving={isSavingPublicationRegistrationCase}
+        errorMessage={publicationRegistrationCaseError}
+        onChange={handlePublicationRegistrationCaseFormField}
+        onClose={closePublicationActionModal}
+        onSave={handleSavePublicationRegistrationCase}
       />
     </div>
   );
@@ -6990,6 +8941,19 @@ const agendaEventTagLabel = (item: AgendaItem) => {
 };
 
 const agendaEventAssigneesLabel = (item: AgendaItem) => item.assignees || item.assignee_name || "";
+
+const isAgendaDeadlineItem = (item: AgendaItem) => item.kind === "deadline" || item.event_type === "deadline";
+
+const isAgendaHearingItem = (item: AgendaItem) => {
+  if (item.event_type === "hearing") return true;
+  const haystack = normalizeSearchText([item.title, item.description, item.reference, item.location].filter(Boolean).join(" "));
+  return haystack.includes("audiencia") || haystack.includes("concilia");
+};
+
+const isAgendaTaskOrMeetingItem = (item: AgendaItem) => {
+  if (isAgendaDeadlineItem(item) || isAgendaHearingItem(item)) return false;
+  return item.kind === "meeting" || item.event_type === "meeting" || item.event_type === "audit";
+};
 
 const formatAgendaTime = (startValue: string, endValue: string, isAllDay: boolean) => {
   if (isAllDay) return "Dia inteiro";
@@ -7157,8 +9121,8 @@ function Agenda() {
     });
   }, [events, sourceFilter, typeFilter]);
 
-  const eventCountByDate = useMemo(() => {
-    const counts: Record<string, number> = {};
+  const dayMarkersByDate = useMemo(() => {
+    const markers: Record<string, { deadline: boolean; task: boolean; hearing: boolean }> = {};
     filteredEvents.forEach((event) => {
       const start = new Date(event.starts_at);
       const end = new Date(event.ends_at);
@@ -7166,11 +9130,16 @@ function Agenda() {
       const endDay = new Date(end.getFullYear(), end.getMonth(), end.getDate());
       while (cursor <= endDay) {
         const key = formatIsoDate(cursor);
-        counts[key] = (counts[key] || 0) + 1;
+        if (!markers[key]) {
+          markers[key] = { deadline: false, task: false, hearing: false };
+        }
+        if (isAgendaDeadlineItem(event)) markers[key].deadline = true;
+        if (isAgendaTaskOrMeetingItem(event)) markers[key].task = true;
+        if (isAgendaHearingItem(event)) markers[key].hearing = true;
         cursor.setDate(cursor.getDate() + 1);
       }
     });
-    return counts;
+    return markers;
   }, [filteredEvents]);
 
   const selectedDayEvents = useMemo(() => {
@@ -7331,20 +9300,31 @@ function Agenda() {
                   return <div key={`empty-${index}`} className="calendar-cell empty" />;
                 }
                 const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
-                const count = eventCountByDate[dateKey] || 0;
                 const isSelected = dateKey === selectedDate;
+                const dayMarkers = dayMarkersByDate[dateKey];
+                const markerKinds = [
+                  dayMarkers?.deadline ? "deadline" : null,
+                  dayMarkers?.task ? "task" : null,
+                  dayMarkers?.hearing ? "hearing" : null
+                ].filter(Boolean) as Array<"deadline" | "task" | "hearing">;
                 return (
                   <button
                     key={dateKey}
                     type="button"
-                    className={`calendar-cell agenda-day-btn ${count > 0 ? "has-deadline" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                    className={`calendar-cell agenda-day-btn ${markerKinds.length > 0 ? "has-events" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
                     onClick={() => {
                       setSelectedDate(dateKey);
                       setDeadlineForm((prev) => ({ ...prev, dueDate: dateKey }));
                     }}
                   >
                     <div className="calendar-day">{dayNumber}</div>
-                    {count > 0 && <div className="calendar-count">{count} item{count > 1 ? "s" : ""}</div>}
+                    {markerKinds.length > 0 && (
+                      <div className="calendar-markers" aria-hidden="true">
+                        {markerKinds.map((marker) => (
+                          <span key={marker} className={`calendar-marker ${marker}`} />
+                        ))}
+                      </div>
+                    )}
                   </button>
                 );
               })}
@@ -7631,6 +9611,486 @@ const toCaseRow = (entry: ApiCase, clientsById: Map<number, string>): CaseRow =>
   };
 };
 
+type ProgressTimelineTone = "blue" | "green" | "amber" | "red" | "violet" | "slate";
+type ProgressTimelineKind = "publication" | "deadline" | "meeting" | "hearing" | "audit" | "external";
+type ProgressTimelineItem = {
+  id: string;
+  caseId: number;
+  caseNumber: string;
+  occurredAt: string;
+  dateKey: string;
+  timestamp: number;
+  kind: ProgressTimelineKind;
+  kindLabel: string;
+  title: string;
+  description: string;
+  meta: string[];
+  tone: ProgressTimelineTone;
+  isNew: boolean;
+};
+
+const progressCaseNumberPattern = /\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}/;
+
+const extractProgressCaseDigits = (value?: string | null) => {
+  const match = (value || "").match(progressCaseNumberPattern);
+  return match ? normalizeCaseDigits(match[0]) : "";
+};
+
+const buildProgressDateKey = (value?: string | null) => {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value.slice(0, 10);
+  return formatIsoDate(new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate()));
+};
+
+const buildProgressTimestamp = (value?: string | null) => {
+  if (!value) return 0;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? 0 : parsed.getTime();
+};
+
+const formatProgressDocument = (value?: string | null) => {
+  const digits = (value || "").replace(/\D/g, "");
+  if (digits.length === 11) return formatCpfFromDigits(digits);
+  if (digits.length === 14) return formatCnpj(digits);
+  return value?.trim() || "Sem documento";
+};
+
+const getProgressCaseCode = (row: CaseRow) => {
+  const haystack = `${row.title} ${row.client} ${row.action} ${row.area} ${row.walletName || ""} ${row.forum}`.toLowerCase();
+  if (haystack.includes("trabalh")) return "TRA";
+  if (haystack.includes("tribut") || haystack.includes("carf")) return "TRI";
+  if (haystack.includes("previd")) return "PRE";
+  if (haystack.includes("penal") || haystack.includes("criminal")) return "PEN";
+  if (haystack.includes("administr")) return "ADM";
+  if (haystack.includes("empresa")) return "EMP";
+  return "CIV";
+};
+
+const getProgressToneFromCaseCode = (code: string): ProgressTimelineTone => {
+  switch (code) {
+    case "TRA":
+      return "violet";
+    case "TRI":
+      return "amber";
+    case "PRE":
+      return "green";
+    case "PEN":
+      return "red";
+    case "ADM":
+      return "blue";
+    case "EMP":
+      return "slate";
+    default:
+      return "blue";
+  }
+};
+
+const getProgressToneFromAgendaItem = (item: AgendaItem): ProgressTimelineTone => {
+  if (item.source !== "internal") return item.kind === "deadline" ? "amber" : "blue";
+  if (item.event_type === "hearing") return "violet";
+  if (item.event_type === "audit") return "green";
+  if (item.kind === "deadline") return "amber";
+  return "blue";
+};
+
+const getProgressAgendaKind = (item: AgendaItem): ProgressTimelineKind => {
+  if (item.source !== "internal") return "external";
+  if (item.event_type === "hearing") return "hearing";
+  if (item.event_type === "audit") return "audit";
+  return item.kind;
+};
+
+function Progress() {
+  const [processSearch, setProcessSearch] = useState("");
+  const [documentSearch, setDocumentSearch] = useState("");
+  const [clientSearch, setClientSearch] = useState("");
+  const [caseRows, setCaseRows] = useState<CaseRow[]>([]);
+  const [clientsById, setClientsById] = useState<Map<number, ApiClient>>(new Map());
+  const [agendaItems, setAgendaItems] = useState<AgendaItem[]>([]);
+  const [publicationRecords, setPublicationRecords] = useState<PublicationAutomationRecord[]>([]);
+  const [expandedCaseId, setExpandedCaseId] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadProgress = async () => {
+      setIsLoading(true);
+      setError("");
+
+      try {
+        const [cases, clients] = await Promise.all([apiListCases(), apiListClients()]);
+        if (cancelled) return;
+
+        const clientNameMap = new Map<number, string>();
+        const clientRecordMap = new Map<number, ApiClient>();
+        clients.forEach((client) => {
+          clientNameMap.set(client.id, client.name);
+          clientRecordMap.set(client.id, client);
+        });
+
+        setClientsById(clientRecordMap);
+        setCaseRows(cases.map((entry) => toCaseRow(entry, clientNameMap)));
+
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 45);
+        const endDate = new Date();
+        endDate.setDate(endDate.getDate() + 30);
+
+        const [agendaResult, publicationResult] = await Promise.allSettled([
+          apiListAgendaEvents({ start: formatIsoDate(startDate), end: formatIsoDate(endDate) }),
+          apiGetPublicationAutomationSettings()
+        ]);
+
+        if (cancelled) return;
+
+        setAgendaItems(agendaResult.status === "fulfilled" ? agendaResult.value : []);
+        setPublicationRecords(
+          publicationResult.status === "fulfilled" ? publicationResult.value.recent_records || [] : []
+        );
+      } catch (err) {
+        if (cancelled) return;
+        setError(extractApiErrorMessage(err, "Não foi possível carregar os andamentos."));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    loadProgress();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const timelineByCaseId = useMemo(() => {
+    const byCaseDigits = new Map<string, CaseRow>();
+    caseRows.forEach((row) => {
+      byCaseDigits.set(normalizeCaseDigits(row.number), row);
+    });
+
+    const grouped = new Map<number, ProgressTimelineItem[]>();
+    const todayKey = formatIsoDate(new Date());
+
+    const pushItem = (item: ProgressTimelineItem) => {
+      const existing = grouped.get(item.caseId) || [];
+      existing.push(item);
+      grouped.set(item.caseId, existing);
+    };
+
+    agendaItems.forEach((item) => {
+      const caseDigits =
+        normalizeCaseDigits(item.publication_process_number || "") ||
+        extractProgressCaseDigits(item.reference) ||
+        extractProgressCaseDigits(item.title) ||
+        extractProgressCaseDigits(item.description);
+      if (!caseDigits) return;
+
+      const relatedCase = byCaseDigits.get(caseDigits);
+      if (!relatedCase) return;
+
+      const occurredAt = item.starts_at || item.ends_at || "";
+      const dateKey = buildProgressDateKey(occurredAt);
+      const timeLabel = formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day);
+      const meta = [agendaSourceLabel(item.source)];
+      if (timeLabel) meta.push(timeLabel);
+      if (agendaEventAssigneesLabel(item)) meta.push(`Responsáveis: ${agendaEventAssigneesLabel(item)}`);
+      if (item.location) meta.push(item.location);
+      if (item.status) meta.push(item.status);
+
+      pushItem({
+        id: `agenda-${item.id}`,
+        caseId: relatedCase.id,
+        caseNumber: relatedCase.number,
+        occurredAt,
+        dateKey,
+        timestamp: buildProgressTimestamp(occurredAt),
+        kind: getProgressAgendaKind(item),
+        kindLabel: agendaEventTagLabel(item),
+        title: item.title,
+        description: item.description?.trim() || item.reference?.trim() || "Compromisso vinculado ao processo.",
+        meta,
+        tone: getProgressToneFromAgendaItem(item),
+        isNew: dateKey === todayKey
+      });
+    });
+
+    publicationRecords.forEach((record) => {
+      const caseDigits = normalizeCaseDigits(record.case_number || "");
+      if (!caseDigits) return;
+
+      const relatedCase = byCaseDigits.get(caseDigits);
+      if (!relatedCase) return;
+
+      const dateKey = buildProgressDateKey(record.created_at);
+      const meta = ["Automação de publicações"];
+      if (record.client_name) meta.push(record.client_name);
+      if (record.matched_via === "case_number") meta.push("Match por processo");
+      if (record.matched_via === "document") meta.push("Match por documento");
+
+      pushItem({
+        id: `publication-${record.id}`,
+        caseId: relatedCase.id,
+        caseNumber: relatedCase.number,
+        occurredAt: record.created_at,
+        dateKey,
+        timestamp: buildProgressTimestamp(record.created_at),
+        kind: "publication",
+        kindLabel: "Publicação",
+        title: record.title || `Publicação vinculada ao processo ${record.case_number}`,
+        description: record.case_number
+          ? `Nova publicação identificada para o processo ${formatCaseNumber(record.case_number)}.`
+          : "Nova publicação vinculada ao processo monitorado.",
+        meta,
+        tone: "red",
+        isNew: dateKey === todayKey
+      });
+    });
+
+    grouped.forEach((items) => {
+      items.sort((left, right) => right.timestamp - left.timestamp);
+    });
+
+    return grouped;
+  }, [agendaItems, caseRows, publicationRecords]);
+
+  const filteredCases = useMemo(() => {
+    const processDigits = normalizeCaseDigits(processSearch);
+    const documentDigits = documentSearch.replace(/\D/g, "");
+    const clientTerm = clientSearch.trim().toLowerCase();
+
+    return caseRows.filter((row) => {
+      const clientRecord = row.clientId ? clientsById.get(row.clientId) : undefined;
+      const clientDocument = (clientRecord?.document || "").replace(/\D/g, "");
+      const normalizedCase = normalizeCaseDigits(row.number);
+      const normalizedClient = `${row.client} ${clientRecord?.name || ""}`.toLowerCase();
+
+      if (processDigits && !normalizedCase.includes(processDigits)) return false;
+      if (documentDigits && !clientDocument.includes(documentDigits)) return false;
+      if (clientTerm && !normalizedClient.includes(clientTerm)) return false;
+      return true;
+    });
+  }, [caseRows, clientSearch, clientsById, documentSearch, processSearch]);
+
+  const displayedCases = useMemo(() => {
+    return [...filteredCases].sort((left, right) => {
+      const rightLatest = timelineByCaseId.get(right.id)?.[0]?.timestamp ?? 0;
+      const leftLatest = timelineByCaseId.get(left.id)?.[0]?.timestamp ?? 0;
+      if (rightLatest !== leftLatest) return rightLatest - leftLatest;
+      return left.number.localeCompare(right.number, "pt-BR");
+    });
+  }, [filteredCases, timelineByCaseId]);
+
+  useEffect(() => {
+    if (!displayedCases.length) {
+      if (expandedCaseId !== null) setExpandedCaseId(null);
+      return;
+    }
+
+    if (expandedCaseId === null || !displayedCases.some((row) => row.id === expandedCaseId)) {
+      setExpandedCaseId(displayedCases[0].id);
+    }
+  }, [displayedCases, expandedCaseId]);
+
+  const visibleTimelineItems = useMemo(
+    () => displayedCases.flatMap((row) => timelineByCaseId.get(row.id) || []),
+    [displayedCases, timelineByCaseId]
+  );
+
+  const monitoredCount = displayedCases.length;
+  const timelineCount = visibleTimelineItems.length;
+  const deadlineCount = visibleTimelineItems.filter((item) => item.kind === "deadline" || item.kind === "hearing").length;
+  const updatedTodayCount = displayedCases.filter((row) => (timelineByCaseId.get(row.id) || []).some((item) => item.isNew)).length;
+  const latestTimelineTimestamp = visibleTimelineItems.reduce((max, item) => Math.max(max, item.timestamp), 0);
+  const lastCaptureLabel = latestTimelineTimestamp
+    ? formatDateTimePtBr(new Date(latestTimelineTimestamp).toISOString())
+    : "Ainda sem eventos vinculados";
+  const hasActiveFilters = Boolean(processSearch.trim() || documentSearch.trim() || clientSearch.trim());
+
+  return (
+    <div className="content-card page-card progress-page">
+      <div className="page-header progress-header">
+        <div>
+          <div className="eyebrow">Andamentos</div>
+          <h1 className="page-title">Movimentações processuais em linha do tempo</h1>
+          <div className="page-subtitle">
+            Use os filtros para localizar processos e expandir a sequência de publicações, prazos e compromissos relacionados.
+          </div>
+        </div>
+        <div className="pill">Beta</div>
+      </div>
+
+      {error && <div className="error">{error}</div>}
+
+      {!error && (
+        <>
+          <form
+            className="progress-filter-card"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (displayedCases.length) setExpandedCaseId(displayedCases[0].id);
+            }}
+          >
+            <div className="progress-filter-head">
+              <div className="progress-filter-title">Filtrar andamentos</div>
+              <div className="progress-filter-status">Última atualização: {lastCaptureLabel}</div>
+            </div>
+
+            <div className="progress-filter-grid">
+              <div className="field">
+                <label>Nº do processo</label>
+                <input
+                  value={processSearch}
+                  onChange={(event) => setProcessSearch(formatCaseNumber(event.target.value))}
+                  placeholder="Ex: 1001234-56.2024.8.26.0100"
+                />
+              </div>
+              <div className="field">
+                <label>CPF ou CNPJ do cliente</label>
+                <input
+                  value={documentSearch}
+                  onChange={(event) => setDocumentSearch(event.target.value)}
+                  placeholder="Ex: 123.456.789-00"
+                />
+              </div>
+              <div className="field">
+                <label>Nome do cliente</label>
+                <input
+                  value={clientSearch}
+                  onChange={(event) => setClientSearch(event.target.value)}
+                  placeholder="Ex: Carlos Drummond"
+                />
+              </div>
+              <div className="progress-filter-actions">
+                <button className="btn ghost small" type="submit">
+                  Buscar
+                </button>
+                {hasActiveFilters && (
+                  <button
+                    className="btn secondary small"
+                    type="button"
+                    onClick={() => {
+                      setProcessSearch("");
+                      setDocumentSearch("");
+                      setClientSearch("");
+                    }}
+                  >
+                    Limpar
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="progress-filter-foot">
+              <span>Mostrando {monitoredCount} processo(s) monitorado(s).</span>
+              {hasActiveFilters && <span>Filtros aplicados em tempo real.</span>}
+            </div>
+          </form>
+
+          <div className="progress-summary-grid">
+            <div className="progress-summary-card">
+              <div className="progress-summary-value">{monitoredCount}</div>
+              <div className="progress-summary-label">Processos monitorados</div>
+            </div>
+            <div className="progress-summary-card">
+              <div className="progress-summary-value">{timelineCount}</div>
+              <div className="progress-summary-label">Eventos na timeline</div>
+            </div>
+            <div className="progress-summary-card">
+              <div className="progress-summary-value">{deadlineCount}</div>
+              <div className="progress-summary-label">Prazos e audiências</div>
+            </div>
+            <div className="progress-summary-card">
+              <div className="progress-summary-value">{updatedTodayCount}</div>
+              <div className="progress-summary-label">Processos com atualização hoje</div>
+            </div>
+          </div>
+
+          {isLoading ? (
+            <div className="publication-empty">Carregando andamentos...</div>
+          ) : !displayedCases.length ? (
+            <div className="publication-empty">Nenhum processo encontrado para os filtros informados.</div>
+          ) : (
+            <div className="progress-case-list">
+              {displayedCases.map((row) => {
+                const clientRecord = row.clientId ? clientsById.get(row.clientId) : undefined;
+                const items = timelineByCaseId.get(row.id) || [];
+                const isOpen = expandedCaseId === row.id;
+                const caseCode = getProgressCaseCode(row);
+                const caseTone = getProgressToneFromCaseCode(caseCode);
+                const newItems = items.filter((item) => item.isNew).length;
+
+                return (
+                  <article
+                    key={row.id}
+                    className={`progress-case-card ${isOpen ? "open" : ""}`}
+                  >
+                    <button
+                      type="button"
+                      className="progress-case-head"
+                      onClick={() => setExpandedCaseId((current) => (current === row.id ? null : row.id))}
+                    >
+                      <div className="progress-case-ident">
+                        <div className={`progress-case-badge tone-${caseTone}`}>{caseCode}</div>
+                        <div className="progress-case-copy">
+                          <div className="progress-case-number">{formatCaseNumber(row.number)}</div>
+                          <div className="progress-case-meta">
+                            <span>{row.client}</span>
+                            <span>{formatProgressDocument(clientRecord?.document)}</span>
+                            <span>{row.action}</span>
+                            <span>{row.walletName || "Sem carteira"}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="progress-case-state">
+                        {newItems > 0 && <span className="progress-pill new">{newItems} novo(s)</span>}
+                        <span className="progress-case-count">{items.length} mov.</span>
+                        <span className={`progress-chevron ${isOpen ? "open" : ""}`}>⌄</span>
+                      </div>
+                    </button>
+
+                    {isOpen && (
+                      <div className="progress-case-body">
+                        {items.length ? (
+                          <div className="progress-timeline">
+                            {items.map((item) => (
+                              <div key={item.id} className="progress-timeline-item">
+                                <div className="progress-timeline-rail">
+                                  <span className={`progress-timeline-dot tone-${item.tone}`} />
+                                </div>
+                                <div className="progress-timeline-content">
+                                  <div className="progress-timeline-date">{formatDatePtBr(item.dateKey || item.occurredAt.slice(0, 10))}</div>
+                                  <div className="progress-timeline-tags">
+                                    <span className={`progress-pill tone-${item.tone}`}>{item.kindLabel}</span>
+                                    {item.isNew && <span className="progress-pill new">Hoje</span>}
+                                  </div>
+                                  <div className="progress-timeline-title">{item.title}</div>
+                                  <div className="progress-timeline-description">{item.description}</div>
+                                  {item.meta.length > 0 && <div className="progress-timeline-meta">{item.meta.join(" • ")}</div>}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="progress-empty-state">
+                            Ainda não há publicações ou compromissos vinculados a este processo.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function Cases() {
   type ProcessView = "dashboard" | "list" | "detail" | "create";
   type ProcessDetailKey =
@@ -7703,10 +10163,11 @@ function Cases() {
       if (activeCaseId !== 0) setActiveCaseId(0);
       return;
     }
-    if (!caseRows.some((row) => row.id === activeCaseId)) {
-      setActiveCaseId(caseRows[0].id);
+    if (activeCaseId !== 0 && !caseRows.some((row) => row.id === activeCaseId)) {
+      setActiveCaseId(0);
+      if (view === "detail") setView("list");
     }
-  }, [caseRows, activeCaseId]);
+  }, [caseRows, activeCaseId, view]);
 
   const totalCases = caseRows.length;
   const activeCases = caseRows.filter((row) => row.status !== "Arquivado").length;
@@ -7748,7 +10209,7 @@ function Cases() {
     filteredCreateClients.length > 0 &&
     (!selectedCreateClient ||
       createClientSearch.trim().toLowerCase() !== selectedCreateClient.name.trim().toLowerCase());
-  const selectedCase = caseRows.find((row) => row.id === activeCaseId) ?? caseRows[0] ?? null;
+  const selectedCase = caseRows.find((row) => row.id === activeCaseId) ?? null;
 
   const detailSections: { id: ProcessDetailKey; title: string; description?: string; items?: string[] }[] = [
     {
@@ -10202,7 +12663,8 @@ function Settings({
 
 function App() {
   const [active, setActive] = useState<NavKey>("people");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const sidebarCollapsed = true;
+  const [isAssistantOpen, setIsAssistantOpen] = useState(false);
   const [token, setToken] = useState<string | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [profilePreferences, setProfilePreferences] = useState<UserProfilePreferences>(() => loadStoredProfilePreferences(null));
@@ -10210,7 +12672,7 @@ function App() {
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
-  const [creds, setCreds] = useState({ username: "", password: "" });
+  const [signupForm, setSignupForm] = useState(() => ({ ...emptyOfficeSignupForm }));
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "dark";
     const stored = window.localStorage.getItem("newlaw-theme");
@@ -10346,17 +12808,54 @@ function App() {
     }
   }, [token, visibleNavItems, active]);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const finishAuthSession = (data: { access_token: string; refresh_token: string; user: AuthUser }) => {
+    setToken(data.access_token);
+    setUser(data.user);
+    saveAuthSession({ accessToken: data.access_token, refreshToken: data.refresh_token, user: data.user });
+  };
+
+  const handleRegisterOffice = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
+
+    if (!signupForm.officeName.trim()) {
+      setAuthError("Informe o nome do escritório.");
+      return;
+    }
+    if (!signupForm.ownerName.trim()) {
+      setAuthError("Informe o nome do responsável.");
+      return;
+    }
+    if (!signupForm.ownerEmail.trim()) {
+      setAuthError("Informe o e-mail do responsável.");
+      return;
+    }
+    if (!signupForm.password) {
+      setAuthError("Defina uma senha para a conta master.");
+      return;
+    }
+    if (signupForm.password !== signupForm.confirmPassword) {
+      setAuthError("A confirmação de senha não confere.");
+      return;
+    }
+    if (!signupForm.acceptedTerms) {
+      setAuthError("Você precisa aceitar os termos para criar a conta.");
+      return;
+    }
+
     setAuthBusy(true);
     try {
-      const data = await apiLogin(creds.username, creds.password);
-      setToken(data.access_token);
-      setUser(data.user);
-      saveAuthSession({ accessToken: data.access_token, refreshToken: data.refresh_token, user: data.user });
+      const data = await apiRegisterOffice({
+        office_name: signupForm.officeName,
+        owner_full_name: signupForm.ownerName,
+        owner_email: signupForm.ownerEmail,
+        owner_password: signupForm.password,
+        owner_phone: signupForm.ownerPhone || undefined
+      });
+      finishAuthSession(data);
+      setSignupForm({ ...emptyOfficeSignupForm });
     } catch (err) {
-      setAuthError(extractApiErrorMessage(err, "Login inválido."));
+      setAuthError(extractApiErrorMessage(err, "Não foi possível criar a conta do escritório."));
     } finally {
       setAuthBusy(false);
     }
@@ -10378,6 +12877,7 @@ function App() {
     try {
       await apiLogout();
     } finally {
+      setIsAssistantOpen(false);
       clearAuthSession();
       setToken(null);
       setUser(null);
@@ -10401,18 +12901,85 @@ function App() {
   if (!token) {
     return (
       <div className="login-shell">
-        <div className="login-card">
-          <h1>Entrar</h1>
-          <p>Informe suas credenciais para acessar.</p>
-          <form onSubmit={handleLogin}>
-            <div className="field">
-              <label>Email</label>
-              <input value={creds.username} onChange={(e) => setCreds((c) => ({ ...c, username: e.target.value }))} />
+        <div className="login-card auth-card">
+          <div className="auth-branding">
+            <img className="auth-logo" src="/logo_new_law_teste.png" alt="NEWLAW" />
+            <div>
+              <h1>Criar conta do escritório</h1>
+              <p>
+                Cadastre um novo escritório, gere a conta master e comece a testar o NEWLAW.
+              </p>
             </div>
-            <div className="field">
-              <label>Senha</label>
-              <input type="password" value={creds.password} onChange={(e) => setCreds((c) => ({ ...c, password: e.target.value }))} />
+          </div>
+
+          <form onSubmit={handleRegisterOffice}>
+            <div className="auth-grid">
+              <div className="field auth-field-span-2">
+                <label>Nome do escritório *</label>
+                <input
+                  value={signupForm.officeName}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, officeName: event.target.value }))}
+                  placeholder="Ex: Silva & Costa Advogados"
+                />
+              </div>
+              <div className="field">
+                <label>Responsável master *</label>
+                <input
+                  value={signupForm.ownerName}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerName: event.target.value }))}
+                  placeholder="Nome completo"
+                />
+              </div>
+              <div className="field">
+                <label>Telefone / WhatsApp</label>
+                <input
+                  value={signupForm.ownerPhone}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerPhone: event.target.value }))}
+                  placeholder="(00) 00000-0000"
+                />
+              </div>
+              <div className="field auth-field-span-2">
+                <label>E-mail master *</label>
+                <input
+                  type="email"
+                  value={signupForm.ownerEmail}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerEmail: event.target.value }))}
+                  placeholder="responsavel@escritorio.com.br"
+                />
+              </div>
+              <div className="field">
+                <label>Senha *</label>
+                <input
+                  type="password"
+                  value={signupForm.password}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, password: event.target.value }))}
+                  placeholder="Crie uma senha forte"
+                />
+              </div>
+              <div className="field">
+                <label>Confirmar senha *</label>
+                <input
+                  type="password"
+                  value={signupForm.confirmPassword}
+                  onChange={(event) => setSignupForm((current) => ({ ...current, confirmPassword: event.target.value }))}
+                  placeholder="Repita a senha"
+                />
+              </div>
             </div>
+
+            <div className="auth-note">
+              O cadastro cria uma nova organização com conta master do escritório. Depois você poderá convidar equipe, cadastrar clientes e organizar carteiras.
+            </div>
+
+            <label className="settings-checkbox auth-checkbox">
+              <input
+                type="checkbox"
+                checked={signupForm.acceptedTerms}
+                onChange={(event) => setSignupForm((current) => ({ ...current, acceptedTerms: event.target.checked }))}
+              />
+              <span>Declaro que tenho autorização para criar a conta master deste escritório.</span>
+            </label>
+
             <div className="login-meta">
               <span>API: {baseURL}</span>
               <button className="btn ghost small" type="button" onClick={handlePing} disabled={apiStatus === "checking"}>
@@ -10421,9 +12988,11 @@ function App() {
               {apiStatus === "ok" && <span className="status ok">OK</span>}
               {apiStatus === "error" && <span className="status error">Erro</span>}
             </div>
+
             {authError && <div className="error">{authError}</div>}
-            <button className="btn" type="submit" disabled={authBusy}>
-              {authBusy ? "Entrando..." : "Entrar"}
+
+            <button className="btn auth-submit" type="submit" disabled={authBusy}>
+              {authBusy ? "Criando conta..." : "Criar conta do escritório"}
             </button>
           </form>
         </div>
@@ -10435,6 +13004,8 @@ function App() {
     switch (activeNav) {
       case "home":
         return <Home />;
+      case "dashboard":
+        return <Dashboard />;
       case "people":
         return <People />;
       case "cases":
@@ -10464,9 +13035,10 @@ function App() {
         return <Finance />;
       case "agenda":
         return <Agenda />;
+      case "progress":
+        return <Progress />;
       case "service":
       case "reports":
-      case "progress":
       case "templates":
         return <Placeholder title={navItems.find((n) => n.key === activeNav)?.label || "Em breve"} />;
       case "stats":
@@ -10489,15 +13061,6 @@ function App() {
               <span className="brand-meta">{sidebarRoleLabel}</span>
             </div>
           </div>
-          <button
-            type="button"
-            className="collapse-btn"
-            onClick={() => setSidebarCollapsed((prev) => !prev)}
-            aria-label={sidebarCollapsed ? "Expandir menu" : "Minimizar menu"}
-            title={sidebarCollapsed ? "Expandir menu" : "Minimizar menu"}
-          >
-            {sidebarCollapsed ? ">" : "<"}
-          </button>
         </div>
         <div className="section-label">Ferramentas</div>
         <div className="nav-list scroll-area" ref={navListRef}>
@@ -10521,12 +13084,23 @@ function App() {
             <br />
             {user?.email || "usuario@newlaw.app.br"}
           </div>
-          <img className="sidebar-logo" src="/logo_new_law_teste.png" alt="New Law" />
+          <button
+            className={`sidebar-ai-trigger ${isAssistantOpen ? "active" : ""}`}
+            type="button"
+            onClick={() => setIsAssistantOpen((current) => !current)}
+            aria-label={isAssistantOpen ? "Fechar NewLaw AI" : "Abrir NewLaw AI"}
+            aria-haspopup="dialog"
+            aria-expanded={isAssistantOpen}
+            title="NewLaw AI"
+          >
+            <img className="sidebar-logo" src="/logo_new_law_teste.png" alt="NewLaw AI" />
+          </button>
         </div>
       </aside>
       <main className="content scroll-area" ref={contentRef}>
         {render()}
       </main>
+      <NewLawAssistantModal open={isAssistantOpen} onClose={() => setIsAssistantOpen(false)} userName={sidebarDisplayName} />
     </div>
   );
 }
