@@ -82,6 +82,14 @@ INVITE_TOKEN_EXPIRE_HOURS = int(os.getenv("NEWLAW_INVITE_TOKEN_HOURS", "48"))
 INVITE_BASE_URL = os.getenv("NEWLAW_INVITE_BASE_URL", "https://api.newlaw.app.br/invite")
 PUBLIC_SIGNUP_ENABLED = os.getenv("NEWLAW_PUBLIC_SIGNUP_ENABLED", "1") == "1"
 PUBLIC_SIGNUP_PLAN_SLUG = os.getenv("NEWLAW_PUBLIC_SIGNUP_PLAN_SLUG", "basic").strip() or "basic"
+PUBLIC_WEB_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "NEWLAW_PUBLIC_WEB_ORIGINS",
+        "https://newlaw.app.br,https://www.newlaw.app.br",
+    ).split(",")
+    if origin.strip()
+]
 SMTP_HOST = os.getenv("NEWLAW_SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("NEWLAW_SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("NEWLAW_SMTP_USERNAME", "")
@@ -1773,6 +1781,7 @@ app.add_middleware(
         "https://tauri.localhost",
         "http://localhost",
         "https://localhost",
+        *PUBLIC_WEB_ORIGINS,
     ],
     allow_credentials=True,
     allow_methods=["*"],
