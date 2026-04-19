@@ -53,6 +53,7 @@ import {
   listClients as apiListClients,
   listTeamMembers as apiListTeamMembers,
   listWallets as apiListWallets,
+  login as apiLogin,
   startCalendarConnection as apiStartCalendarConnection,
   syncCalendarConnection as apiSyncCalendarConnection,
   uploadClientDocument as apiUploadClientDocument,
@@ -67,7 +68,6 @@ import {
   resetTeamMemberPassword as apiResetTeamMemberPassword,
   runPublicationAutomationNow as apiRunPublicationAutomationNow,
   saveAuthSession,
-  registerOffice as apiRegisterOffice,
   me as apiMe,
   updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
 } from "./api";
@@ -109,16 +109,6 @@ type ClientFileTree = {
 type FilesFolderTarget =
   | { scope: "client"; folderLabel: string }
   | { scope: "case"; caseId: number; folderLabel: string };
-
-const emptyOfficeSignupForm = {
-  officeName: "",
-  ownerName: "",
-  ownerPhone: "",
-  ownerEmail: "",
-  password: "",
-  confirmPassword: "",
-  acceptedTerms: false
-};
 
 const textScaleOptions = [
   { label: "Normal", value: 1 },
@@ -1308,7 +1298,7 @@ const extractApiErrorMessage = (err: unknown, fallback: string) => {
     return "Sessão expirada. Faça login novamente.";
   }
   if (error.response?.status === 405) {
-    return "API no VPS desatualizada para este cadastro (405). Atualize e reinicie o backend.";
+    return "API no VPS desatualizada para esta operação (405). Atualize e reinicie o backend.";
   }
   if (error.response?.data?.detail) {
     return error.response.data.detail;
@@ -12672,7 +12662,7 @@ function App() {
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [apiStatus, setApiStatus] = useState<"idle" | "ok" | "error" | "checking">("idle");
-  const [signupForm, setSignupForm] = useState(() => ({ ...emptyOfficeSignupForm }));
+  const [creds, setCreds] = useState({ username: "", password: "" });
   const [theme, setTheme] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "dark";
     const stored = window.localStorage.getItem("newlaw-theme");
@@ -12814,48 +12804,15 @@ function App() {
     saveAuthSession({ accessToken: data.access_token, refreshToken: data.refresh_token, user: data.user });
   };
 
-  const handleRegisterOffice = async (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
-
-    if (!signupForm.officeName.trim()) {
-      setAuthError("Informe o nome do escritório.");
-      return;
-    }
-    if (!signupForm.ownerName.trim()) {
-      setAuthError("Informe o nome do responsável.");
-      return;
-    }
-    if (!signupForm.ownerEmail.trim()) {
-      setAuthError("Informe o e-mail do responsável.");
-      return;
-    }
-    if (!signupForm.password) {
-      setAuthError("Defina uma senha para a conta master.");
-      return;
-    }
-    if (signupForm.password !== signupForm.confirmPassword) {
-      setAuthError("A confirmação de senha não confere.");
-      return;
-    }
-    if (!signupForm.acceptedTerms) {
-      setAuthError("Você precisa aceitar os termos para criar a conta.");
-      return;
-    }
-
     setAuthBusy(true);
     try {
-      const data = await apiRegisterOffice({
-        office_name: signupForm.officeName,
-        owner_full_name: signupForm.ownerName,
-        owner_email: signupForm.ownerEmail,
-        owner_password: signupForm.password,
-        owner_phone: signupForm.ownerPhone || undefined
-      });
+      const data = await apiLogin(creds.username, creds.password);
       finishAuthSession(data);
-      setSignupForm({ ...emptyOfficeSignupForm });
     } catch (err) {
-      setAuthError(extractApiErrorMessage(err, "Não foi possível criar a conta do escritório."));
+      setAuthError(extractApiErrorMessage(err, "Login inválido."));
     } finally {
       setAuthBusy(false);
     }
@@ -12901,85 +12858,25 @@ function App() {
   if (!token) {
     return (
       <div className="login-shell">
-        <div className="login-card auth-card">
-          <div className="auth-branding">
-            <img className="auth-logo" src="/logo_new_law_teste.png" alt="NEWLAW" />
-            <div>
-              <h1>Criar conta do escritório</h1>
-              <p>
-                Cadastre um novo escritório, gere a conta master e comece a testar o NEWLAW.
-              </p>
-            </div>
-          </div>
-
-          <form onSubmit={handleRegisterOffice}>
-            <div className="auth-grid">
-              <div className="field auth-field-span-2">
-                <label>Nome do escritório *</label>
-                <input
-                  value={signupForm.officeName}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, officeName: event.target.value }))}
-                  placeholder="Ex: Silva & Costa Advogados"
-                />
-              </div>
-              <div className="field">
-                <label>Responsável master *</label>
-                <input
-                  value={signupForm.ownerName}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerName: event.target.value }))}
-                  placeholder="Nome completo"
-                />
-              </div>
-              <div className="field">
-                <label>Telefone / WhatsApp</label>
-                <input
-                  value={signupForm.ownerPhone}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerPhone: event.target.value }))}
-                  placeholder="(00) 00000-0000"
-                />
-              </div>
-              <div className="field auth-field-span-2">
-                <label>E-mail master *</label>
-                <input
-                  type="email"
-                  value={signupForm.ownerEmail}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, ownerEmail: event.target.value }))}
-                  placeholder="responsavel@escritorio.com.br"
-                />
-              </div>
-              <div className="field">
-                <label>Senha *</label>
-                <input
-                  type="password"
-                  value={signupForm.password}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, password: event.target.value }))}
-                  placeholder="Crie uma senha forte"
-                />
-              </div>
-              <div className="field">
-                <label>Confirmar senha *</label>
-                <input
-                  type="password"
-                  value={signupForm.confirmPassword}
-                  onChange={(event) => setSignupForm((current) => ({ ...current, confirmPassword: event.target.value }))}
-                  placeholder="Repita a senha"
-                />
-              </div>
-            </div>
-
-            <div className="auth-note">
-              O cadastro cria uma nova organização com conta master do escritório. Depois você poderá convidar equipe, cadastrar clientes e organizar carteiras.
-            </div>
-
-            <label className="settings-checkbox auth-checkbox">
+        <div className="login-card">
+          <h1>Entrar</h1>
+          <p>Informe suas credenciais para acessar.</p>
+          <form onSubmit={handleLogin}>
+            <div className="field">
+              <label>Usuário</label>
               <input
-                type="checkbox"
-                checked={signupForm.acceptedTerms}
-                onChange={(event) => setSignupForm((current) => ({ ...current, acceptedTerms: event.target.checked }))}
+                value={creds.username}
+                onChange={(event) => setCreds((current) => ({ ...current, username: event.target.value }))}
               />
-              <span>Declaro que tenho autorização para criar a conta master deste escritório.</span>
-            </label>
-
+            </div>
+            <div className="field">
+              <label>Senha</label>
+              <input
+                type="password"
+                value={creds.password}
+                onChange={(event) => setCreds((current) => ({ ...current, password: event.target.value }))}
+              />
+            </div>
             <div className="login-meta">
               <span>API: {baseURL}</span>
               <button className="btn ghost small" type="button" onClick={handlePing} disabled={apiStatus === "checking"}>
@@ -12991,8 +12888,8 @@ function App() {
 
             {authError && <div className="error">{authError}</div>}
 
-            <button className="btn auth-submit" type="submit" disabled={authBusy}>
-              {authBusy ? "Criando conta..." : "Criar conta do escritório"}
+            <button className="btn" type="submit" disabled={authBusy}>
+              {authBusy ? "Entrando..." : "Entrar"}
             </button>
           </form>
         </div>
