@@ -7,6 +7,8 @@ import {
   AgendaItem,
   AuthUser,
   ApiCase,
+  ApiCaseClosing,
+  ApiCaseClosingObligation,
   ApiClient,
   ApiClientDocument,
   ApiFinanceEntry,
@@ -67,6 +69,7 @@ import {
   ping,
   resetTeamMemberPassword as apiResetTeamMemberPassword,
   runPublicationAutomationNow as apiRunPublicationAutomationNow,
+  saveCaseClosing as apiSaveCaseClosing,
   saveAuthSession,
   me as apiMe,
   updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
@@ -9561,6 +9564,10 @@ type CaseRow = {
   lawyer: string;
   rawStatus: string;
   status: "Ativo" | "Em andamento" | "Arquivado";
+  value?: number;
+  createdAt?: string;
+  updatedAt?: string;
+  closing?: ApiCaseClosing | null;
 };
 
 const normalizeCaseStatus = (status?: string | null): CaseRow["status"] => {
@@ -9597,7 +9604,310 @@ const toCaseRow = (entry: ApiCase, clientsById: Map<number, string>): CaseRow =>
     forum: entry.forum?.trim() ? formatCourtOrRegion(entry.forum.trim()) : "-",
     lawyer: "-",
     rawStatus: entry.status || "aberto",
-    status: normalizeCaseStatus(entry.status)
+    status: normalizeCaseStatus(entry.status),
+    value: entry.value ?? undefined,
+    createdAt: entry.created_at || undefined,
+    updatedAt: entry.updated_at || undefined,
+    closing: entry.closing || null
+  };
+};
+
+type CaseClosingStep = "type" | "result" | "obligations" | "dates" | "financial";
+type CaseClosingTone = "positive" | "warning" | "negative" | "neutral";
+type CaseClosingDraftObligation = ApiCaseClosingObligation & {
+  selected: boolean;
+};
+type CaseClosingDraft = {
+  closureType: string;
+  result: string;
+  obligations: CaseClosingDraftObligation[];
+  dates: {
+    triggerDate: string;
+    completionDate: string;
+    archivedAt: string;
+  };
+  financial: {
+    claimAmount: string;
+    closingAmount: string;
+    paymentMethod: string;
+    paymentStatus: string;
+  };
+};
+
+const caseClosingSteps: Array<{ id: CaseClosingStep; label: string; hint: string }> = [
+  { id: "type", label: "Tipo", hint: "Como o processo foi encerrado" },
+  { id: "result", label: "Resultado", hint: "Desfecho principal" },
+  { id: "obligations", label: "Obrigações", hint: "Pendências pós-encerramento" },
+  { id: "dates", label: "Datas", hint: "Marcos relevantes" },
+  { id: "financial", label: "Financeiro", hint: "Valores e pagamento" }
+];
+
+const caseClosingTypeOptions = [
+  {
+    id: "sentenca-transito-julgado",
+    label: "Sentença com trânsito em julgado",
+    description: "Decisão final e definitiva, sem recursos pendentes.",
+    icon: "⚖️"
+  },
+  {
+    id: "acordo-homologado",
+    label: "Acordo homologado",
+    description: "Acordo firmado e validado judicialmente.",
+    icon: "🤝"
+  },
+  {
+    id: "acordo-extrajudicial",
+    label: "Acordo extrajudicial",
+    description: "Composição firmada fora do juízo, com baixa posterior.",
+    icon: "📝"
+  },
+  {
+    id: "arquivamento",
+    label: "Arquivamento",
+    description: "Baixa formal do processo sem outras providências centrais.",
+    icon: "🗂️"
+  },
+  {
+    id: "extincao-sem-merito",
+    label: "Extinção sem resolução do mérito",
+    description: "Encerramento sem análise do mérito da demanda.",
+    icon: "🚫"
+  },
+  {
+    id: "desistencia",
+    label: "Desistência",
+    description: "Parte autora desistiu da ação ou do prosseguimento.",
+    icon: "↩️"
+  },
+  {
+    id: "prescricao-decadencia",
+    label: "Prescrição / decadência",
+    description: "Reconhecimento de perda do direito de ação ou pretensão.",
+    icon: "⏳"
+  }
+] as const;
+
+const caseClosingResultOptions: Array<{
+  id: string;
+  label: string;
+  description: string;
+  tone: CaseClosingTone;
+  badge: string;
+  icon: string;
+}> = [
+  {
+    id: "procedente",
+    label: "Procedente",
+    description: "Resultado favorável integral ao cliente.",
+    tone: "positive",
+    badge: "Favorável",
+    icon: "✅"
+  },
+  {
+    id: "parcialmente-procedente",
+    label: "Parcialmente procedente",
+    description: "Ganho parcial ou acolhimento limitado dos pedidos.",
+    tone: "warning",
+    badge: "Parcial",
+    icon: "⚖️"
+  },
+  {
+    id: "improcedente",
+    label: "Improcedente",
+    description: "Pedidos rejeitados ou resultado desfavorável.",
+    tone: "negative",
+    badge: "Desfavorável",
+    icon: "❌"
+  },
+  {
+    id: "acordo-favoravel",
+    label: "Acordo favorável",
+    description: "Ajuste vantajoso para o cliente.",
+    tone: "positive",
+    badge: "Favorável",
+    icon: "🤝"
+  },
+  {
+    id: "acordo-desfavoravel",
+    label: "Acordo desfavorável",
+    description: "Ajuste necessário, com custo ou concessão relevante.",
+    tone: "negative",
+    badge: "Desfavorável",
+    icon: "📉"
+  },
+  {
+    id: "encerrado-sem-efeito-financeiro",
+    label: "Encerrado sem efeito financeiro",
+    description: "Fechamento operacional, sem condenação ou pagamento.",
+    tone: "neutral",
+    badge: "Operacional",
+    icon: "📌"
+  }
+];
+
+const caseClosingObligationCatalog = [
+  {
+    id: "pagamento",
+    title: "Pagamento",
+    description: "Executar ou acompanhar o pagamento previsto na decisão ou acordo."
+  },
+  {
+    id: "baixa-cadastro",
+    title: "Baixa em cadastro",
+    description: "Registrar o encerramento em sistemas internos e controles externos."
+  },
+  {
+    id: "obrigacao-fazer",
+    title: "Cumprimento de obrigação de fazer",
+    description: "Monitorar entrega, baixa, exclusão, regularização ou outra obrigação não financeira."
+  },
+  {
+    id: "expedicao-alvara",
+    title: "Expedição de alvará",
+    description: "Solicitar e acompanhar expedição/liberação judicial de valores."
+  },
+  {
+    id: "quitacao-final",
+    title: "Quitação final",
+    description: "Conferir e registrar que não restam pendências após o encerramento."
+  }
+] as const;
+
+const caseClosingPaymentMethodOptions = [
+  { id: "a-vista", label: "À vista", icon: "💵" },
+  { id: "parcelado", label: "Parcelado", icon: "📆" },
+  { id: "deposito", label: "Depósito", icon: "🏦" },
+  { id: "sem-pagamento", label: "Sem pagamento", icon: "➖" }
+] as const;
+
+const caseClosingPaymentStatusOptions = [
+  { id: "pago", label: "Pago", icon: "✅", tone: "positive" as CaseClosingTone },
+  { id: "pendente", label: "Pendente", icon: "⏳", tone: "warning" as CaseClosingTone },
+  { id: "parcelado", label: "Parcelado", icon: "📆", tone: "neutral" as CaseClosingTone }
+] as const;
+
+const caseClosingDateTemplates: Record<
+  string,
+  {
+    triggerLabel: string;
+    triggerHint: string;
+    completionLabel: string;
+    completionHint: string;
+    archivedLabel: string;
+    archivedHint: string;
+  }
+> = {
+  "sentenca-transito-julgado": {
+    triggerLabel: "Data da sentença",
+    triggerHint: "Quando a decisão principal foi proferida.",
+    completionLabel: "Data do trânsito em julgado",
+    completionHint: "Quando não restaram recursos pendentes.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando o processo foi efetivamente baixado."
+  },
+  "acordo-homologado": {
+    triggerLabel: "Data do acordo",
+    triggerHint: "Quando as partes fecharam o acordo.",
+    completionLabel: "Data da homologação",
+    completionHint: "Quando o juízo homologou o ajuste.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando o processo foi encerrado no sistema."
+  },
+  "acordo-extrajudicial": {
+    triggerLabel: "Data da assinatura",
+    triggerHint: "Quando o acordo foi formalizado entre as partes.",
+    completionLabel: "Data da quitação",
+    completionHint: "Quando a obrigação principal foi cumprida.",
+    archivedLabel: "Data da baixa",
+    archivedHint: "Quando o caso foi encerrado internamente."
+  },
+  arquivamento: {
+    triggerLabel: "Data do despacho final",
+    triggerHint: "Último ato relevante antes da baixa.",
+    completionLabel: "Data da baixa interna",
+    completionHint: "Quando o caso foi considerado encerrado pela equipe.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando houve o arquivamento formal."
+  },
+  "extincao-sem-merito": {
+    triggerLabel: "Data da extinção",
+    triggerHint: "Quando a extinção sem mérito foi decidida.",
+    completionLabel: "Fim do prazo recursal",
+    completionHint: "Quando a decisão se estabilizou.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando o processo foi baixado."
+  },
+  desistencia: {
+    triggerLabel: "Data da desistência",
+    triggerHint: "Quando a parte formalizou o pedido de desistência.",
+    completionLabel: "Data da homologação",
+    completionHint: "Quando o juízo confirmou a desistência.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando o encerramento foi concluído."
+  },
+  "prescricao-decadencia": {
+    triggerLabel: "Data do reconhecimento",
+    triggerHint: "Quando a prescrição/decadência foi reconhecida.",
+    completionLabel: "Data da estabilização",
+    completionHint: "Quando não restaram medidas cabíveis.",
+    archivedLabel: "Data do arquivamento",
+    archivedHint: "Quando o processo foi baixado definitivamente."
+  }
+};
+
+const defaultCaseClosingDateTemplate = {
+  triggerLabel: "Data inicial",
+  triggerHint: "Marco que deu origem ao encerramento.",
+  completionLabel: "Data de conclusão",
+  completionHint: "Marco principal que consolidou o encerramento.",
+  archivedLabel: "Data do arquivamento",
+  archivedHint: "Momento da baixa formal ou interna."
+};
+
+const getCaseClosingTypeLabel = (value?: string | null) =>
+  caseClosingTypeOptions.find((option) => option.id === value)?.label || "Não definido";
+
+const getCaseClosingResultLabel = (value?: string | null) =>
+  caseClosingResultOptions.find((option) => option.id === value)?.label || "Não definido";
+
+const getCaseClosingDateTemplate = (closureType?: string | null) =>
+  (closureType && caseClosingDateTemplates[closureType]) || defaultCaseClosingDateTemplate;
+
+const buildCaseClosingDraft = (closing?: ApiCaseClosing | null, fallbackClaimAmount?: number): CaseClosingDraft => {
+  const savedObligations = new Map((closing?.obligations || []).map((item) => [item.id, item]));
+  return {
+    closureType: closing?.closure_type || "",
+    result: closing?.result || "",
+    obligations: caseClosingObligationCatalog.map((item) => {
+      const saved = savedObligations.get(item.id);
+      return {
+        id: item.id,
+        title: saved?.title || item.title,
+        description: saved?.description || item.description,
+        responsible: saved?.responsible || "",
+        due_date: saved?.due_date || "",
+        selected: Boolean(saved)
+      };
+    }),
+    dates: {
+      triggerDate: closing?.dates?.trigger_date || "",
+      completionDate: closing?.dates?.completion_date || "",
+      archivedAt: closing?.dates?.archived_at || ""
+    },
+    financial: {
+      claimAmount:
+        typeof closing?.financial?.claim_amount === "number" && Number.isFinite(closing.financial.claim_amount)
+          ? formatCurrencyBRL(closing.financial.claim_amount)
+          : typeof fallbackClaimAmount === "number" && Number.isFinite(fallbackClaimAmount) && fallbackClaimAmount > 0
+            ? formatCurrencyBRL(fallbackClaimAmount)
+            : "",
+      closingAmount:
+        typeof closing?.financial?.closing_amount === "number" && Number.isFinite(closing.financial.closing_amount)
+          ? formatCurrencyBRL(closing.financial.closing_amount)
+          : "",
+      paymentMethod: closing?.financial?.payment_method || "",
+      paymentStatus: closing?.financial?.payment_status || ""
+    }
   };
 };
 
@@ -10090,9 +10400,7 @@ function Cases() {
     | "instancia"
     | "rito"
     | "carteira"
-    | "encerramento"
-    | "acordo"
-    | "valor";
+    | "encerramento";
 
   const [view, setView] = useState<ProcessView>("dashboard");
   const [searchTerm, setSearchTerm] = useState("");
@@ -10102,6 +10410,7 @@ function Cases() {
   const [clientsById, setClientsById] = useState<Map<number, string>>(new Map());
   const [registeredClients, setRegisteredClients] = useState<ApiClient[]>([]);
   const [wallets, setWallets] = useState<ApiWallet[]>([]);
+  const [teamMembers, setTeamMembers] = useState<ApiTeamMember[]>([]);
   const [isLoadingCases, setIsLoadingCases] = useState(true);
   const [casesError, setCasesError] = useState("");
   const [createCaseForm, setCreateCaseForm] = useState<CaseForm>(emptyCaseForm);
@@ -10117,6 +10426,11 @@ function Cases() {
   const [showDeleteCaseConfirm, setShowDeleteCaseConfirm] = useState(false);
   const [isDeletingCase, setIsDeletingCase] = useState(false);
   const [deleteCaseError, setDeleteCaseError] = useState("");
+  const [caseClosingStep, setCaseClosingStep] = useState<CaseClosingStep>("type");
+  const [caseClosingDraft, setCaseClosingDraft] = useState<CaseClosingDraft>(buildCaseClosingDraft());
+  const [isSavingCaseClosing, setIsSavingCaseClosing] = useState(false);
+  const [caseClosingError, setCaseClosingError] = useState("");
+  const [caseClosingSuccess, setCaseClosingSuccess] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -10124,7 +10438,12 @@ function Cases() {
       setIsLoadingCases(true);
       setCasesError("");
       try {
-        const [cases, clients, walletData] = await Promise.all([apiListCases(), apiListClients(), apiListWallets()]);
+        const [cases, clients, walletData, teamMemberData] = await Promise.all([
+          apiListCases(),
+          apiListClients(),
+          apiListWallets(),
+          apiListTeamMembers(undefined, { includeMasterAccounts: true })
+        ]);
         if (cancelled) return;
         const clientsById = new Map<number, string>();
         clients.forEach((client) => {
@@ -10133,6 +10452,7 @@ function Cases() {
         setRegisteredClients(clients);
         setClientsById(clientsById);
         setWallets(walletData);
+        setTeamMembers(teamMemberData);
         const mapped = cases.map((entry) => toCaseRow(entry, clientsById));
         setCaseRows(mapped);
       } catch (err) {
@@ -10201,6 +10521,20 @@ function Cases() {
       createClientSearch.trim().toLowerCase() !== selectedCreateClient.name.trim().toLowerCase());
   const selectedCase = caseRows.find((row) => row.id === activeCaseId) ?? null;
 
+  useEffect(() => {
+    if (!selectedCase) {
+      setCaseClosingDraft(buildCaseClosingDraft());
+      setCaseClosingStep("type");
+      setCaseClosingError("");
+      setCaseClosingSuccess("");
+      return;
+    }
+    setCaseClosingDraft(buildCaseClosingDraft(selectedCase.closing, selectedCase.value));
+    setCaseClosingStep("type");
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  }, [selectedCase?.id]);
+
   const detailSections: { id: ProcessDetailKey; title: string; description?: string; items?: string[] }[] = [
     {
       id: "area",
@@ -10257,20 +10591,65 @@ function Cases() {
         "Extincao sem resolucao",
         "Desistencia"
       ]
-    },
-    {
-      id: "acordo",
-      title: "Acordo",
-      items: ["Procedente", "Parcialmente procedente", "Improcedente", "Acordo favoravel", "Acordo desfavoravel"]
-    },
-    {
-      id: "valor",
-      title: "Valor final",
-      items: ["Valor da causa", "Valor acordado/condenacao", "Situacao de pagamento"]
     }
   ];
 
   const activeDetail = detailSections.find((section) => section.id === detailKey) ?? detailSections[0];
+  const closingResponsibleOptions = useMemo(
+    () =>
+      [...teamMembers]
+        .filter((member) => member.is_active)
+        .sort((left, right) => left.full_name.localeCompare(right.full_name, "pt-BR")),
+    [teamMembers]
+  );
+  const selectedClosingObligations = useMemo(
+    () => caseClosingDraft.obligations.filter((item) => item.selected),
+    [caseClosingDraft.obligations]
+  );
+  const completedClosingObligations = useMemo(
+    () => selectedClosingObligations.filter((item) => item.responsible || item.due_date).length,
+    [selectedClosingObligations]
+  );
+  const closingDateTemplate = useMemo(
+    () => getCaseClosingDateTemplate(caseClosingDraft.closureType),
+    [caseClosingDraft.closureType]
+  );
+  const caseClosingStepIndex = caseClosingSteps.findIndex((step) => step.id === caseClosingStep);
+  const caseClosingStepDone = {
+    type: Boolean(caseClosingDraft.closureType),
+    result: Boolean(caseClosingDraft.result),
+    obligations: selectedClosingObligations.length > 0,
+    dates: Boolean(
+      caseClosingDraft.dates.triggerDate || caseClosingDraft.dates.completionDate || caseClosingDraft.dates.archivedAt
+    ),
+    financial: Boolean(
+      caseClosingDraft.financial.claimAmount ||
+        caseClosingDraft.financial.closingAmount ||
+        caseClosingDraft.financial.paymentMethod ||
+        caseClosingDraft.financial.paymentStatus
+    )
+  };
+  const caseClosingCompletionCount = caseClosingSteps.filter((step) => caseClosingStepDone[step.id]).length;
+  const caseClosingSummary = [
+    { label: "Tipo", value: getCaseClosingTypeLabel(caseClosingDraft.closureType) },
+    { label: "Resultado", value: getCaseClosingResultLabel(caseClosingDraft.result) },
+    {
+      label: "Obrigações",
+      value: selectedClosingObligations.length
+        ? `${selectedClosingObligations.length} selecionada(s)`
+        : "Nenhuma selecionada"
+    },
+    {
+      label: "Datas",
+      value:
+        [caseClosingDraft.dates.triggerDate, caseClosingDraft.dates.completionDate, caseClosingDraft.dates.archivedAt].filter(Boolean)
+          .length + " preenchida(s)"
+    },
+    {
+      label: "Financeiro",
+      value: caseClosingDraft.financial.closingAmount || caseClosingDraft.financial.claimAmount || "Sem valores"
+    }
+  ];
 
   const handleSelectCase = (id: number) => {
     setActiveCaseId(id);
@@ -10415,6 +10794,367 @@ function Cases() {
     }
   };
 
+  const handleSelectClosingType = (closureType: string) => {
+    setCaseClosingDraft((prev) => ({ ...prev, closureType }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleSelectClosingResult = (result: string) => {
+    setCaseClosingDraft((prev) => ({ ...prev, result }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleToggleClosingObligation = (obligationId: string) => {
+    setCaseClosingDraft((prev) => ({
+      ...prev,
+      obligations: prev.obligations.map((item) =>
+        item.id === obligationId
+          ? {
+              ...item,
+              selected: !item.selected,
+              responsible: item.selected ? "" : item.responsible,
+              due_date: item.selected ? "" : item.due_date
+            }
+          : item
+      )
+    }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleChangeClosingObligation = (
+    obligationId: string,
+    field: "responsible" | "due_date",
+    value: string
+  ) => {
+    setCaseClosingDraft((prev) => ({
+      ...prev,
+      obligations: prev.obligations.map((item) => (item.id === obligationId ? { ...item, [field]: value } : item))
+    }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleChangeClosingDate = (
+    field: keyof CaseClosingDraft["dates"],
+    value: string
+  ) => {
+    setCaseClosingDraft((prev) => ({ ...prev, dates: { ...prev.dates, [field]: value } }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleChangeClosingFinancial = (
+    field: keyof CaseClosingDraft["financial"],
+    value: string
+  ) => {
+    setCaseClosingDraft((prev) => ({ ...prev, financial: { ...prev.financial, [field]: value } }));
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+  };
+
+  const handleGoToNextClosingStep = () => {
+    const nextStep = caseClosingSteps[caseClosingStepIndex + 1];
+    if (nextStep) setCaseClosingStep(nextStep.id);
+  };
+
+  const handleGoToPreviousClosingStep = () => {
+    const previousStep = caseClosingSteps[caseClosingStepIndex - 1];
+    if (previousStep) setCaseClosingStep(previousStep.id);
+  };
+
+  const handleSaveCaseClosing = async () => {
+    if (!selectedCase) return;
+    if (!caseClosingDraft.closureType) {
+      setCaseClosingError("Selecione o tipo de encerramento para salvar a composição.");
+      return;
+    }
+
+    setIsSavingCaseClosing(true);
+    setCaseClosingError("");
+    setCaseClosingSuccess("");
+    try {
+      const payload = {
+        closure_type: caseClosingDraft.closureType || undefined,
+        result: caseClosingDraft.result || undefined,
+        obligations: caseClosingDraft.obligations
+          .filter((item) => item.selected)
+          .map(({ selected, ...item }) => ({
+            ...item,
+            responsible: item.responsible || undefined,
+            due_date: item.due_date || undefined
+          })),
+        dates: {
+          trigger_date: caseClosingDraft.dates.triggerDate || undefined,
+          completion_date: caseClosingDraft.dates.completionDate || undefined,
+          archived_at: caseClosingDraft.dates.archivedAt || undefined
+        },
+        financial: {
+          claim_amount: caseClosingDraft.financial.claimAmount ? parseCurrencyBRL(caseClosingDraft.financial.claimAmount) : undefined,
+          closing_amount: caseClosingDraft.financial.closingAmount
+            ? parseCurrencyBRL(caseClosingDraft.financial.closingAmount)
+            : undefined,
+          payment_method: caseClosingDraft.financial.paymentMethod || undefined,
+          payment_status: caseClosingDraft.financial.paymentStatus || undefined
+        }
+      };
+      const updated = await apiSaveCaseClosing(selectedCase.id, payload);
+      const updatedRow = toCaseRow(updated, clientsById);
+      setCaseRows((prev) => prev.map((row) => (row.id === updatedRow.id ? updatedRow : row)));
+      setCaseClosingDraft(buildCaseClosingDraft(updatedRow.closing, updatedRow.value));
+      setCaseClosingSuccess("Encerramento salvo com sucesso.");
+    } catch (err) {
+      setCaseClosingError(extractApiErrorMessage(err, "Não foi possível salvar o encerramento."));
+    } finally {
+      setIsSavingCaseClosing(false);
+    }
+  };
+
+  const canAdvanceCaseClosingStep =
+    caseClosingStep === "type"
+      ? Boolean(caseClosingDraft.closureType)
+      : caseClosingStep === "result"
+        ? Boolean(caseClosingDraft.result)
+        : true;
+  const isLastCaseClosingStep = caseClosingStep === "financial";
+  const financialClaimAmount = caseClosingDraft.financial.claimAmount ? parseCurrencyBRL(caseClosingDraft.financial.claimAmount) : 0;
+  const financialClosingAmount = caseClosingDraft.financial.closingAmount ? parseCurrencyBRL(caseClosingDraft.financial.closingAmount) : 0;
+
+  const renderCaseClosingStepContent = () => {
+    if (caseClosingStep === "type") {
+      return (
+        <div className="processes-closing-step-body">
+          <div className="processes-closing-step-copy">
+            <h3>Tipo de encerramento</h3>
+            <p>Selecione a forma principal de encerramento para estruturar o restante do fluxo.</p>
+          </div>
+          <div className="processes-closing-option-grid">
+            {caseClosingTypeOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={`processes-closing-option-card ${caseClosingDraft.closureType === option.id ? "active" : ""}`}
+                onClick={() => handleSelectClosingType(option.id)}
+              >
+                <span className="processes-closing-option-icon" aria-hidden="true">
+                  {option.icon}
+                </span>
+                <strong>{option.label}</strong>
+                <span>{option.description}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    if (caseClosingStep === "result") {
+      return (
+        <div className="processes-closing-step-body">
+          <div className="processes-closing-step-copy">
+            <h3>Resultado do encerramento</h3>
+            <p>Defina o desfecho principal para orientar relatórios, histórico e comunicação interna.</p>
+          </div>
+          <div className="processes-closing-option-grid result">
+            {caseClosingResultOptions.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                className={`processes-closing-option-card tone-${option.tone} ${caseClosingDraft.result === option.id ? "active" : ""}`}
+                onClick={() => handleSelectClosingResult(option.id)}
+              >
+                <span className="processes-closing-option-icon" aria-hidden="true">
+                  {option.icon}
+                </span>
+                <strong>{option.label}</strong>
+                <span>{option.description}</span>
+                <em>{option.badge}</em>
+              </button>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    if (caseClosingStep === "obligations") {
+      const progressPercent = caseClosingObligationCatalog.length
+        ? Math.round((completedClosingObligations / caseClosingObligationCatalog.length) * 100)
+        : 0;
+      return (
+        <div className="processes-closing-step-body">
+          <div className="processes-closing-step-copy">
+            <h3>Obrigações pós-encerramento</h3>
+            <p>Marque apenas o que se aplica ao caso e atribua responsável e prazo quando fizer sentido.</p>
+          </div>
+          <div className="processes-closing-obligation-progress">
+            <div>
+              <strong>{completedClosingObligations}</strong>
+              <span>obrigação(ões) configurada(s)</span>
+            </div>
+            <div className="processes-closing-progress-bar" aria-hidden="true">
+              <span style={{ width: `${progressPercent}%` }} />
+            </div>
+            <strong>{progressPercent}%</strong>
+          </div>
+          <div className="processes-closing-obligation-list">
+            {caseClosingDraft.obligations.map((item) => (
+              <div key={item.id} className={`processes-closing-obligation-card ${item.selected ? "active" : ""}`}>
+                <label className="processes-closing-obligation-head">
+                  <input
+                    type="checkbox"
+                    checked={item.selected}
+                    onChange={() => handleToggleClosingObligation(item.id)}
+                  />
+                  <div>
+                    <strong>{item.title}</strong>
+                    <span>{item.description}</span>
+                  </div>
+                </label>
+                {item.selected && (
+                  <div className="processes-closing-obligation-fields">
+                    <div className="field">
+                      <label>Responsável</label>
+                      <select
+                        value={item.responsible || ""}
+                        onChange={(event) => handleChangeClosingObligation(item.id, "responsible", event.target.value)}
+                      >
+                        <option value="">Selecionar responsável</option>
+                        {closingResponsibleOptions.map((member) => (
+                          <option key={member.id} value={member.full_name}>
+                            {member.full_name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="field">
+                      <label>Prazo</label>
+                      <input
+                        type="date"
+                        value={item.due_date || ""}
+                        onChange={(event) => handleChangeClosingObligation(item.id, "due_date", event.target.value)}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    if (caseClosingStep === "dates") {
+      return (
+        <div className="processes-closing-step-body">
+          <div className="processes-closing-step-copy">
+            <h3>Datas importantes</h3>
+            <p>Registre os marcos relevantes para fechar a timeline do processo com coerência.</p>
+          </div>
+          <div className="processes-closing-date-grid">
+            <div className="processes-closing-date-card">
+              <strong>{closingDateTemplate.triggerLabel}</strong>
+              <span>{closingDateTemplate.triggerHint}</span>
+              <input
+                type="date"
+                value={caseClosingDraft.dates.triggerDate}
+                onChange={(event) => handleChangeClosingDate("triggerDate", event.target.value)}
+              />
+            </div>
+            <div className="processes-closing-date-card">
+              <strong>{closingDateTemplate.completionLabel}</strong>
+              <span>{closingDateTemplate.completionHint}</span>
+              <input
+                type="date"
+                value={caseClosingDraft.dates.completionDate}
+                onChange={(event) => handleChangeClosingDate("completionDate", event.target.value)}
+              />
+            </div>
+            <div className="processes-closing-date-card">
+              <strong>{closingDateTemplate.archivedLabel}</strong>
+              <span>{closingDateTemplate.archivedHint}</span>
+              <input
+                type="date"
+                value={caseClosingDraft.dates.archivedAt}
+                onChange={(event) => handleChangeClosingDate("archivedAt", event.target.value)}
+              />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="processes-closing-step-body">
+        <div className="processes-closing-step-copy">
+          <h3>Dados financeiros</h3>
+          <p>Preencha os valores e marque a forma de pagamento para compor o encerramento financeiro do caso.</p>
+        </div>
+        <div className="processes-closing-financial-grid">
+          <div className="field">
+            <label>Valor da causa</label>
+            <input
+              value={caseClosingDraft.financial.claimAmount}
+              onChange={(event) => handleChangeClosingFinancial("claimAmount", formatCurrencyInputBRL(event.target.value))}
+              placeholder="R$ 0,00"
+            />
+          </div>
+          <div className="field">
+            <label>Valor do acordo / condenação</label>
+            <input
+              value={caseClosingDraft.financial.closingAmount}
+              onChange={(event) => handleChangeClosingFinancial("closingAmount", formatCurrencyInputBRL(event.target.value))}
+              placeholder="R$ 0,00"
+            />
+          </div>
+          <div className="field span-2">
+            <label>Forma de pagamento</label>
+            <div className="processes-closing-toggle-grid">
+              {caseClosingPaymentMethodOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`processes-closing-toggle-card ${caseClosingDraft.financial.paymentMethod === option.id ? "active" : ""}`}
+                  onClick={() => handleChangeClosingFinancial("paymentMethod", option.id)}
+                >
+                  <span aria-hidden="true">{option.icon}</span>
+                  <strong>{option.label}</strong>
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="field span-2">
+            <label>Status do pagamento</label>
+            <div className="processes-closing-toggle-grid">
+              {caseClosingPaymentStatusOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`processes-closing-toggle-card tone-${option.tone} ${caseClosingDraft.financial.paymentStatus === option.id ? "active" : ""}`}
+                  onClick={() => handleChangeClosingFinancial("paymentStatus", option.id)}
+                >
+                  <span aria-hidden="true">{option.icon}</span>
+                  <strong>{option.label}</strong>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="processes-closing-financial-summary">
+          <div>
+            <strong>{formatCurrencyBRL(financialClaimAmount)}</strong>
+            <span>Base do processo</span>
+          </div>
+          <div>
+            <strong>{formatCurrencyBRL(financialClosingAmount)}</strong>
+            <span>Fechamento financeiro</span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="content-card page-card cases-page processes-page">
       <section className="processes-body">
@@ -10545,19 +11285,27 @@ function Cases() {
                 <div>
                   <div className="processes-detail-number">{selectedCase.number}</div>
                   <div className="processes-detail-meta">
-                    Data de distribuicao: xx/xx/xxxx · Ultima alteracao: xx/xx/xxxx
+                    Cadastro: {selectedCase.createdAt ? formatDateTimePtBr(selectedCase.createdAt) : "-"} · Última alteração:{" "}
+                    {selectedCase.updatedAt ? formatDateTimePtBr(selectedCase.updatedAt) : "-"}
                   </div>
                 </div>
                 <div className="processes-detail-side">
                   <span className="processes-status-pill">{selectedCase.status}</span>
-                  <div className="processes-detail-bubble">Aparece no site do TJ, se esta no sistema e ativo.</div>
+                  <div className="processes-detail-bubble">
+                    {selectedCase.closing?.closure_type
+                      ? `Encerramento configurado: ${getCaseClosingTypeLabel(selectedCase.closing.closure_type)}.`
+                      : "Monte o encerramento em etapas e salve o fluxo dentro deste processo."}
+                  </div>
                 </div>
               </div>
               <div className="processes-detail-lines">
                 <div>Polo ativo: {selectedCase.client}</div>
                 <div>Polo passivo: {selectedCase.counterparty}</div>
                 <div>Carteira: {selectedCase.walletName || "-"}</div>
-                <div>Valor da causa: XXXX,XX</div>
+                <div>
+                  Valor da causa: {typeof selectedCase.value === "number" ? formatCurrencyBRL(selectedCase.value) : "-"}
+                </div>
+                <div>Encerramento: {selectedCase.closing?.closure_type ? getCaseClosingTypeLabel(selectedCase.closing.closure_type) : "Não iniciado"}</div>
               </div>
 
               <div className="processes-detail-section">
@@ -10576,18 +11324,135 @@ function Cases() {
                 </div>
               </div>
 
-              <div className="processes-detail-panel">
-                <div className="processes-detail-panel-title">{activeDetail.title}</div>
-                {activeDetail.description && <div className="processes-detail-panel-text">{activeDetail.description}</div>}
-                {activeDetail.items && (
-                  <ul className="processes-detail-list">
-                    {activeDetail.items.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
+              {activeDetail.id === "encerramento" ? (
+                <div className="processes-detail-panel processes-closing-panel">
+                  <div className="processes-closing-layout">
+                    <div className="processes-closing-main">
+                      <div className="processes-closing-header">
+                        <div>
+                          <div className="processes-detail-panel-title">Encerramento do processo</div>
+                          <div className="processes-detail-panel-text">
+                            Estruture tipo, resultado, obrigações, datas e financeiro no mesmo fluxo.
+                          </div>
+                        </div>
+                        <button
+                          className="btn secondary small"
+                          type="button"
+                          onClick={handleSaveCaseClosing}
+                          disabled={isSavingCaseClosing || !caseClosingDraft.closureType}
+                        >
+                          {isSavingCaseClosing ? "Salvando..." : "Salvar encerramento"}
+                        </button>
+                      </div>
+
+                      <div className="processes-closing-steps" role="tablist" aria-label="Etapas do encerramento">
+                        {caseClosingSteps.map((step, index) => (
+                          <button
+                            key={step.id}
+                            type="button"
+                            className={`processes-closing-step-tab ${caseClosingStep === step.id ? "active" : ""} ${
+                              caseClosingStepDone[step.id] ? "done" : ""
+                            }`}
+                            onClick={() => setCaseClosingStep(step.id)}
+                          >
+                            <span className="processes-closing-step-index">
+                              {caseClosingStepDone[step.id] ? "✓" : index + 1}
+                            </span>
+                            <span>
+                              <strong>{step.label}</strong>
+                              <small>{step.hint}</small>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+
+                      {caseClosingError && <div className="error">{caseClosingError}</div>}
+                      {caseClosingSuccess && <div className="success">{caseClosingSuccess}</div>}
+
+                      {renderCaseClosingStepContent()}
+
+                      <div className="processes-closing-footer">
+                        <button
+                          className="btn ghost small"
+                          type="button"
+                          onClick={handleGoToPreviousClosingStep}
+                          disabled={caseClosingStepIndex <= 0}
+                        >
+                          Voltar
+                        </button>
+                        <div className="processes-closing-footer-actions">
+                          {!isLastCaseClosingStep && (
+                            <button
+                              className="btn secondary small"
+                              type="button"
+                              onClick={handleSaveCaseClosing}
+                              disabled={isSavingCaseClosing || !caseClosingDraft.closureType}
+                            >
+                              Salvar rascunho
+                            </button>
+                          )}
+                          <button
+                            className="btn small"
+                            type="button"
+                            onClick={isLastCaseClosingStep ? handleSaveCaseClosing : handleGoToNextClosingStep}
+                            disabled={isSavingCaseClosing || (!isLastCaseClosingStep && !canAdvanceCaseClosingStep)}
+                          >
+                            {isLastCaseClosingStep ? "Salvar encerramento" : "Próxima etapa"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <aside className="processes-closing-summary-card">
+                      <div className="processes-closing-summary-head">
+                        <strong>Resumo do encerramento</strong>
+                        <span>{caseClosingCompletionCount}/{caseClosingSteps.length} etapas com dados</span>
+                      </div>
+                      <div className="processes-closing-summary-list">
+                        {caseClosingSummary.map((item) => (
+                          <div key={item.label} className="processes-closing-summary-item">
+                            <span>{item.label}</span>
+                            <strong>{item.value}</strong>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="processes-closing-summary-block">
+                        <span>Próximas obrigações</span>
+                        {selectedClosingObligations.length ? (
+                          selectedClosingObligations.map((item) => (
+                            <div key={item.id} className="processes-closing-summary-chip">
+                              <strong>{item.title}</strong>
+                              <span>
+                                {[item.responsible || "Sem responsável", item.due_date ? formatBrazilDate(item.due_date) : "Sem prazo"].join(
+                                  " · "
+                                )}
+                              </span>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="processes-detail-panel-text">Nenhuma obrigação selecionada.</div>
+                        )}
+                      </div>
+                    </aside>
+                  </div>
+                </div>
+              ) : (
+                <div className="processes-detail-panel">
+                  <div className="processes-detail-panel-title">{activeDetail.title}</div>
+                  {activeDetail.description && <div className="processes-detail-panel-text">{activeDetail.description}</div>}
+                  {activeDetail.items && (
+                    <ul className="processes-detail-list">
+                      {activeDetail.items.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
               <div className="processes-detail-actions">
+                <button className="btn small" type="button" onClick={() => setDetailKey("encerramento")}>
+                  Abrir encerramento
+                </button>
                 <button className="btn secondary small" type="button" onClick={handleStartEditCase}>
                   Editar processo
                 </button>

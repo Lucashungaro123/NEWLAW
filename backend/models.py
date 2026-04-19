@@ -80,6 +80,11 @@ class Case(TimestampMixin, table=True):
     forum: Optional[str] = None
     court: Optional[str] = None
     value: Optional[float] = None
+    closure_type: Optional[str] = None
+    closure_result: Optional[str] = None
+    closure_obligations_json: Optional[str] = None
+    closure_dates_json: Optional[str] = None
+    closure_financial_json: Optional[str] = None
 
 
 class Wallet(TimestampMixin, table=True):

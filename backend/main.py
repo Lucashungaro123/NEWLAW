@@ -1736,6 +1736,13 @@ def ensure_schema_columns() -> None:
             "is_team_admin": boolean_type,
             "allowed_nav_keys": text_type,
         },
+        Case.__table__.name: {
+            "closure_type": text_type,
+            "closure_result": text_type,
+            "closure_obligations_json": text_type,
+            "closure_dates_json": text_type,
+            "closure_financial_json": text_type,
+        },
     }
 
     with engine.begin() as connection:
@@ -1894,6 +1901,35 @@ class UpdateCaseRequest(BaseModel):
     court: str | None = None
     value: float | None = None
     organization_id: int | None = None
+
+
+class CaseClosingObligationRequest(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    responsible: str | None = None
+    due_date: str | None = None
+
+
+class CaseClosingDatesRequest(BaseModel):
+    trigger_date: str | None = None
+    completion_date: str | None = None
+    archived_at: str | None = None
+
+
+class CaseClosingFinancialRequest(BaseModel):
+    claim_amount: float | None = None
+    closing_amount: float | None = None
+    payment_method: str | None = None
+    payment_status: str | None = None
+
+
+class UpdateCaseClosingRequest(BaseModel):
+    closure_type: str | None = None
+    result: str | None = None
+    obligations: list[CaseClosingObligationRequest] | None = None
+    dates: CaseClosingDatesRequest | None = None
+    financial: CaseClosingFinancialRequest | None = None
 
 
 class CreateWalletRequest(BaseModel):
@@ -2443,6 +2479,106 @@ def get_case_wallet_lookup(session: Session, case_ids: list[int]) -> dict[int, W
     return lookup
 
 
+def load_json_dict(raw_value: str | None) -> dict[str, Any]:
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def load_json_list(raw_value: str | None) -> list[dict[str, Any]]:
+    if not raw_value:
+        return []
+    try:
+        parsed = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def normalize_case_closing_date(raw_value: str | None, field_name: str) -> str | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            return date.fromisoformat(value).isoformat()
+        return datetime.fromisoformat(value).date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} inválida") from exc
+
+
+def build_case_closing_payload(payload: UpdateCaseClosingRequest) -> dict[str, Any]:
+    closure_type = (payload.closure_type or "").strip() or None
+    result = (payload.result or "").strip() or None
+
+    obligations: list[dict[str, Any]] = []
+    for item in payload.obligations or []:
+        identifier = (item.id or "").strip()
+        title = (item.title or "").strip()
+        if not identifier or not title:
+            continue
+        obligations.append(
+            {
+                "id": identifier[:80],
+                "title": title[:120],
+                "description": (item.description or "").strip()[:240] or None,
+                "responsible": (item.responsible or "").strip()[:160] or None,
+                "due_date": normalize_case_closing_date(item.due_date, f"Prazo de {title}"),
+            }
+        )
+
+    dates_payload = payload.dates or CaseClosingDatesRequest()
+    dates = {
+        "trigger_date": normalize_case_closing_date(dates_payload.trigger_date, "Data inicial"),
+        "completion_date": normalize_case_closing_date(dates_payload.completion_date, "Data de conclusão"),
+        "archived_at": normalize_case_closing_date(dates_payload.archived_at, "Data do arquivamento"),
+    }
+
+    financial_payload = payload.financial or CaseClosingFinancialRequest()
+    financial = {
+        "claim_amount": financial_payload.claim_amount,
+        "closing_amount": financial_payload.closing_amount,
+        "payment_method": (financial_payload.payment_method or "").strip()[:80] or None,
+        "payment_status": (financial_payload.payment_status or "").strip()[:80] or None,
+    }
+
+    return {
+        "closure_type": closure_type,
+        "result": result,
+        "obligations": obligations,
+        "dates": dates,
+        "financial": financial,
+    }
+
+
+def serialize_case_closing(case: Case) -> dict[str, Any] | None:
+    payload = {
+        "closure_type": (case.closure_type or "").strip() or None,
+        "result": (case.closure_result or "").strip() or None,
+        "obligations": load_json_list(case.closure_obligations_json),
+        "dates": load_json_dict(case.closure_dates_json),
+        "financial": load_json_dict(case.closure_financial_json),
+        "updated_at": case.updated_at,
+    }
+    if (
+        payload["closure_type"] is None
+        and payload["result"] is None
+        and not payload["obligations"]
+        and not any(payload["dates"].values())
+        and not any(payload["financial"].values())
+    ):
+        return None
+    return payload
+
+
 def serialize_case(case: Case, wallet: Wallet | None = None) -> dict:
     return {
         "id": case.id,
@@ -2457,6 +2593,7 @@ def serialize_case(case: Case, wallet: Wallet | None = None) -> dict:
         "wallet_id": wallet.id if wallet else None,
         "wallet_name": wallet.name if wallet else None,
         "wallet_nickname": wallet.nickname if wallet else None,
+        "closing": serialize_case_closing(case),
         "created_at": case.created_at,
         "updated_at": case.updated_at,
     }
@@ -5264,6 +5401,39 @@ def update_case(
     wallet = resolve_wallet_for_case(session, payload.wallet_id, case.organization_id, user)
     sync_case_wallet_assignment(session, case.id, wallet.id if wallet else None)
     session.commit()
+    return serialize_case(case, wallet)
+
+
+@app.put("/cases/{case_id}/closing")
+def update_case_closing(
+    case_id: int,
+    payload: UpdateCaseClosingRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict:
+    case = session.get(Case, case_id)
+    if not case:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processo não encontrado")
+    current_scope = resolve_existing_record_scope(user, session, case.organization_id)
+    if current_scope is not None and case.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este processo")
+
+    wallet = get_case_wallet_lookup(session, [case.id]).get(case.id)
+    if wallet is not None:
+        ensure_user_can_access_wallet(session, user, wallet)
+
+    normalized = build_case_closing_payload(payload)
+    case.closure_type = normalized["closure_type"]
+    case.closure_result = normalized["result"]
+    case.closure_obligations_json = json.dumps(normalized["obligations"], ensure_ascii=False) if normalized["obligations"] else None
+    case.closure_dates_json = json.dumps(normalized["dates"], ensure_ascii=False) if any(normalized["dates"].values()) else None
+    case.closure_financial_json = (
+        json.dumps(normalized["financial"], ensure_ascii=False) if any(normalized["financial"].values()) else None
+    )
+    case.updated_at = datetime.utcnow()
+    session.add(case)
+    session.commit()
+    session.refresh(case)
     return serialize_case(case, wallet)
 
 

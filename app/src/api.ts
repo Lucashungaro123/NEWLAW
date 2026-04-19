@@ -47,6 +47,30 @@ export type CreateClientPayload = {
   organization_id?: number;
 };
 export type UpdateClientPayload = CreateClientPayload;
+export type ApiCaseClosingObligation = {
+  id: string;
+  title: string;
+  description?: string | null;
+  responsible?: string | null;
+  due_date?: string | null;
+};
+export type ApiCaseClosing = {
+  closure_type?: string | null;
+  result?: string | null;
+  obligations?: ApiCaseClosingObligation[];
+  dates?: {
+    trigger_date?: string | null;
+    completion_date?: string | null;
+    archived_at?: string | null;
+  } | null;
+  financial?: {
+    claim_amount?: number | null;
+    closing_amount?: number | null;
+    payment_method?: string | null;
+    payment_status?: string | null;
+  } | null;
+  updated_at?: string | null;
+};
 export type ApiCase = {
   id: number;
   organization_id?: number | null;
@@ -60,6 +84,9 @@ export type ApiCase = {
   forum?: string | null;
   court?: string | null;
   value?: number | null;
+  closing?: ApiCaseClosing | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 export type CreateCasePayload = {
   number: string;
@@ -73,6 +100,22 @@ export type CreateCasePayload = {
   organization_id?: number;
 };
 export type UpdateCasePayload = CreateCasePayload;
+export type UpdateCaseClosingPayload = {
+  closure_type?: string;
+  result?: string;
+  obligations?: ApiCaseClosingObligation[];
+  dates?: {
+    trigger_date?: string;
+    completion_date?: string;
+    archived_at?: string;
+  };
+  financial?: {
+    claim_amount?: number;
+    closing_amount?: number;
+    payment_method?: string;
+    payment_status?: string;
+  };
+};
 
 export type ApiWallet = {
   id: number;
@@ -544,6 +587,11 @@ export async function createCase(payload: CreateCasePayload) {
 
 export async function updateCase(caseId: number, payload: UpdateCasePayload) {
   const { data } = await api.put(`/cases/${caseId}`, payload);
+  return data as ApiCase;
+}
+
+export async function saveCaseClosing(caseId: number, payload: UpdateCaseClosingPayload) {
+  const { data } = await api.put(`/cases/${caseId}/closing`, payload);
   return data as ApiCase;
 }
 
