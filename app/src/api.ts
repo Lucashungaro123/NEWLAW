@@ -118,6 +118,9 @@ export type ApiTeamMember = {
   is_active: boolean;
   invite_email_sent?: boolean;
   invite_token?: string;
+  is_read_only?: boolean;
+  is_master_account?: boolean;
+  account_role?: string | null;
 };
 
 export type TeamMemberPasswordResetResult = {
@@ -684,8 +687,14 @@ export async function deleteWallet(walletId: number) {
   return data as { status: string; id: number };
 }
 
-export async function listTeamMembers(organizationId?: number) {
-  const params = organizationId ? { organization_id: organizationId } : undefined;
+export async function listTeamMembers(organizationId?: number, options?: { includeMasterAccounts?: boolean }) {
+  const params: Record<string, unknown> = {};
+  if (typeof organizationId === "number") {
+    params.organization_id = organizationId;
+  }
+  if (options?.includeMasterAccounts) {
+    params.include_master_accounts = true;
+  }
   const { data } = await api.get("/team-members", { params });
   return data as ApiTeamMember[];
 }

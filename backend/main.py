@@ -3937,6 +3937,28 @@ def serialize_team_member(member: TeamMember, *, invite_email_sent: bool = False
     return payload
 
 
+def serialize_master_account_as_team_member(user: User) -> dict:
+    return {
+        "id": -((user.id or 0) + 1_000_000),
+        "organization_id": user.organization_id,
+        "full_name": user.full_name,
+        "email": user.email,
+        "phone": user.phone,
+        "cpf": "",
+        "oab": "",
+        "role_title": "Responsável master",
+        "team_name": "Conta master",
+        "notes": "Conta principal do escritório",
+        "is_admin": True,
+        "allowed_nav_keys": get_effective_user_nav_keys(user),
+        "is_active": bool(user.is_active),
+        "invite_email_sent": False,
+        "is_read_only": True,
+        "is_master_account": True,
+        "account_role": user.role,
+    }
+
+
 def sync_user_from_team_member(
     session: Session,
     organization: Organization,
@@ -4796,6 +4818,7 @@ def list_team_members(
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
     organization_id: int | None = None,
+    include_master_accounts: bool = False,
 ) -> list[dict]:
     scope_organization_id = resolve_organization_scope(user, session, organization_id)
     query = select(TeamMember)
@@ -4804,7 +4827,21 @@ def list_team_members(
     else:
         query = query.where(TeamMember.organization_id == scope_organization_id)
     members = session.exec(query).all()
-    return [serialize_team_member(member) for member in members]
+    payload = [serialize_team_member(member) for member in members]
+    if include_master_accounts and scope_organization_id is not None:
+        known_emails = {normalize_email(member.email) for member in members}
+        master_users = session.exec(
+            select(User).where(
+                User.organization_id == scope_organization_id,
+                User.role == "owner",
+            )
+        ).all()
+        for master_user in master_users:
+            if normalize_email(master_user.email) in known_emails:
+                continue
+            payload.append(serialize_master_account_as_team_member(master_user))
+    payload.sort(key=lambda item: ((item.get("full_name") or "").lower(), (item.get("email") or "").lower()))
+    return payload
 
 
 @app.get("/team-members/capacity", response_model=TeamMembersCapacityResponse)

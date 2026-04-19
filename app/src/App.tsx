@@ -11193,7 +11193,7 @@ function Team({ canManage }: { canManage: boolean }) {
       setError("");
       try {
         const [data, teamCapacity] = await Promise.all([
-          apiListTeamMembers(),
+          apiListTeamMembers(undefined, { includeMasterAccounts: true }),
           apiGetTeamMembersCapacity().catch(() => null)
         ]);
         if (cancelled) return;
@@ -11242,7 +11242,7 @@ function Team({ canManage }: { canManage: boolean }) {
     if (!term) return members;
     return members.filter((member) => {
       const haystack =
-        `${member.full_name} ${member.email} ${member.cpf} ${member.oab} ${member.role_title} ${member.team_name}`.toLowerCase();
+        `${member.full_name} ${member.email} ${member.cpf} ${member.oab} ${member.role_title} ${member.team_name} ${member.account_role || ""}`.toLowerCase();
       return haystack.includes(term);
     });
   }, [members, searchTerm]);
@@ -11362,6 +11362,11 @@ function Team({ canManage }: { canManage: boolean }) {
   };
 
   const handleEditMember = (member: ApiTeamMember) => {
+    if (member.is_read_only) {
+      setSaveError("A conta master aparece na equipe apenas para consulta.");
+      setView("list");
+      return;
+    }
     setSaveSuccess("");
     setEditingId(member.id);
     const memberNavKeys = normalizeNavKeys(member.allowed_nav_keys);
@@ -11391,6 +11396,11 @@ function Team({ canManage }: { canManage: boolean }) {
       return;
     }
     if (!deleteId) return;
+    const member = members.find((item) => item.id === deleteId);
+    if (member?.is_read_only) {
+      setDeleteError("A conta master não pode ser excluída pela tela de equipe.");
+      return;
+    }
     setIsDeleting(true);
     setDeleteError("");
     try {
@@ -11409,6 +11419,10 @@ function Team({ canManage }: { canManage: boolean }) {
   const handleResetMemberPassword = async (member: ApiTeamMember) => {
     if (!canManage) {
       setSaveError("Você não tem permissão para refazer senhas.");
+      return;
+    }
+    if (member.is_read_only) {
+      setSaveError("A conta master não pode ser alterada pela tela de equipe.");
       return;
     }
     setResettingPasswordId(member.id);
@@ -11551,14 +11565,15 @@ function Team({ canManage }: { canManage: boolean }) {
                     <div>
                       <strong>{member.full_name}</strong>
                       <div className="wallets-row-sub">{member.email}</div>
+                      {member.is_master_account && <div className="wallets-row-sub">Conta master do escritório</div>}
                     </div>
                     <div>{member.team_name}</div>
                     <div>{member.role_title}</div>
                     <div>{formatCpfFromDigits(member.cpf)}</div>
-                    <div>{member.oab}</div>
-                    <div>{member.is_active ? "Ativo" : "Inativo"}</div>
+                    <div>{member.oab || "—"}</div>
+                    <div>{member.is_active ? "Ativo" : "Inativo"}{member.is_read_only ? " · Somente leitura" : ""}</div>
                     <div className="wallets-row-actions">
-                      {canManage && (
+                      {canManage && !member.is_read_only ? (
                         <>
                           <button className="btn ghost small" type="button" onClick={() => handleEditMember(member)}>
                             Editar
@@ -11567,7 +11582,9 @@ function Team({ canManage }: { canManage: boolean }) {
                             Excluir
                           </button>
                         </>
-                      )}
+                      ) : member.is_read_only ? (
+                        <span className="wallets-row-sub">Conta master</span>
+                      ) : null}
                     </div>
                   </div>
                 ))
