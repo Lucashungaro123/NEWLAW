@@ -1332,6 +1332,16 @@ def serialize_deadline(deadline: AgendaDeadline) -> dict[str, Any]:
     }
 
 
+def ensure_can_manage_agenda_deadline(deadline: AgendaDeadline, user: User) -> None:
+    if user.id is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Usuário sem identificador")
+    if deadline.user_id == user.id:
+        return
+    if user.organization_id is not None and deadline.organization_id == user.organization_id:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+
+
 def serialize_external_datetime(value: datetime, *, is_all_day: bool) -> str:
     # All-day items are represented as date-local midnight for UI grouping.
     if is_all_day:
@@ -4813,10 +4823,7 @@ def delete_agenda_deadline(
     deadline = session.get(AgendaDeadline, deadline_id)
     if not deadline:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prazo não encontrado")
-    if user.organization_id is not None and deadline.organization_id != user.organization_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
-    if user.organization_id is None and user.id != deadline.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+    ensure_can_manage_agenda_deadline(deadline, user)
     session.delete(deadline)
     session.commit()
     return {"status": "ok", "id": deadline_id}
@@ -4832,10 +4839,7 @@ def update_agenda_deadline(
     deadline = session.get(AgendaDeadline, deadline_id)
     if not deadline:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prazo não encontrado")
-    if user.organization_id is not None and deadline.organization_id != user.organization_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
-    if user.organization_id is None and user.id != deadline.user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+    ensure_can_manage_agenda_deadline(deadline, user)
     deadline.is_completed = bool(payload.is_completed)
     deadline.updated_at = datetime.utcnow()
     session.add(deadline)
