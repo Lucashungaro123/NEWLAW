@@ -2015,6 +2015,10 @@ class AgendaDeadlineCreateRequest(BaseModel):
     is_all_day: bool = True
 
 
+class AgendaDeadlineUpdateRequest(BaseModel):
+    is_completed: bool
+
+
 class AgendaSyncResponse(BaseModel):
     provider: str
     synced_events: int
@@ -4816,6 +4820,28 @@ def delete_agenda_deadline(
     session.delete(deadline)
     session.commit()
     return {"status": "ok", "id": deadline_id}
+
+
+@app.patch("/agenda/deadlines/{deadline_id}")
+def update_agenda_deadline(
+    deadline_id: int,
+    payload: AgendaDeadlineUpdateRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    deadline = session.get(AgendaDeadline, deadline_id)
+    if not deadline:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prazo não encontrado")
+    if user.organization_id is not None and deadline.organization_id != user.organization_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+    if user.organization_id is None and user.id != deadline.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+    deadline.is_completed = bool(payload.is_completed)
+    deadline.updated_at = datetime.utcnow()
+    session.add(deadline)
+    session.commit()
+    session.refresh(deadline)
+    return serialize_deadline(deadline)
 
 
 @app.get("/agenda/events")

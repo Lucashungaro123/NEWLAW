@@ -232,6 +232,9 @@ export type CreateAgendaDeadlinePayload = {
   end_time?: string;
   is_all_day?: boolean;
 };
+export type UpdateAgendaDeadlinePayload = {
+  is_completed: boolean;
+};
 export type FinanceEntryType = "receita" | "despesa";
 export type FinancePaymentMethod = "" | "pix" | "boleto" | "cartao" | "dinheiro" | "transferencia";
 export type FinanceRecurring = "nao-recorrente" | "mensal" | "anual" | "personalizado";
@@ -810,6 +813,11 @@ export async function createAgendaDeadline(payload: CreateAgendaDeadlinePayload)
 export async function deleteAgendaDeadline(deadlineId: number) {
   const { data } = await api.delete(`/agenda/deadlines/${deadlineId}`);
   return data as { status: string; id: number };
+}
+
+export async function updateAgendaDeadline(deadlineId: number, payload: UpdateAgendaDeadlinePayload) {
+  const { data } = await api.patch(`/agenda/deadlines/${deadlineId}`, payload);
+  return data as AgendaItem;
 }
 
 export async function listFinanceEntries(organizationId?: number) {

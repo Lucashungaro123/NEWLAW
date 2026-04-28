@@ -7994,11 +7994,30 @@ body {
   border-left: 3px solid #2f5fb8;
 }
 
+.agenda-event-item.completed,
+.agenda-upcoming-item.completed {
+  background: rgba(90, 168, 109, 0.12);
+  border-color: rgba(90, 168, 109, 0.35);
+}
+
+.agenda-event-item.completed .publication-name,
+.agenda-upcoming-item.completed .publication-name {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
 .agenda-event-side {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 8px;
+}
+
+.agenda-event-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
 }
 
 .agenda-event-description {
@@ -8016,6 +8035,20 @@ body {
   background: #2f5fb8;
 }
 
+.agenda-status {
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.agenda-status.completed {
+  color: #2f6d45;
+  background: rgba(90, 168, 109, 0.18);
+  border: 1px solid rgba(90, 168, 109, 0.42);
+}
+
 .agenda-meeting-link {
   font-size: 12px;
   font-weight: 700;
@@ -8029,6 +8062,10 @@ body {
 
 .link-btn.danger {
   color: #d46868;
+}
+
+.link-btn.success {
+  color: #2f8f57;
 }
 
 .agenda-upcoming-item {
@@ -9653,6 +9690,11 @@ body {
   }
 
   .agenda-event-side {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .agenda-event-actions {
     flex-direction: row;
     align-items: center;
   }

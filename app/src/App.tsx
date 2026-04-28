@@ -59,6 +59,7 @@ import {
   syncCalendarConnection as apiSyncCalendarConnection,
   uploadClientDocument as apiUploadClientDocument,
   updateTeamMember as apiUpdateTeamMember,
+  updateAgendaDeadline as apiUpdateAgendaDeadline,
   updateCase as apiUpdateCase,
   updateClient as apiUpdateClient,
   updateFinanceEntry as apiUpdateFinanceEntry,
@@ -8995,6 +8996,8 @@ const agendaEventTagLabel = (item: AgendaItem) => {
 
 const agendaEventAssigneesLabel = (item: AgendaItem) => item.assignees || item.assignee_name || "";
 
+const isAgendaItemCompleted = (item: AgendaItem) => (item.status || "").trim().toLowerCase() === "concluido";
+
 const isAgendaDeadlineItem = (item: AgendaItem) => item.kind === "deadline" || item.event_type === "deadline";
 
 const isAgendaHearingItem = (item: AgendaItem) => {
@@ -9058,7 +9061,9 @@ function Agenda() {
   const [inlineMessage, setInlineMessage] = useState("");
   const [sourceFilter, setSourceFilter] = useState<"all" | "internal" | CalendarProvider>("all");
   const [typeFilter, setTypeFilter] = useState<"all" | "deadline" | "meeting">("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | "open" | "completed">("all");
   const [savingDeadline, setSavingDeadline] = useState(false);
+  const [updatingDeadlineId, setUpdatingDeadlineId] = useState<number | null>(null);
   const [teamMembers, setTeamMembers] = useState<ApiTeamMember[]>([]);
   const [isLoadingTeamMembers, setIsLoadingTeamMembers] = useState(false);
   const [isAssigneePickerOpen, setIsAssigneePickerOpen] = useState(false);
@@ -9168,11 +9173,13 @@ function Agenda() {
   const filteredEvents = useMemo(() => {
     return events.filter((item) => {
       if (typeFilter !== "all" && item.kind !== typeFilter) return false;
+      if (statusFilter === "open" && isAgendaItemCompleted(item)) return false;
+      if (statusFilter === "completed" && !isAgendaItemCompleted(item)) return false;
       if (sourceFilter === "all") return true;
       if (sourceFilter === "internal") return item.source === "internal";
       return item.source === sourceFilter;
     });
-  }, [events, sourceFilter, typeFilter]);
+  }, [events, sourceFilter, statusFilter, typeFilter]);
 
   const dayMarkersByDate = useMemo(() => {
     const markers: Record<string, { deadline: boolean; task: boolean; hearing: boolean }> = {};
@@ -9303,6 +9310,28 @@ function Agenda() {
       await loadAgendaData(month);
     } catch (err) {
       setError(extractApiErrorMessage(err, "Não foi possível remover o compromisso interno."));
+    }
+  };
+
+  const handleToggleDeadlineCompleted = async (eventItem: AgendaItem) => {
+    if (eventItem.source !== "internal") return;
+    const nextCompleted = !isAgendaItemCompleted(eventItem);
+    setUpdatingDeadlineId(eventItem.entity_id);
+    setError("");
+    setEvents((prev) =>
+      prev.map((item) =>
+        item.id === eventItem.id ? { ...item, status: nextCompleted ? "concluido" : "pendente" } : item
+      )
+    );
+    try {
+      const updated = await apiUpdateAgendaDeadline(eventItem.entity_id, { is_completed: nextCompleted });
+      setEvents((prev) => prev.map((item) => (item.id === eventItem.id ? updated : item)));
+      setInlineMessage(nextCompleted ? "Compromisso marcado como concluído." : "Compromisso reaberto.");
+    } catch (err) {
+      setEvents((prev) => prev.map((item) => (item.id === eventItem.id ? eventItem : item)));
+      setError(extractApiErrorMessage(err, "Não foi possível atualizar o compromisso interno."));
+    } finally {
+      setUpdatingDeadlineId(null);
     }
   };
 
@@ -9540,6 +9569,11 @@ function Agenda() {
                   <option value="deadline">Prazos</option>
                   <option value="meeting">Reuniões e compromissos</option>
                 </select>
+                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | "open" | "completed")}>
+                  <option value="all">Todos status</option>
+                  <option value="open">Em aberto</option>
+                  <option value="completed">Concluídos</option>
+                </select>
               </div>
             </div>
 
@@ -9549,33 +9583,48 @@ function Agenda() {
               <div className="publication-empty">Nenhum compromisso para o dia selecionado.</div>
             ) : (
               <div className="publication-list agenda-event-list">
-                {selectedDayEvents.map((item) => (
-                  <div key={item.id} className={`publication-item agenda-event-item ${item.kind}`}>
-                    <div>
-                      <div className="publication-name">{item.title}</div>
-                      <div className="publication-meta">
-                        {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
-                        {item.reference ? ` · ${item.reference}` : ""}
+                {selectedDayEvents.map((item) => {
+                  const completed = isAgendaItemCompleted(item);
+                  const isUpdating = updatingDeadlineId === item.entity_id;
+                  return (
+                    <div key={item.id} className={`publication-item agenda-event-item ${item.kind} ${completed ? "completed" : ""}`}>
+                      <div>
+                        <div className="publication-name">{item.title}</div>
+                        <div className="publication-meta">
+                          {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
+                          {item.reference ? ` · ${item.reference}` : ""}
+                        </div>
+                        {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
+                        {item.description && <div className="agenda-event-description">{item.description}</div>}
+                        {item.location && <div className="publication-meta">Local: {item.location}</div>}
+                        {item.meeting_url && (
+                          <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
+                            Entrar na reunião
+                          </a>
+                        )}
                       </div>
-                      {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
-                      {item.description && <div className="agenda-event-description">{item.description}</div>}
-                      {item.location && <div className="publication-meta">Local: {item.location}</div>}
-                      {item.meeting_url && (
-                        <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
-                          Entrar na reunião
-                        </a>
-                      )}
+                      <div className="agenda-event-side">
+                        <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                        {completed && <span className="agenda-status completed">Concluído</span>}
+                        {item.source === "internal" && (
+                          <div className="agenda-event-actions">
+                            <button
+                              type="button"
+                              className={`link-btn ${completed ? "" : "success"}`}
+                              onClick={() => handleToggleDeadlineCompleted(item)}
+                              disabled={isUpdating}
+                            >
+                              {isUpdating ? "Salvando..." : completed ? "Reabrir" : "Concluir"}
+                            </button>
+                            <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
+                              Remover
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <div className="agenda-event-side">
-                      <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
-                      {item.source === "internal" && (
-                        <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
-                          Remover
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -9587,7 +9636,7 @@ function Agenda() {
             ) : (
               <div className="publication-list">
                 {upcomingEvents.map((item) => (
-                  <div key={`upcoming-${item.id}`} className="publication-item agenda-upcoming-item">
+                  <div key={`upcoming-${item.id}`} className={`publication-item agenda-upcoming-item ${isAgendaItemCompleted(item) ? "completed" : ""}`}>
                     <div>
                       <div className="publication-name">{item.title}</div>
                       <div className="publication-meta">
@@ -9596,7 +9645,10 @@ function Agenda() {
                       </div>
                       {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
                     </div>
-                    <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                    <div className="agenda-event-side">
+                      <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                      {isAgendaItemCompleted(item) && <span className="agenda-status completed">Concluído</span>}
+                    </div>
                   </div>
                 ))}
               </div>
