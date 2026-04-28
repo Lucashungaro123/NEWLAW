@@ -127,6 +127,7 @@ NAV_PERMISSION_KEYS = (
 )
 ADMIN_REQUIRED_NAV_KEYS = ("team", "wallets")
 ADMIN_ROLES = {"superadmin", "owner", "admin"}
+MASTER_ACCOUNT_TEAM_MEMBER_ID_OFFSET = 1_000_000
 CALENDAR_PROVIDERS = ("google", "microsoft")
 FINANCE_ENTRY_TYPES = ("receita", "despesa")
 FINANCE_PAYMENT_METHODS = ("pix", "boleto", "cartao", "dinheiro", "transferencia")
@@ -4074,9 +4075,55 @@ def serialize_team_member(member: TeamMember, *, invite_email_sent: bool = False
     return payload
 
 
+def get_master_account_team_member_id(user: User) -> int:
+    return -((user.id or 0) + MASTER_ACCOUNT_TEAM_MEMBER_ID_OFFSET)
+
+
+def parse_master_account_team_member_id(member_id: int) -> int | None:
+    if member_id >= 0:
+        return None
+    user_id = abs(member_id) - MASTER_ACCOUNT_TEAM_MEMBER_ID_OFFSET
+    return user_id if user_id > 0 else None
+
+
+def find_master_user_for_member(session: Session, member: TeamMember) -> User | None:
+    if member.organization_id is None:
+        return None
+    return session.exec(
+        select(User).where(
+            User.organization_id == member.organization_id,
+            User.email == normalize_email(member.email),
+            User.role == "owner",
+        )
+    ).first()
+
+
+def decorate_master_team_member_payload(payload: dict, user: User) -> dict:
+    payload["is_admin"] = True
+    payload["allowed_nav_keys"] = get_effective_user_nav_keys(user)
+    payload["is_active"] = bool(user.is_active)
+    payload["is_read_only"] = False
+    payload["is_master_account"] = True
+    payload["account_role"] = user.role
+    return payload
+
+
+def serialize_master_team_member(
+    member: TeamMember,
+    user: User,
+    *,
+    invite_email_sent: bool = False,
+    invite_token: str | None = None,
+) -> dict:
+    return decorate_master_team_member_payload(
+        serialize_team_member(member, invite_email_sent=invite_email_sent, invite_token=invite_token),
+        user,
+    )
+
+
 def serialize_master_account_as_team_member(user: User) -> dict:
     return {
-        "id": -((user.id or 0) + 1_000_000),
+        "id": get_master_account_team_member_id(user),
         "organization_id": user.organization_id,
         "full_name": user.full_name,
         "email": user.email,
@@ -4090,10 +4137,67 @@ def serialize_master_account_as_team_member(user: User) -> dict:
         "allowed_nav_keys": get_effective_user_nav_keys(user),
         "is_active": bool(user.is_active),
         "invite_email_sent": False,
-        "is_read_only": True,
+        "is_read_only": False,
         "is_master_account": True,
         "account_role": user.role,
     }
+
+
+def save_master_account_team_member(
+    session: Session,
+    actor: User,
+    master_user: User,
+    payload: UpdateTeamMemberRequest,
+    existing_member: TeamMember | None = None,
+) -> dict:
+    current_scope = resolve_existing_record_scope(actor, session, master_user.organization_id)
+    if current_scope is not None and master_user.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este membro")
+
+    organization = session.get(Organization, master_user.organization_id) if master_user.organization_id is not None else None
+    if not organization or not organization.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organização inválida")
+    organization_id = get_organization_pk(organization)
+    clean = sanitize_team_member_payload(payload)
+    clean["is_admin"] = True
+    clean["allowed_nav_keys"] = get_effective_user_nav_keys(master_user)
+    clean["is_active"] = True
+
+    linked_user = get_user_by_email(session, clean["email"])
+    if linked_user and linked_user.id != master_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email já está em uso por outro usuário")
+
+    ignore_member_id = existing_member.id if existing_member else None
+    ensure_unique_team_member_cpf(session, clean["cpf"], organization_id, ignore_id=ignore_member_id)
+    ensure_unique_team_member_email(session, clean["email"], organization_id, ignore_id=ignore_member_id)
+
+    member = existing_member or TeamMember(organization_id=organization_id)
+    member.organization_id = organization_id
+    member.full_name = clean["full_name"]
+    member.email = clean["email"]
+    member.phone = clean["phone"]
+    member.cpf = clean["cpf"]
+    member.oab = clean["oab"]
+    member.role_title = clean["role_title"]
+    member.team_name = clean["team_name"]
+    member.notes = clean["notes"]
+    member.is_team_admin = True
+    member.allowed_nav_keys = serialize_nav_keys(clean["allowed_nav_keys"])
+    member.is_active = True
+    member.updated_at = datetime.utcnow()
+
+    master_user.full_name = clean["full_name"]
+    master_user.email = clean["email"]
+    master_user.phone = clean["phone"]
+    master_user.is_active = True
+    master_user.updated_at = datetime.utcnow()
+
+    session.add(master_user)
+    session.add(member)
+    session.commit()
+    session.refresh(master_user)
+    session.refresh(member)
+    return serialize_master_team_member(member, master_user)
 
 
 def sync_user_from_team_member(
@@ -4964,15 +5068,23 @@ def list_team_members(
     else:
         query = query.where(TeamMember.organization_id == scope_organization_id)
     members = session.exec(query).all()
-    payload = [serialize_team_member(member) for member in members]
+    master_users: list[User] = []
     if include_master_accounts and scope_organization_id is not None:
-        known_emails = {normalize_email(member.email) for member in members}
         master_users = session.exec(
             select(User).where(
                 User.organization_id == scope_organization_id,
                 User.role == "owner",
             )
         ).all()
+    master_by_email = {normalize_email(master_user.email): master_user for master_user in master_users}
+    payload = [
+        serialize_master_team_member(member, master_by_email[normalize_email(member.email)])
+        if normalize_email(member.email) in master_by_email
+        else serialize_team_member(member)
+        for member in members
+    ]
+    if include_master_accounts and scope_organization_id is not None:
+        known_emails = {normalize_email(member.email) for member in members}
         for master_user in master_users:
             if normalize_email(master_user.email) in known_emails:
                 continue
@@ -5046,6 +5158,14 @@ def update_team_member(
     user: Annotated[User, Depends(get_current_user)],
 ) -> dict:
     ensure_can_manage_team_and_wallets(user)
+    master_user_id = parse_master_account_team_member_id(member_id)
+    if master_user_id is not None:
+        master_user = session.get(User, master_user_id)
+        if not master_user or master_user.role != "owner":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Membro não encontrado")
+        existing_member = get_team_member_for_user(session, master_user)
+        return save_master_account_team_member(session, user, master_user, payload, existing_member)
+
     member = session.get(TeamMember, member_id)
     if not member:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Membro não encontrado")
@@ -5064,6 +5184,10 @@ def update_team_member(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Não é permitido mover membro entre organizações",
             )
+
+    master_user = find_master_user_for_member(session, member)
+    if master_user:
+        return save_master_account_team_member(session, user, master_user, payload, member)
 
     clean = sanitize_team_member_payload(payload)
     ensure_unique_team_member_cpf(session, clean["cpf"], target_organization_id, ignore_id=member.id)
@@ -5175,6 +5299,8 @@ def delete_team_member(
     user: Annotated[User, Depends(get_current_user)],
 ) -> dict:
     ensure_can_manage_team_and_wallets(user)
+    if parse_master_account_team_member_id(member_id) is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A conta master não pode ser excluída.")
     member = session.get(TeamMember, member_id)
     if not member:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Membro não encontrado")
@@ -5182,6 +5308,8 @@ def delete_team_member(
     if current_scope is not None and member.organization_id != current_scope:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este membro")
     linked_user = get_user_by_email(session, member.email)
+    if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "owner":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A conta master não pode ser excluída.")
     if linked_user and linked_user.id is not None and linked_user.organization_id == member.organization_id and linked_user.role == "member":
         linked_user.is_active = False
         linked_user.updated_at = datetime.utcnow()

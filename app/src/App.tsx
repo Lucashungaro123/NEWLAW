@@ -181,7 +181,7 @@ const navItems: { key: NavKey; label: string }[] = [
 ];
 
 const navPermissionOptions = navItems.map((item) => ({ key: item.key, label: item.label }));
-const defaultMemberNavKeys = navPermissionOptions.map((item) => item.key);
+const defaultMemberNavKeys: NavKey[] = navPermissionOptions.map((item) => item.key);
 const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
 const MASTER_OFFICE_NAME = "NEWLAW";
 const PROFILE_STORAGE_KEY_PREFIX = "newlaw-profile-preferences";
@@ -526,6 +526,7 @@ type ClientForm = {
   rg: string;
   cnpj: string;
   birth: string;
+  gender: string;
   marital: string;
   job: string;
   cep: string;
@@ -549,6 +550,7 @@ const emptyClientForm: ClientForm = {
   rg: "",
   cnpj: "",
   birth: "",
+  gender: "",
   marital: "",
   job: "",
   cep: "",
@@ -1162,6 +1164,57 @@ const resolveClientKind = (document: string, metadataKind?: ClientKind): ClientK
   return digits.length > 11 ? "PJ" : "PF";
 };
 
+const clientGenderOptions = ["Masculino", "Feminino"] as const;
+type ClientGender = (typeof clientGenderOptions)[number] | "";
+type ClientMaritalKey = "" | "single" | "married" | "divorced" | "widowed" | "stable_union";
+
+const clientMaritalOptions: {
+  key: Exclude<ClientMaritalKey, "">;
+  label: string;
+  masculine: string;
+  feminine: string;
+}[] = [
+  { key: "single", label: "Solteiro(a)", masculine: "Solteiro", feminine: "Solteira" },
+  { key: "married", label: "Casado(a)", masculine: "Casado", feminine: "Casada" },
+  { key: "divorced", label: "Divorciado(a)", masculine: "Divorciado", feminine: "Divorciada" },
+  { key: "widowed", label: "Viúvo(a)", masculine: "Viúvo", feminine: "Viúva" },
+  { key: "stable_union", label: "União estável", masculine: "União estável", feminine: "União estável" }
+];
+
+const getClientMaritalOption = (key: ClientMaritalKey) => clientMaritalOptions.find((option) => option.key === key) || null;
+
+const getClientGenderFromMarital = (marital: string): ClientGender => {
+  if (["Solteira", "Casada", "Divorciada", "Viúva"].includes(marital)) return "Feminino";
+  if (["Solteiro", "Casado", "Divorciado", "Viúvo"].includes(marital)) return "Masculino";
+  return "";
+};
+
+const getClientMaritalKey = (marital: string): ClientMaritalKey => {
+  const normalized = marital.trim();
+  if (!normalized) return "";
+  const option = clientMaritalOptions.find(
+    (item) => item.masculine === normalized || item.feminine === normalized || item.label === normalized
+  );
+  return option?.key || "";
+};
+
+const formatClientMaritalStatus = (key: ClientMaritalKey, gender: string) => {
+  const option = getClientMaritalOption(key);
+  if (!option) return "";
+  if (gender === "Feminino") return option.feminine;
+  if (gender === "Masculino") return option.masculine;
+  return option.label;
+};
+
+const getClientMaritalOptionLabel = (
+  option: { label: string; masculine: string; feminine: string },
+  gender: string
+) => {
+  if (gender === "Feminino") return option.feminine;
+  if (gender === "Masculino") return option.masculine;
+  return option.label;
+};
+
 const toClientForm = (client: ApiClient): ClientForm => {
   const metadata = parseClientMetadata(client.notes);
   const document = (client.document || "").trim();
@@ -1184,6 +1237,9 @@ const toClientForm = (client: ApiClient): ClientForm => {
       form.cpf = "";
     }
   }
+  if (form.kind === "PF" && !form.gender) {
+    form.gender = getClientGenderFromMarital(form.marital);
+  }
   return form;
 };
 
@@ -1194,6 +1250,7 @@ const buildClientNotes = (form: ClientForm) =>
     phone2: form.phone2.trim(),
     rg: form.rg.trim(),
     birth: form.birth.trim(),
+    gender: form.gender.trim(),
     marital: form.marital.trim(),
     job: form.job.trim(),
     cep: form.cep.trim(),
@@ -1527,8 +1584,21 @@ function AddClientModal({
     onChange("rg", formatRg(value));
   };
 
+  const handleGenderChange = (value: ClientGender) => {
+    onChange("gender", value);
+    const maritalKey = getClientMaritalKey(form.marital);
+    if (maritalKey) {
+      onChange("marital", formatClientMaritalStatus(maritalKey, value));
+    }
+  };
+
+  const handleMaritalChange = (value: ClientMaritalKey) => {
+    onChange("marital", formatClientMaritalStatus(value, form.gender));
+  };
+
   const cepDigits = (form.cep || "").replace(/\D/g, "");
   const isPerson = form.kind === "PF";
+  const maritalKey = getClientMaritalKey(form.marital);
   const validationMessage = getClientFormValidationMessage(form);
   const cpfInvalid = isPerson && form.cpf.trim().length > 0 && !isValidCpf(form.cpf);
   const cnpjInvalid = !isPerson && form.cnpj.trim().length > 0 && !isValidCnpj(form.cnpj);
@@ -1638,16 +1708,25 @@ function AddClientModal({
                 />
               </div>
               <div className="field">
-                <label>Estado civil</label>
-                <select value={form.marital} onChange={(e) => onChange("marital", e.target.value)}>
+                <label>Sexo</label>
+                <select value={form.gender} onChange={(e) => handleGenderChange(e.target.value as ClientGender)}>
                   <option value="">Selecione</option>
-                  <option value="Solteiro">Solteiro</option>
-                  <option value="Solteira">Solteira</option>
-                  <option value="Casado">Casado</option>
-                  <option value="Casada">Casada</option>
-                  <option value="Viúvo">Viúvo</option>
-                  <option value="Viúva">Viúva</option>
-                  <option value="União estável">União estável</option>
+                  {clientGenderOptions.map((gender) => (
+                    <option key={gender} value={gender}>
+                      {gender}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Estado civil</label>
+                <select value={maritalKey} onChange={(e) => handleMaritalChange(e.target.value as ClientMaritalKey)}>
+                  <option value="">Selecione</option>
+                  {clientMaritalOptions.map((option) => (
+                    <option key={option.key} value={option.key}>
+                      {getClientMaritalOptionLabel(option, form.gender)}
+                    </option>
+                  ))}
                 </select>
               </div>
               <div className="field">
@@ -1936,6 +2015,10 @@ function ClientDetailsModal({
               <div className="field">
                 <label>Data de nascimento</label>
                 <input value={form.birth || "-"} readOnly />
+              </div>
+              <div className="field">
+                <label>Sexo</label>
+                <input value={form.gender || "-"} readOnly />
               </div>
               <div className="field">
                 <label>Estado civil</label>
@@ -12103,6 +12186,7 @@ function Team({ canManage }: { canManage: boolean }) {
     () => (editingId ? members.find((member) => member.id === editingId) ?? null : null),
     [editingId, members]
   );
+  const editingMasterAccount = Boolean(editingMember?.is_master_account);
 
   const refreshCapacity = async () => {
     try {
@@ -12121,9 +12205,9 @@ function Team({ canManage }: { canManage: boolean }) {
 
   const enforceAdminNavAccess = (keys: NavKey[], isAdmin: boolean): NavKey[] => {
     const normalized = normalizeNavKeys(keys);
-    const withSettings = normalized.includes("settings") ? [...normalized] : [...normalized, "settings"];
+    const withSettings: NavKey[] = normalized.includes("settings") ? [...normalized] : [...normalized, "settings"];
     if (!isAdmin) return withSettings;
-    const output = [...withSettings];
+    const output: NavKey[] = [...withSettings];
     for (const required of adminRequiredNavKeys) {
       if (!output.includes(required)) output.push(required);
     }
@@ -12174,13 +12258,13 @@ function Team({ canManage }: { canManage: boolean }) {
         role_title: form.roleTitle.trim(),
         team_name: form.teamName.trim(),
         notes: form.notes.trim() || undefined,
-        is_admin: form.isAdmin,
-        allowed_nav_keys: form.allowedNavKeys,
-        is_active: form.isActive
+        is_admin: editingMasterAccount ? true : form.isAdmin,
+        allowed_nav_keys: editingMasterAccount ? [...defaultMemberNavKeys] : form.allowedNavKeys,
+        is_active: editingMasterAccount ? true : form.isActive
       };
       if (editingId) {
         const updated = await apiUpdateTeamMember(editingId, payload);
-        setMembers((prev) => prev.map((member) => (member.id === updated.id ? updated : member)));
+        setMembers((prev) => prev.map((member) => (member.id === editingId || member.id === updated.id ? updated : member)));
         setSaveSuccess("Membro atualizado com sucesso.");
       } else {
         const created = await apiCreateTeamMember(payload);
@@ -12204,7 +12288,7 @@ function Team({ canManage }: { canManage: boolean }) {
   };
 
   const handleEditMember = (member: ApiTeamMember) => {
-    if (member.is_read_only) {
+    if (member.is_read_only && !member.is_master_account) {
       setSaveError("A conta master aparece na equipe apenas para consulta.");
       setView("list");
       return;
@@ -12239,7 +12323,7 @@ function Team({ canManage }: { canManage: boolean }) {
     }
     if (!deleteId) return;
     const member = members.find((item) => item.id === deleteId);
-    if (member?.is_read_only) {
+    if (member?.is_master_account || member?.is_read_only) {
       setDeleteError("A conta master não pode ser excluída pela tela de equipe.");
       return;
     }
@@ -12263,7 +12347,7 @@ function Team({ canManage }: { canManage: boolean }) {
       setSaveError("Você não tem permissão para refazer senhas.");
       return;
     }
-    if (member.is_read_only) {
+    if (member.is_read_only || member.is_master_account) {
       setSaveError("A conta master não pode ser alterada pela tela de equipe.");
       return;
     }
@@ -12413,19 +12497,26 @@ function Team({ canManage }: { canManage: boolean }) {
                     <div>{member.role_title}</div>
                     <div>{formatCpfFromDigits(member.cpf)}</div>
                     <div>{member.oab || "—"}</div>
-                    <div>{member.is_active ? "Ativo" : "Inativo"}{member.is_read_only ? " · Somente leitura" : ""}</div>
+                    <div>
+                      {member.is_active ? "Ativo" : "Inativo"}
+                      {member.is_read_only && !member.is_master_account ? " · Somente leitura" : ""}
+                    </div>
                     <div className="wallets-row-actions">
-                      {canManage && !member.is_read_only ? (
+                      {canManage && (!member.is_read_only || member.is_master_account) ? (
                         <>
                           <button className="btn ghost small" type="button" onClick={() => handleEditMember(member)}>
                             Editar
                           </button>
-                          <button className="btn danger small" type="button" onClick={() => setDeleteId(member.id)}>
-                            Excluir
-                          </button>
+                          {!member.is_master_account && (
+                            <button className="btn danger small" type="button" onClick={() => setDeleteId(member.id)}>
+                              Excluir
+                            </button>
+                          )}
                         </>
-                      ) : member.is_read_only ? (
+                      ) : member.is_master_account ? (
                         <span className="wallets-row-sub">Conta master</span>
+                      ) : member.is_read_only ? (
+                        <span className="wallets-row-sub">Somente leitura</span>
                       ) : null}
                     </div>
                   </div>
@@ -12506,6 +12597,7 @@ function Team({ canManage }: { canManage: boolean }) {
                 <select
                   value={form.isActive ? "active" : "inactive"}
                   onChange={(event) => setForm((prev) => ({ ...prev, isActive: event.target.value === "active" }))}
+                  disabled={editingMasterAccount}
                 >
                   <option value="active">Ativo</option>
                   <option value="inactive">Inativo</option>
@@ -12517,7 +12609,12 @@ function Team({ canManage }: { canManage: boolean }) {
               </div>
               <div className="field span-2">
                 <label className="check-field">
-                  <input type="checkbox" checked={form.isAdmin} onChange={(event) => handleToggleAdmin(event.target.checked)} />
+                  <input
+                    type="checkbox"
+                    checked={form.isAdmin || editingMasterAccount}
+                    onChange={(event) => handleToggleAdmin(event.target.checked)}
+                    disabled={editingMasterAccount}
+                  />
                   Administrador da equipe (pode cadastrar membros e criar carteiras)
                 </label>
               </div>
@@ -12543,7 +12640,7 @@ function Team({ canManage }: { canManage: boolean }) {
             </div>
             {saveError && <div className="error">{saveError}</div>}
             <div className="modal-actions">
-              {editingMember && (
+              {editingMember && !editingMember.is_master_account && (
                 <button
                   className="btn ghost"
                   type="button"
