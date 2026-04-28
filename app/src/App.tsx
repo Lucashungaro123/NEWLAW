@@ -46,7 +46,6 @@ import {
   getPublicationAutomationSettings as apiGetPublicationAutomationSettings,
   getTodayPublications as apiGetTodayPublications,
   handlePublication as apiHandlePublication,
-  searchPublicationsByOabLocally as apiSearchPublicationsByOabLocally,
   listAgendaEvents as apiListAgendaEvents,
   listCalendarConnections as apiListCalendarConnections,
   listClientDocuments as apiListClientDocuments,
@@ -7811,7 +7810,6 @@ function Publications({ user }: { user: AuthUser | null }) {
   const [isSavingPublicationRegistrationClient, setIsSavingPublicationRegistrationClient] = useState(false);
   const [isSavingPublicationRegistrationCase, setIsSavingPublicationRegistrationCase] = useState(false);
   const [processingPublicationSourceKey, setProcessingPublicationSourceKey] = useState("");
-  const runningInTauri = typeof window !== "undefined" && isTauri();
   const publicationResultsRef = useRef<HTMLDivElement | null>(null);
 
   const buildPublicationContextFallback = async (items: TodayPublicationItem[]) => {
@@ -8008,28 +8006,7 @@ function Publications({ user }: { user: AuthUser | null }) {
     setTodayPublicationsInlineMessage("");
     setPublicationActionError("");
     try {
-      let data: TodayPublicationsResponse;
-      if (runningInTauri && baseURL !== LOCAL_API_BASE_URL) {
-        const memberEmail = user?.email?.trim().toLowerCase();
-        if (!memberEmail) {
-          throw new Error("Não foi possível identificar o e-mail do usuário logado.");
-        }
-        const sessionUser = loadAuthSession()?.user;
-        const parsedSessionOab = splitStoredOab(user?.oab || sessionUser?.oab || "");
-        if (parsedSessionOab.number.length === 6 && parsedSessionOab.uf) {
-          data = await apiSearchPublicationsByOabLocally({
-            oab_number: parsedSessionOab.number,
-            oab_uf: parsedSessionOab.uf,
-            member_name: user?.name || "Membro da equipe",
-            member_email: memberEmail,
-            publication_date: selectedPublicationDate
-          });
-        } else {
-          data = await apiGetTodayPublications(selectedPublicationDate);
-        }
-      } else {
-        data = await apiGetTodayPublications(selectedPublicationDate);
-      }
+      const data = await apiGetTodayPublications(selectedPublicationDate);
       if (data.oab) {
         const session = loadAuthSession();
         if (session?.user && session.user.oab !== data.oab) {

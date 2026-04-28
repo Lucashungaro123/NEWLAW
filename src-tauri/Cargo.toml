@@ -1,6 +1,6 @@
 [package]
 name = "newlaw"
-version = "0.1.15"
+version = "0.1.16"
 description = "NEWLAW desktop app"
 authors = ["lucashungaro"]
 edition = "2021"
