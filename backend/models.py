@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import UniqueConstraint
@@ -87,6 +87,28 @@ class Case(TimestampMixin, table=True):
     closure_financial_json: Optional[str] = None
 
 
+class ServiceIntake(TimestampMixin, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    organization_id: Optional[int] = Field(default=None, foreign_key="organization.id", index=True)
+    handled_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    lead_name: str = Field(index=True)
+    document: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    legal_area: Optional[str] = None
+    referral_source: Optional[str] = None
+    meeting_date: Optional[date] = Field(default=None, index=True)
+    meeting_time: Optional[str] = None
+    meeting_mode: Optional[str] = None
+    summary: Optional[str] = None
+    process_overview: Optional[str] = None
+    next_steps: Optional[str] = None
+    agreed_fee: Optional[float] = None
+    payment_terms: Optional[str] = None
+    handled_by_name: Optional[str] = None
+    status: str = Field(default="registrado", index=True)
+
+
 class Wallet(TimestampMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     organization_id: Optional[int] = Field(default=None, foreign_key="organization.id")
@@ -104,7 +126,7 @@ class TeamMember(TimestampMixin, table=True):
     email: str = Field(index=True)
     phone: Optional[str] = None
     cpf: str = Field(index=True, description="CPF do colaborador (somente dígitos)")
-    oab: str = Field(index=True, description="Número da OAB")
+    oab: str = Field(default="", index=True, description="Número da OAB, quando houver")
     role_title: str = Field(index=True, description="Cargo na equipe")
     team_name: str = Field(index=True, description="Equipe/área")
     notes: Optional[str] = None

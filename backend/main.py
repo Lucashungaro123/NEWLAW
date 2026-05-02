@@ -57,6 +57,7 @@ from .models import (
     PublicationHandling,
     PublicationRecord,
     RefreshToken,
+    ServiceIntake,
     TeamMember,
     Template,
     User,
@@ -119,7 +120,6 @@ NAV_PERMISSION_KEYS = (
     "agenda",
     "finance",
     "service",
-    "reports",
     "stats",
     "official",
     "files",
@@ -163,6 +163,42 @@ PUBLICATIONS_HTTP_HEADERS = {
     "Accept": "application/json, application/pdf, text/plain, */*",
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+DATAJUD_BASE_URL = os.getenv("NEWLAW_DATAJUD_BASE_URL", "https://api-publica.datajud.cnj.jus.br").rstrip("/")
+DATAJUD_API_KEY = os.getenv(
+    "NEWLAW_DATAJUD_API_KEY",
+    "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw==",
+).strip()
+DATAJUD_TIMEOUT_SECONDS = int(os.getenv("NEWLAW_DATAJUD_TIMEOUT_SECONDS", "25"))
+DATAJUD_JURISDICTION_ALIASES = {
+    "tjsp": "tjsp",
+    "tjrj": "tjrj",
+    "tjmg": "tjmg",
+    "tjrs": "tjrs",
+    "tjpr": "tjpr",
+    "trt2": "trt2",
+    "trt15": "trt15",
+    "trf3": "trf3",
+    "stj": "stj",
+}
+DATAJUD_PROCESS_NUMBER_ALIASES = {
+    "826": "tjsp",
+    "819": "tjrj",
+    "813": "tjmg",
+    "821": "tjrs",
+    "816": "tjpr",
+    "502": "trt2",
+    "515": "trt15",
+    "403": "trf3",
+    "300": "stj",
+}
+DATAJUD_SOURCE_NAME = "DataJud/CNJ"
+DATAJUD_SOURCE_DOC_URL = "https://www.cnj.jus.br/sistemas/datajud/api-publica/"
+DATAJUD_SEARCH_FIELDS = (
+    "classe.nome^3",
+    "assuntos.nome^4",
+    "movimentos.nome",
+    "orgaoJulgador.nome",
+)
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -237,13 +273,18 @@ def parse_nav_keys(value: str | None) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in items:
-        if item == "progress":
-            item = "official"
         if not item or item not in valid or item in seen:
             continue
         seen.add(item)
         cleaned.append(item)
     return cleaned
+
+
+def expand_nav_aliases(keys: list[str]) -> list[str]:
+    expanded = list(keys)
+    if "official" in expanded and "progress" not in expanded:
+        expanded.append("progress")
+    return expanded
 
 
 def normalize_nav_keys(raw: list[str] | None, *, is_admin: bool) -> list[str]:
@@ -255,8 +296,6 @@ def normalize_nav_keys(raw: list[str] | None, *, is_admin: bool) -> list[str]:
         seen: set[str] = set()
         for key in raw:
             clean = key.strip()
-            if clean == "progress":
-                clean = "official"
             if clean not in valid or clean in seen:
                 continue
             seen.add(clean)
@@ -292,7 +331,8 @@ def ensure_can_manage_team_and_wallets(user: User) -> None:
 def get_effective_user_nav_keys(user: User) -> list[str]:
     if user.role in ADMIN_ROLES:
         return list(NAV_PERMISSION_KEYS)
-    return normalize_nav_keys(parse_nav_keys(user.allowed_nav_keys), is_admin=bool(user.is_team_admin))
+    keys = normalize_nav_keys(parse_nav_keys(user.allowed_nav_keys), is_admin=bool(user.is_team_admin))
+    return expand_nav_aliases(keys)
 
 
 def ensure_nav_access(user: User, nav_key: str) -> None:
@@ -303,15 +343,25 @@ def ensure_nav_access(user: User, nav_key: str) -> None:
 
 def serialize_auth_user(session: Session, user: User) -> dict:
     member = get_team_member_for_user(session, user)
+    organization = session.get(Organization, user.organization_id) if user.organization_id is not None else None
+    member_role_title = member.role_title if member and member.is_active else None
+    member_team_name = member.team_name if member and member.is_active else None
+    if not member_role_title:
+        member_role_title = "Responsável master" if user.role in {"superadmin", "owner", "admin"} else "Membro da equipe"
+    if not member_team_name and user.role in {"superadmin", "owner", "admin"}:
+        member_team_name = "Conta master"
     return {
         "id": user.id,
         "email": user.email,
         "name": user.full_name,
         "role": user.role,
         "organization_id": user.organization_id,
+        "organization_name": organization.name if organization else None,
         "is_admin": bool(user.is_team_admin),
         "allowed_nav_keys": get_effective_user_nav_keys(user),
         "oab": member.oab if member and member.is_active else None,
+        "role_title": member_role_title,
+        "team_name": member_team_name,
     }
 
 
@@ -1160,6 +1210,7 @@ def parse_deadline_due_date(raw_value: str) -> datetime:
 
 
 INTERNAL_AGENDA_EVENT_TYPES = {"deadline", "meeting", "hearing", "audit"}
+SERVICE_INTAKE_STATUSES = {"registrado", "proposta", "fechado", "nao_avancou"}
 
 
 def normalize_internal_agenda_event_type(raw_value: str | None) -> str:
@@ -1185,6 +1236,36 @@ def normalize_internal_agenda_time(raw_value: str | None) -> str | None:
     except ValueError:
         return None
     return parsed.strftime("%H:%M")
+
+
+def parse_optional_iso_date(raw_value: str | None, detail: str) -> date | None:
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail) from exc
+
+
+def normalize_service_intake_status(raw_value: str | None) -> str:
+    value = (raw_value or "").strip().lower()
+    aliases = {
+        "registrado": "registrado",
+        "atendido": "registrado",
+        "proposta": "proposta",
+        "proposta enviada": "proposta",
+        "fechado": "fechado",
+        "contratado": "fechado",
+        "nao_avancou": "nao_avancou",
+        "não avançou": "nao_avancou",
+        "nao avancou": "nao_avancou",
+        "descartado": "nao_avancou",
+    }
+    normalized = aliases.get(value, value or "registrado")
+    if normalized not in SERVICE_INTAKE_STATUSES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Status do atendimento inválido")
+    return normalized
 
 
 def parse_internal_agenda_metadata(raw_notes: str | None) -> dict[str, Any]:
@@ -1340,6 +1421,32 @@ def ensure_can_manage_agenda_deadline(deadline: AgendaDeadline, user: User) -> N
     if user.organization_id is not None and deadline.organization_id == user.organization_id:
         return
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este prazo")
+
+
+def serialize_service_intake(record: ServiceIntake) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "organization_id": record.organization_id,
+        "handled_by_user_id": record.handled_by_user_id,
+        "lead_name": record.lead_name,
+        "document": record.document,
+        "email": record.email,
+        "phone": record.phone,
+        "legal_area": record.legal_area,
+        "referral_source": record.referral_source,
+        "meeting_date": record.meeting_date.isoformat() if record.meeting_date else None,
+        "meeting_time": record.meeting_time,
+        "meeting_mode": record.meeting_mode,
+        "summary": record.summary,
+        "process_overview": record.process_overview,
+        "next_steps": record.next_steps,
+        "agreed_fee": record.agreed_fee,
+        "payment_terms": record.payment_terms,
+        "handled_by_name": record.handled_by_name,
+        "status": record.status,
+        "created_at": record.created_at.isoformat(timespec="seconds") if record.created_at else None,
+        "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at else None,
+    }
 
 
 def serialize_external_datetime(value: datetime, *, is_all_day: bool) -> str:
@@ -1943,6 +2050,46 @@ class UpdateCaseClosingRequest(BaseModel):
     financial: CaseClosingFinancialRequest | None = None
 
 
+class JurisprudenceSearchRequest(BaseModel):
+    area: str | None = None
+    claim_type: str | None = None
+    objective: str | None = None
+    narrative: str | None = None
+    opposing_party: str | None = None
+    jurisdiction: str
+    fact_period: str | None = None
+    evidence_summary: str | None = None
+    process_number: str | None = None
+    limit: int = 6
+
+
+class JurisprudenceVerifiedCaseResponse(BaseModel):
+    number: str
+    formatted_number: str
+    court: str | None = None
+    degree: str | None = None
+    organ: str | None = None
+    class_name: str | None = None
+    subjects: list[str] = []
+    filed_at: str | None = None
+    updated_at: str | None = None
+    movements: list[str] = []
+    source_name: str
+    source_url: str
+
+
+class JurisprudenceSearchResponse(BaseModel):
+    source_name: str
+    source_url: str
+    status: str
+    reliable: bool
+    total_hits: int = 0
+    total_relation: str = "eq"
+    query_terms: list[str] = []
+    cases: list[JurisprudenceVerifiedCaseResponse] = []
+    message: str
+
+
 class CreateWalletRequest(BaseModel):
     nickname: str
     description: str | None = None
@@ -1964,7 +2111,7 @@ class CreateTeamMemberRequest(BaseModel):
     email: str
     phone: str | None = None
     cpf: str
-    oab: str
+    oab: str | None = None
     role_title: str
     team_name: str
     notes: str | None = None
@@ -1979,7 +2126,7 @@ class UpdateTeamMemberRequest(BaseModel):
     email: str
     phone: str | None = None
     cpf: str
-    oab: str
+    oab: str | None = None
     role_title: str
     team_name: str
     notes: str | None = None
@@ -2027,6 +2174,25 @@ class AgendaDeadlineCreateRequest(BaseModel):
 
 class AgendaDeadlineUpdateRequest(BaseModel):
     is_completed: bool
+
+
+class ServiceIntakeRequest(BaseModel):
+    lead_name: str
+    document: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    legal_area: str | None = None
+    referral_source: str | None = None
+    meeting_date: str | None = None
+    meeting_time: str | None = None
+    meeting_mode: str | None = None
+    summary: str | None = None
+    process_overview: str | None = None
+    next_steps: str | None = None
+    agreed_fee: float | None = None
+    payment_terms: str | None = None
+    handled_by_name: str | None = None
+    status: str | None = None
 
 
 class AgendaSyncResponse(BaseModel):
@@ -2621,6 +2787,418 @@ def serialize_case_list(session: Session, cases: list[Case], wallet_lookup: dict
         wallet = lookup.get(case.id) if case.id is not None else None
         output.append(serialize_case(case, wallet))
     return output
+
+
+DATAJUD_STOPWORDS = {
+    "sobre",
+    "contra",
+    "cliente",
+    "parte",
+    "pedido",
+    "processo",
+    "direito",
+    "caso",
+    "fatos",
+    "fato",
+    "prova",
+    "provas",
+    "documento",
+    "documentos",
+    "com",
+    "para",
+    "pela",
+    "pelo",
+    "das",
+    "dos",
+    "uma",
+    "sem",
+    "mais",
+    "menos",
+    "quando",
+    "onde",
+    "houve",
+    "teve",
+    "tem",
+    "ser",
+    "pode",
+    "podem",
+    "possivel",
+    "possivelmente",
+    "foi",
+    "foram",
+    "mantido",
+    "mantida",
+    "eventual",
+    "aplicado",
+    "aplicada",
+    "aplicados",
+    "aplicadas",
+    "valores",
+    "valor",
+    "pagos",
+    "pagas",
+}
+
+
+def normalize_datajud_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFD", value)
+    normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+    return normalized.lower()
+
+
+def extract_datajud_terms(payload: JurisprudenceSearchRequest) -> list[str]:
+    terms: list[str] = []
+
+    def collect(value: str | None, max_terms: int) -> None:
+        if not value or len(terms) >= max_terms:
+            return
+        raw_tokens = re.split(r"[^0-9A-Za-zÀ-ÿ]+", value.lower())
+        for raw_token in raw_tokens:
+            normalized_token = normalize_datajud_token(raw_token)
+            if len(normalized_token) < 5 or normalized_token in DATAJUD_STOPWORDS:
+                continue
+            if raw_token not in terms:
+                terms.append(raw_token)
+            if len(terms) >= max_terms:
+                break
+
+    collect(payload.claim_type, 5)
+    collect(payload.objective, 5)
+    if len(terms) < 3:
+        collect(payload.evidence_summary, 5)
+    if len(terms) < 3:
+        collect(payload.narrative, 5)
+    return terms
+
+
+def text_has_all_terms(value: str, terms: list[str]) -> bool:
+    normalized = normalize_datajud_token(value)
+    return all(term in normalized for term in terms)
+
+
+def append_unique_query(queries: list[list[str]], terms: list[str]) -> None:
+    cleaned: list[str] = []
+    for term in terms:
+        normalized = normalize_datajud_token(term)
+        if not normalized or normalized in DATAJUD_STOPWORDS:
+            continue
+        if term not in cleaned:
+            cleaned.append(term)
+    if cleaned and cleaned not in queries:
+        queries.append(cleaned)
+
+
+def build_datajud_query_attempts(payload: JurisprudenceSearchRequest, process_number: str | None) -> list[list[str]]:
+    if process_number:
+        return [[process_number]]
+
+    source_text = " ".join(
+        [
+            payload.area or "",
+            payload.claim_type or "",
+            payload.objective or "",
+            payload.narrative or "",
+            payload.evidence_summary or "",
+            payload.opposing_party or "",
+        ]
+    )
+    queries: list[list[str]] = []
+
+    if text_has_all_terms(source_text, ["saude", "reajust"]):
+        append_unique_query(queries, ["saúde", "reajuste"])
+    if text_has_all_terms(source_text, ["saude", "cobertura"]):
+        append_unique_query(queries, ["saúde", "cobertura"])
+    if text_has_all_terms(source_text, ["negativ", "indevid"]):
+        append_unique_query(queries, ["negativação", "indevida"])
+    if text_has_all_terms(source_text, ["cobranca", "indevid"]):
+        terms = ["cobrança", "indevida"]
+        if "moral" in normalize_datajud_token(source_text):
+            terms.append("moral")
+        append_unique_query(queries, terms)
+
+    extracted = extract_datajud_terms(payload)
+    append_unique_query(queries, extracted[:4])
+    if len(extracted) >= 3:
+        append_unique_query(queries, extracted[:3])
+    if len(extracted) >= 2:
+        append_unique_query(queries, extracted[:2])
+    return queries
+
+
+def extract_datajud_process_number(value: str | None) -> str | None:
+    if not value:
+        return None
+    compact = re.sub(r"\D", "", value)
+    if len(compact) == 20:
+        return compact
+    match = re.search(r"\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}", value)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(0))
+    return digits if len(digits) == 20 else None
+
+
+def format_datajud_process_number(value: str | None) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) != 20:
+        return value or ""
+    return f"{digits[:7]}-{digits[7:9]}.{digits[9:13]}.{digits[13]}.{digits[14:16]}.{digits[16:]}"
+
+
+def infer_datajud_alias_from_process_number(value: str | None) -> str | None:
+    digits = re.sub(r"\D", "", value or "")
+    if len(digits) != 20:
+        return None
+    return DATAJUD_PROCESS_NUMBER_ALIASES.get(f"{digits[13]}{digits[14:16]}")
+
+
+def get_nested_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        name = str(value.get("nome") or "").strip()
+        return name or None
+    return None
+
+
+def parse_datajud_compact_date(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        pass
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) < 8:
+        return None
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+
+def parse_datajud_source_date(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return raw[:10] if len(raw) >= 10 else raw
+
+
+def build_datajud_search_body(payload: JurisprudenceSearchRequest, terms: list[str], process_number: str | None) -> dict[str, Any]:
+    limit = clamp_int(payload.limit, 1, 10)
+    source_fields = [
+        "numeroProcesso",
+        "classe",
+        "assuntos",
+        "orgaoJulgador",
+        "tribunal",
+        "grau",
+        "dataAjuizamento",
+        "dataHoraUltimaAtualizacao",
+        "movimentos",
+    ]
+    if process_number:
+        return {
+            "size": limit,
+            "_source": source_fields,
+            "query": {"match": {"numeroProcesso": process_number}},
+        }
+    return {
+        "size": limit,
+        "_source": source_fields,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "simple_query_string": {
+                            "query": " ".join(terms),
+                            "fields": list(DATAJUD_SEARCH_FIELDS),
+                            "default_operator": "and",
+                        }
+                    }
+                ]
+            }
+        },
+    }
+
+
+def serialize_datajud_hit(hit: dict[str, Any], source_url: str) -> JurisprudenceVerifiedCaseResponse | None:
+    source = hit.get("_source")
+    if not isinstance(source, dict):
+        return None
+    number = str(source.get("numeroProcesso") or "").strip()
+    if not number:
+        return None
+
+    subjects: list[str] = []
+    for subject in source.get("assuntos") or []:
+        name = get_nested_name(subject)
+        if name and name not in subjects:
+            subjects.append(name)
+
+    movements: list[str] = []
+    last_movement_organ: str | None = None
+    for movement in source.get("movimentos") or []:
+        if not isinstance(movement, dict):
+            continue
+        movement_name = str(movement.get("nome") or "").strip()
+        if movement_name and movement_name not in movements:
+            movements.append(movement_name)
+        if last_movement_organ is None:
+            last_movement_organ = get_nested_name(movement.get("orgaoJulgador"))
+        if len(movements) >= 5:
+            break
+
+    return JurisprudenceVerifiedCaseResponse(
+        number=number,
+        formatted_number=format_datajud_process_number(number),
+        court=str(source.get("tribunal") or "").strip() or None,
+        degree=str(source.get("grau") or "").strip() or None,
+        organ=get_nested_name(source.get("orgaoJulgador")) or last_movement_organ,
+        class_name=get_nested_name(source.get("classe")),
+        subjects=subjects[:6],
+        filed_at=parse_datajud_compact_date(source.get("dataAjuizamento")),
+        updated_at=parse_datajud_source_date(source.get("dataHoraUltimaAtualizacao")),
+        movements=movements,
+        source_name=DATAJUD_SOURCE_NAME,
+        source_url=source_url,
+    )
+
+
+def build_jurisprudence_response(
+    *,
+    status_value: str,
+    reliable: bool,
+    message: str,
+    source_url: str = DATAJUD_SOURCE_DOC_URL,
+    total_hits: int = 0,
+    total_relation: str = "eq",
+    query_terms: list[str] | None = None,
+    cases: list[JurisprudenceVerifiedCaseResponse] | None = None,
+) -> JurisprudenceSearchResponse:
+    return JurisprudenceSearchResponse(
+        source_name=DATAJUD_SOURCE_NAME,
+        source_url=source_url,
+        status=status_value,
+        reliable=reliable,
+        total_hits=total_hits,
+        total_relation=total_relation,
+        query_terms=query_terms or [],
+        cases=cases or [],
+        message=message,
+    )
+
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def search_datajud_jurisprudence(payload: JurisprudenceSearchRequest) -> JurisprudenceSearchResponse:
+    explicit_number = extract_datajud_process_number(payload.process_number)
+    embedded_number = extract_datajud_process_number(
+        " ".join([payload.claim_type or "", payload.objective or "", payload.narrative or "", payload.evidence_summary or ""])
+    )
+    process_number = explicit_number or embedded_number
+    alias = infer_datajud_alias_from_process_number(process_number) or DATAJUD_JURISDICTION_ALIASES.get(payload.jurisdiction.strip().lower())
+    if not alias:
+        return build_jurisprudence_response(
+            status_value="unsupported_jurisdiction",
+            reliable=False,
+            message="Selecione um tribunal específico com endpoint público do DataJud/CNJ para consultar processos verificados.",
+        )
+    if not DATAJUD_API_KEY:
+        return build_jurisprudence_response(
+            status_value="not_configured",
+            reliable=False,
+            message="A chave pública do DataJud/CNJ não está configurada. Nenhum processo será exibido sem consulta verificável.",
+        )
+
+    query_attempts = build_datajud_query_attempts(payload, process_number)
+    if not query_attempts:
+        return build_jurisprudence_response(
+            status_value="empty_query",
+            reliable=False,
+            message="A consulta não tinha termos suficientes para buscar processos reais sem ampliar demais o recorte.",
+        )
+
+    source_url = f"{DATAJUD_BASE_URL}/api_publica_{alias}/_search"
+    headers = {
+        "Authorization": f"APIKey {DATAJUD_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    last_total_hits = 0
+    last_total_relation = "eq"
+    last_terms = query_attempts[0]
+
+    for terms in query_attempts:
+        last_terms = terms
+        body = build_datajud_search_body(payload, terms, process_number)
+        try:
+            response = requests.post(source_url, headers=headers, json=body, timeout=DATAJUD_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            payload_json = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            return build_jurisprudence_response(
+                status_value="source_error",
+                reliable=False,
+                source_url=source_url,
+                query_terms=terms,
+                message=f"Não foi possível consultar o DataJud/CNJ agora. Nenhum processo foi preenchido automaticamente. Detalhe: {exc}",
+            )
+
+        hits_root = payload_json.get("hits") if isinstance(payload_json, dict) else None
+        if not isinstance(hits_root, dict):
+            return build_jurisprudence_response(
+                status_value="source_error",
+                reliable=False,
+                source_url=source_url,
+                query_terms=terms,
+                message="O DataJud/CNJ retornou uma resposta inesperada. Nenhum processo foi preenchido automaticamente.",
+            )
+
+        total_raw = hits_root.get("total")
+        total_hits = 0
+        total_relation = "eq"
+        if isinstance(total_raw, dict):
+            total_hits = int(total_raw.get("value") or 0)
+            total_relation = str(total_raw.get("relation") or "eq")
+        elif isinstance(total_raw, int):
+            total_hits = total_raw
+
+        last_total_hits = total_hits
+        last_total_relation = total_relation
+        verified_cases: list[JurisprudenceVerifiedCaseResponse] = []
+        for hit in hits_root.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
+            serialized = serialize_datajud_hit(hit, source_url)
+            if serialized:
+                verified_cases.append(serialized)
+
+        if verified_cases:
+            return build_jurisprudence_response(
+                status_value="ok",
+                reliable=True,
+                source_url=source_url,
+                total_hits=total_hits,
+                total_relation=total_relation,
+                query_terms=terms,
+                cases=verified_cases,
+                message="Processos retornados por consulta direta ao DataJud/CNJ. Os números exibidos vieram da fonte oficial.",
+            )
+
+    return build_jurisprudence_response(
+        status_value="empty",
+        reliable=True,
+        source_url=source_url,
+        total_hits=last_total_hits,
+        total_relation=last_total_relation,
+        query_terms=last_terms,
+        message=(
+            "Nenhum processo público foi encontrado no DataJud/CNJ para esse recorte, mesmo após busca progressiva por termos essenciais. "
+            "A tela não exibirá exemplos sem confirmação da fonte."
+        )
+    )
 
 
 def validate_case_payload(payload: CreateCaseRequest | UpdateCaseRequest) -> dict[str, Any]:
@@ -4001,7 +4579,7 @@ def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMe
     full_name = payload.full_name.strip()
     email = payload.email.strip().lower()
     cpf = normalize_cpf_digits(payload.cpf)
-    oab = payload.oab.strip().upper()
+    oab = (payload.oab or "").strip().upper()
     parsed_oab = parse_team_member_oab(oab)
     if parsed_oab:
         oab = parsed_oab["normalized"]
@@ -4020,8 +4598,8 @@ def sanitize_team_member_payload(payload: CreateTeamMemberRequest | UpdateTeamMe
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="CPF é obrigatório")
     if not is_valid_cpf_digits(cpf):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe um CPF válido")
-    if not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe a OAB com 6 números e UF")
+    if oab and (not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Informe a OAB com 6 números e UF ou deixe em branco")
     if not role_title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cargo é obrigatório")
     if not team_name:
@@ -4082,7 +4660,9 @@ def serialize_team_member(member: TeamMember, *, invite_email_sent: bool = False
     payload = member.model_dump()
     payload.pop("is_team_admin", None)
     payload["is_admin"] = bool(member.is_team_admin)
-    payload["allowed_nav_keys"] = normalize_nav_keys(parse_nav_keys(member.allowed_nav_keys), is_admin=bool(member.is_team_admin))
+    payload["allowed_nav_keys"] = expand_nav_aliases(
+        normalize_nav_keys(parse_nav_keys(member.allowed_nav_keys), is_admin=bool(member.is_team_admin))
+    )
     payload["invite_email_sent"] = invite_email_sent
     if invite_token and DEV_RETURN_INVITE_TOKEN:
         payload["invite_token"] = invite_token
@@ -4122,13 +4702,7 @@ def decorate_master_team_member_payload(payload: dict, user: User) -> dict:
     return payload
 
 
-def serialize_master_team_member(
-    member: TeamMember,
-    user: User,
-    *,
-    invite_email_sent: bool = False,
-    invite_token: str | None = None,
-) -> dict:
+def serialize_master_team_member(member: TeamMember, user: User, *, invite_email_sent: bool = False, invite_token: str | None = None) -> dict:
     return decorate_master_team_member_payload(
         serialize_team_member(member, invite_email_sent=invite_email_sent, invite_token=invite_token),
         user,
@@ -5373,6 +5947,119 @@ def list_clients(
     return session.exec(query).all()
 
 
+@app.get("/service/intakes")
+def list_service_intakes(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    organization_id: int | None = None,
+) -> list[dict[str, Any]]:
+    scope_organization_id = resolve_organization_scope(user, session, organization_id)
+    query = select(ServiceIntake)
+    if scope_organization_id is not None:
+        query = query.where(ServiceIntake.organization_id == scope_organization_id)
+    elif user.id is not None:
+        query = query.where(ServiceIntake.handled_by_user_id == user.id)
+    query = query.order_by(ServiceIntake.meeting_date.desc(), ServiceIntake.updated_at.desc())
+    records = session.exec(query).all()
+    return [serialize_service_intake(record) for record in records]
+
+
+@app.post("/service/intakes")
+def create_service_intake(
+    payload: ServiceIntakeRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    scope_organization_id = resolve_organization_scope(user, session, None)
+    lead_name = (payload.lead_name or "").strip()
+    if not lead_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome do interessado é obrigatório")
+    record = ServiceIntake(
+        organization_id=scope_organization_id,
+        handled_by_user_id=user.id,
+        lead_name=lead_name,
+        document=(payload.document or "").strip() or None,
+        email=normalize_email(payload.email) if (payload.email or "").strip() else None,
+        phone=(payload.phone or "").strip() or None,
+        legal_area=(payload.legal_area or "").strip() or None,
+        referral_source=(payload.referral_source or "").strip() or None,
+        meeting_date=parse_optional_iso_date(payload.meeting_date, "Data do atendimento inválida"),
+        meeting_time=normalize_internal_agenda_time(payload.meeting_time),
+        meeting_mode=(payload.meeting_mode or "").strip() or None,
+        summary=(payload.summary or "").strip() or None,
+        process_overview=(payload.process_overview or "").strip() or None,
+        next_steps=(payload.next_steps or "").strip() or None,
+        agreed_fee=payload.agreed_fee,
+        payment_terms=(payload.payment_terms or "").strip() or None,
+        handled_by_name=(payload.handled_by_name or "").strip() or user.full_name,
+        status=normalize_service_intake_status(payload.status),
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return serialize_service_intake(record)
+
+
+@app.put("/service/intakes/{record_id}")
+def update_service_intake(
+    record_id: int,
+    payload: ServiceIntakeRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    record = session.get(ServiceIntake, record_id)
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Atendimento não encontrado")
+    current_scope = resolve_existing_record_scope(user, session, record.organization_id)
+    if current_scope is not None and record.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este atendimento")
+    if current_scope is None and user.id != record.handled_by_user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este atendimento")
+    lead_name = (payload.lead_name or "").strip()
+    if not lead_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Nome do interessado é obrigatório")
+    record.lead_name = lead_name
+    record.document = (payload.document or "").strip() or None
+    record.email = normalize_email(payload.email) if (payload.email or "").strip() else None
+    record.phone = (payload.phone or "").strip() or None
+    record.legal_area = (payload.legal_area or "").strip() or None
+    record.referral_source = (payload.referral_source or "").strip() or None
+    record.meeting_date = parse_optional_iso_date(payload.meeting_date, "Data do atendimento inválida")
+    record.meeting_time = normalize_internal_agenda_time(payload.meeting_time)
+    record.meeting_mode = (payload.meeting_mode or "").strip() or None
+    record.summary = (payload.summary or "").strip() or None
+    record.process_overview = (payload.process_overview or "").strip() or None
+    record.next_steps = (payload.next_steps or "").strip() or None
+    record.agreed_fee = payload.agreed_fee
+    record.payment_terms = (payload.payment_terms or "").strip() or None
+    record.handled_by_name = (payload.handled_by_name or "").strip() or user.full_name
+    record.status = normalize_service_intake_status(payload.status)
+    record.updated_at = datetime.utcnow()
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return serialize_service_intake(record)
+
+
+@app.delete("/service/intakes/{record_id}")
+def delete_service_intake(
+    record_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    record = session.get(ServiceIntake, record_id)
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Atendimento não encontrado")
+    current_scope = resolve_existing_record_scope(user, session, record.organization_id)
+    if current_scope is not None and record.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este atendimento")
+    if current_scope is None and user.id != record.handled_by_user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para este atendimento")
+    session.delete(record)
+    session.commit()
+    return {"status": "ok", "id": record_id}
+
+
 @app.post("/clients")
 def create_client(
     payload: CreateClientRequest,
@@ -5479,6 +6166,13 @@ def list_cases(
             )
         ]
     return serialize_case_list(session, cases, wallet_lookup)
+
+
+@app.post("/stats/jurisprudence/search")
+def search_jurisprudence_stats(
+    payload: JurisprudenceSearchRequest,
+) -> JurisprudenceSearchResponse:
+    return search_datajud_jurisprudence(payload)
 
 
 @app.post("/cases")
@@ -5936,14 +6630,14 @@ def get_today_publications_for_logged_member(
     if not member or not member.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Nenhum membro ativo da equipe com OAB cadastrada está vinculado ao e-mail logado.",
+            detail="Nenhum membro ativo da equipe está vinculado ao e-mail logado.",
         )
 
     parsed_oab = parse_team_member_oab(member.oab)
     if not parsed_oab or len(parsed_oab["number"]) != 6 or not parsed_oab["uf"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A OAB do seu cadastro precisa ter 6 números e UF.",
+            detail="OAB não cadastrada no seu membro da equipe. Cadastre a OAB com 6 números e UF para consultar publicações.",
         )
 
     target_date = get_local_now().date()

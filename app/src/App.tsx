@@ -12,11 +12,13 @@ import {
   ApiClient,
   ApiClientDocument,
   ApiFinanceEntry,
+  ApiServiceIntake,
   ApiTeamMember,
   ApiWallet,
   CalendarConnectionStatus,
   CalendarProvider,
   InternalAgendaEventType,
+  JurisprudenceSearchResponse,
   LOCAL_API_BASE_URL,
   PublicationContextItem,
   PublicationHandlingStatus,
@@ -27,10 +29,12 @@ import {
   TeamMembersCapacity,
   baseURL,
   createAgendaDeadline as apiCreateAgendaDeadline,
+  createServiceIntake as apiCreateServiceIntake,
   deleteClientDocument as apiDeleteClientDocument,
   createFinanceEntry as apiCreateFinanceEntry,
   createTeamMember as apiCreateTeamMember,
   createWallet as apiCreateWallet,
+  deleteServiceIntake as apiDeleteServiceIntake,
   downloadClientDocument as apiDownloadClientDocument,
   clearAuthSession,
   createCase as apiCreateCase,
@@ -52,6 +56,7 @@ import {
   listFinanceEntries as apiListFinanceEntries,
   listCases as apiListCases,
   listClients as apiListClients,
+  listServiceIntakes as apiListServiceIntakes,
   listTeamMembers as apiListTeamMembers,
   listWallets as apiListWallets,
   login as apiLogin,
@@ -59,7 +64,6 @@ import {
   syncCalendarConnection as apiSyncCalendarConnection,
   uploadClientDocument as apiUploadClientDocument,
   updateTeamMember as apiUpdateTeamMember,
-  updateAgendaDeadline as apiUpdateAgendaDeadline,
   updateCase as apiUpdateCase,
   updateClient as apiUpdateClient,
   updateFinanceEntry as apiUpdateFinanceEntry,
@@ -72,7 +76,10 @@ import {
   saveCaseClosing as apiSaveCaseClosing,
   saveAuthSession,
   me as apiMe,
-  updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings
+  updateAgendaDeadline as apiUpdateAgendaDeadline,
+  updateServiceIntake as apiUpdateServiceIntake,
+  updatePublicationAutomationSettings as apiUpdatePublicationAutomationSettings,
+  searchJurisprudenceStats as apiSearchJurisprudenceStats
 } from "./api";
 import { NavKey } from "./types";
 
@@ -86,6 +93,24 @@ type ClientRow = {
   city: string;
   document: string;
   kind: ClientKind;
+};
+type ServiceIntakeFormState = {
+  leadName: string;
+  document: string;
+  email: string;
+  phone: string;
+  legalArea: string;
+  referralSource: string;
+  meetingDate: string;
+  meetingTime: string;
+  meetingMode: string;
+  summary: string;
+  processOverview: string;
+  nextSteps: string;
+  agreedFee: string;
+  paymentTerms: string;
+  handledByName: string;
+  status: ApiServiceIntake["status"];
 };
 type ThemeMode = "dark" | "light";
 type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "installed" | "up-to-date" | "error" | "unavailable";
@@ -173,7 +198,6 @@ const navItems: { key: NavKey; label: string }[] = [
   { key: "agenda", label: "Agenda" },
   { key: "finance", label: "Financeiro" },
   { key: "service", label: "Atendimento" },
-  { key: "reports", label: "Relatórios" },
   { key: "stats", label: "Estatísticas" },
   { key: "official", label: "Publicações" },
   { key: "progress", label: "Andamentos" },
@@ -182,7 +206,7 @@ const navItems: { key: NavKey; label: string }[] = [
 ];
 
 const navPermissionOptions = navItems.map((item) => ({ key: item.key, label: item.label }));
-const defaultMemberNavKeys: NavKey[] = navPermissionOptions.map((item) => item.key);
+const defaultMemberNavKeys = navPermissionOptions.map((item) => item.key);
 const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
 const MASTER_OFFICE_NAME = "NEWLAW";
 const PROFILE_STORAGE_KEY_PREFIX = "newlaw-profile-preferences";
@@ -343,14 +367,6 @@ const navIcons: Record<NavKey, JSX.Element> = {
       <rect x="3" y="12" width="4" height="6" rx="2" />
       <rect x="17" y="12" width="4" height="6" rx="2" />
       <path d="M12 18v2a2 2 0 0 1-2 2H8" />
-    </svg>
-  ),
-  reports: (
-    <svg className="nav-svg" {...navIconProps} aria-hidden="true">
-      <path d="M2 20h20" />
-      <path d="M6 20V10" />
-      <path d="M12 20V4" />
-      <path d="M18 20v-8" />
     </svg>
   ),
   stats: (
@@ -1169,12 +1185,7 @@ const clientGenderOptions = ["Masculino", "Feminino"] as const;
 type ClientGender = (typeof clientGenderOptions)[number] | "";
 type ClientMaritalKey = "" | "single" | "married" | "divorced" | "widowed" | "stable_union";
 
-const clientMaritalOptions: {
-  key: Exclude<ClientMaritalKey, "">;
-  label: string;
-  masculine: string;
-  feminine: string;
-}[] = [
+const clientMaritalOptions: { key: Exclude<ClientMaritalKey, "">; label: string; masculine: string; feminine: string }[] = [
   { key: "single", label: "Solteiro(a)", masculine: "Solteiro", feminine: "Solteira" },
   { key: "married", label: "Casado(a)", masculine: "Casado", feminine: "Casada" },
   { key: "divorced", label: "Divorciado(a)", masculine: "Divorciado", feminine: "Divorciada" },
@@ -1229,6 +1240,9 @@ const toClientForm = (client: ApiClient): ClientForm => {
     email: client.email || metadata.email || "",
     city: metadata.city || ""
   };
+  if (form.kind === "PF" && !form.gender) {
+    form.gender = getClientGenderFromMarital(form.marital);
+  }
   if (document) {
     if (kind === "PF") {
       form.cpf = formatCpf(document);
@@ -1237,9 +1251,6 @@ const toClientForm = (client: ApiClient): ClientForm => {
       form.cnpj = formatCnpj(document);
       form.cpf = "";
     }
-  }
-  if (form.kind === "PF" && !form.gender) {
-    form.gender = getClientGenderFromMarital(form.marital);
   }
   return form;
 };
@@ -1409,12 +1420,20 @@ const normalizeNavKeys = (keys?: string[] | null): NavKey[] => {
   return output;
 };
 
+const expandNavAliases = (keys: NavKey[]): NavKey[] => {
+  const output = [...keys];
+  if (output.includes("official") && !output.includes("progress")) {
+    output.push("progress");
+  }
+  return output;
+};
+
 const getEffectiveAllowedNavKeys = (user: AuthUser | null): NavKey[] => {
   if (!user) return [];
   const isPlatformAdmin = user.role === "superadmin" || user.role === "owner" || user.role === "admin";
   if (isPlatformAdmin) return [...defaultMemberNavKeys];
   const keys = normalizeNavKeys(user.allowed_nav_keys);
-  const base = keys.length ? [...keys] : [...defaultMemberNavKeys];
+  const base = expandNavAliases(keys.length ? [...keys] : [...defaultMemberNavKeys]);
   if (!base.includes("settings")) base.push("settings");
   if (user.is_admin) {
     for (const required of adminRequiredNavKeys) {
@@ -2486,6 +2505,7 @@ type JurisprudenceAreaId = "consumer" | "civil_bank" | "labor" | "family" | "hea
 
 type JurisprudenceIntakeForm = {
   area: JurisprudenceAreaId | "";
+  processNumber: string;
   claimType: string;
   objective: string;
   narrative: string;
@@ -2502,22 +2522,6 @@ type JurisprudenceIntakeForm = {
   hasAdministrativeAttempt: boolean;
   needsExpertEvidence: boolean;
 };
-
-type JurisprudenceSimilarCase = {
-  number: string;
-  outcome: "Deferido" | "Parcialmente deferido" | "Indeferido";
-  tone: "granted" | "partial" | "denied";
-  counterparty: string;
-  decidedAt: string;
-  court: string;
-  organ: string;
-  summary: string;
-  highlight: string;
-  reason: string;
-};
-
-type JurisprudenceOutcomeTone = JurisprudenceSimilarCase["tone"];
-type JurisprudenceSamplesTab = "summary" | JurisprudenceOutcomeTone;
 
 const jurisprudenceAreaOptions = [
   {
@@ -2602,7 +2606,7 @@ const jurisprudenceJurisdictionOptions = [
   { value: "trt15", label: "TRT 15" },
   { value: "trf3", label: "TRF 3" },
   { value: "stj", label: "STJ" },
-  { value: "local", label: "Outro recorte estadual/federal" }
+  { value: "local", label: "Outro recorte (sem consulta automática)" }
 ] as const;
 
 const jurisprudenceValueRangeOptions = [
@@ -2686,6 +2690,7 @@ const jurisprudenceStopwords = new Set([
 
 const buildEmptyJurisprudenceForm = (): JurisprudenceIntakeForm => ({
   area: "",
+  processNumber: "",
   claimType: "",
   objective: "",
   narrative: "",
@@ -2718,283 +2723,6 @@ const extractJurisprudenceKeywords = (value: string) => {
     .split(/[^a-z0-9]+/)
     .filter((token) => token.length >= 5 && !jurisprudenceStopwords.has(token));
   return Array.from(new Set(tokens)).slice(0, 4);
-};
-
-const jurisprudenceCourtCodeMap: Record<string, string> = {
-  tjsp: "8.26.0100",
-  tjrj: "8.19.0001",
-  tjmg: "8.13.0024",
-  tjrs: "8.21.7000",
-  tjpr: "8.16.0001",
-  trt2: "5.02.0001",
-  trt15: "5.15.0001",
-  trf3: "4.03.6100",
-  stj: "3.00.0000",
-  local: "8.00.0001"
-};
-
-const jurisprudenceOrganMap: Record<JurisprudenceAreaId, string[]> = {
-  consumer: ["21ª Câmara de Direito Privado", "18ª Câmara de Direito Privado", "34ª Câmara de Direito Privado"],
-  civil_bank: ["19ª Câmara de Direito Privado", "24ª Câmara de Direito Privado", "13ª Câmara de Direito Privado"],
-  labor: ["8ª Turma", "11ª Turma", "4ª Turma"],
-  family: ["8ª Câmara de Direito Privado", "10ª Câmara de Direito Privado", "2ª Câmara de Direito Privado"],
-  health: ["3ª Câmara de Direito Privado", "5ª Câmara de Direito Privado", "9ª Câmara de Direito Privado"]
-};
-
-const jurisprudenceOutcomeLabelMap: Record<JurisprudenceOutcomeTone, string> = {
-  granted: "Deferido",
-  partial: "Parcialmente deferido",
-  denied: "Indeferido"
-};
-
-const jurisprudenceOutcomeTabLabelMap: Record<JurisprudenceSamplesTab, string> = {
-  summary: "Resumo",
-  granted: "Deferidos",
-  partial: "Parciais",
-  denied: "Indeferidos"
-};
-
-const buildJurisprudenceSeed = (value: string) =>
-  Array.from(value).reduce((total, char, index) => total + char.charCodeAt(0) * (index + 1), 0);
-
-const clampNumber = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-
-const buildSyntheticDecisionYear = (form: JurisprudenceIntakeForm, index: number) => {
-  const yearBase = form.proceduralStage === "appeal" ? 2023 : form.proceduralStage === "evidence-phase" ? 2024 : 2025;
-  return Math.max(2022, yearBase - index);
-};
-
-const buildSyntheticJurisprudenceNumber = (form: JurisprudenceIntakeForm, index: number) => {
-  const seed = buildJurisprudenceSeed(
-    [form.area, form.claimType, form.objective, form.opposingParty, form.jurisdiction, String(index)].join("|")
-  );
-  const prefix = String((seed * (index + 9)) % 10000000).padStart(7, "0");
-  const checkDigits = String((seed + index * 17) % 100).padStart(2, "0");
-  const year = String(buildSyntheticDecisionYear(form, index));
-  const courtCode = jurisprudenceCourtCodeMap[form.jurisdiction] ?? jurisprudenceCourtCodeMap.local;
-  return `${prefix}-${checkDigits}.${year}.${courtCode}`;
-};
-
-const sentenceStart = (value: string) => {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  return `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
-};
-
-const buildSyntheticDecisionDate = (form: JurisprudenceIntakeForm, index: number) => {
-  const seed = buildJurisprudenceSeed([form.factPeriod, form.narrative, form.evidenceSummary, String(index)].join("|"));
-  const day = String(((seed + index * 11) % 27) + 1).padStart(2, "0");
-  const month = String(((seed + index * 5) % 12) + 1).padStart(2, "0");
-  return `${day}/${month}/${buildSyntheticDecisionYear(form, index)}`;
-};
-
-const buildSyntheticOrgan = (form: JurisprudenceIntakeForm, index: number) => {
-  if (!form.area) return "Órgão julgador";
-  const options = jurisprudenceOrganMap[form.area];
-  return options[index % options.length] ?? options[0];
-};
-
-const buildSyntheticPrecedentAggregate = (
-  form: JurisprudenceIntakeForm,
-  proofSignals: string[],
-  completionScore: number
-) => {
-  const seed = buildJurisprudenceSeed(
-    [form.area, form.claimType, form.objective, form.narrative, form.evidenceSummary, form.jurisdiction].join("|")
-  );
-  const total = 84 + (seed % 73);
-  let grantedShare = 0.28;
-  let partialShare = 0.16;
-
-  if (form.evidenceStrength === "high") grantedShare += 0.24;
-  else if (form.evidenceStrength === "medium") grantedShare += 0.12;
-  else grantedShare += 0.03;
-
-  if (form.hasDocuments) grantedShare += 0.08;
-  if (form.hasMessages) grantedShare += 0.04;
-  if (form.hasWitnesses) grantedShare += 0.05;
-  if (form.hasAdministrativeAttempt) grantedShare += 0.03;
-  if (form.needsExpertEvidence) {
-    grantedShare -= 0.08;
-    partialShare += 0.05;
-  }
-  if (form.proceduralStage === "appeal") grantedShare -= 0.03;
-  if (form.valueRange === "200k-plus") grantedShare -= 0.02;
-  if (form.area === "health" && form.hasDocuments) grantedShare += 0.05;
-  if (form.area === "labor" && form.hasWitnesses) grantedShare += 0.04;
-  if (form.area === "family") partialShare += 0.04;
-  if (completionScore >= 90) grantedShare += 0.02;
-  if (proofSignals.length === 0) grantedShare -= 0.06;
-
-  grantedShare = clampNumber(grantedShare, 0.14, 0.78);
-  partialShare = clampNumber(partialShare, 0.1, 0.32);
-  if (grantedShare + partialShare > 0.88) {
-    partialShare = 0.88 - grantedShare;
-  }
-
-  let grantedCount = Math.round(total * grantedShare);
-  let partialCount = Math.round(total * partialShare);
-  let deniedCount = total - grantedCount - partialCount;
-
-  if (deniedCount < 6) {
-    const deficit = 6 - deniedCount;
-    if (partialCount - deficit >= 8) partialCount -= deficit;
-    else grantedCount = Math.max(12, grantedCount - deficit);
-    deniedCount = total - grantedCount - partialCount;
-  }
-
-  const dominantTone: JurisprudenceOutcomeTone =
-    grantedCount >= partialCount && grantedCount >= deniedCount
-      ? "granted"
-      : partialCount >= deniedCount
-        ? "partial"
-        : "denied";
-  const dominantCount =
-    dominantTone === "granted" ? grantedCount : dominantTone === "partial" ? partialCount : deniedCount;
-
-  return {
-    total,
-    grantedCount,
-    partialCount,
-    deniedCount,
-    dominantTone,
-    dominantCount,
-    dominantLabel: jurisprudenceOutcomeLabelMap[dominantTone],
-    dominantShare: Math.round((dominantCount / total) * 100),
-    defermentScore: Math.round((grantedCount / total) * 100)
-  };
-};
-
-const buildSampleCaseProfiles = (
-  tone: JurisprudenceOutcomeTone,
-  claim: string,
-  objective: string,
-  opposingParty: string,
-  proofLead: string,
-  jurisdictionLabel: string
-): Array<Omit<JurisprudenceSimilarCase, "number" | "decidedAt" | "organ">> => {
-  if (tone === "granted") {
-    return [
-      {
-        outcome: "Deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `${sentenceStart(claim)} deferido com acolhimento do pedido de ${objective}.`,
-        highlight: `${jurisdictionLabel} deu peso à sequência documental e à postura insuficiente de ${opposingParty}.`,
-        reason: `Motivo central: prova consistente e nexo claro entre o fato narrado e a conduta da contraparte.`
-      },
-      {
-        outcome: "Deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `Pedido de ${objective} acolhido após reconhecimento de falha relevante de ${opposingParty}.`,
-        highlight: `O precedente aproximou o caso de outros em que o dano apareceu de forma objetiva e cronológica.`,
-        reason: `Motivo central: documentação madura desde o início e impacto prático bem demonstrado.`
-      },
-      {
-        outcome: "Deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `${sentenceStart(claim)} admitido em recorte com forte apoio em ${proofLead}.`,
-        highlight: `O órgão julgador destacou coerência entre narrativa, documento principal e consequência concreta.`,
-        reason: `Motivo central: prejuízo demonstrado e defesa tratada como genérica ou insuficiente.`
-      }
-    ];
-  }
-
-  if (tone === "partial") {
-    return [
-      {
-        outcome: "Parcialmente deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `${sentenceStart(claim)} acolhido em parte, com redução do alcance econômico do pedido.`,
-        highlight: `O tribunal separou o núcleo comprovado das parcelas que ainda dependiam de reforço probatório.`,
-        reason: `Motivo central: procedência limitada ao ponto documentalmente demonstrado.`
-      },
-      {
-        outcome: "Parcialmente deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `Pedido reconhecido só em parte, sem integralidade de ${objective}.`,
-        highlight: `A decisão preservou a tese principal, mas modulou extensão, valores ou reflexos acessórios.`,
-        reason: `Motivo central: prova suficiente para parte do pedido, mas não para todo o efeito pretendido.`
-      },
-      {
-        outcome: "Parcialmente deferido",
-        tone,
-        counterparty: opposingParty,
-        court: jurisdictionLabel,
-        summary: `${sentenceStart(claim)} parcialmente deferido após distinção entre obrigação principal e danos acessórios.`,
-        highlight: `O precedente foi favorável no mérito, porém conservador na parte econômica ou indenizatória.`,
-        reason: `Motivo central: acolhimento do núcleo do direito com restrição nos pedidos acessórios.`
-      }
-    ];
-  }
-
-  return [
-    {
-      outcome: "Indeferido",
-      tone,
-      counterparty: opposingParty,
-      court: jurisdictionLabel,
-      summary: `${sentenceStart(claim)} indeferido por insuficiência de lastro para ${objective}.`,
-      highlight: `O julgamento apontou abertura excessiva entre narrativa e prova disponível.`,
-      reason: `Motivo central: ausência de documento ou elemento técnico decisivo para o pedido principal.`
-    },
-    {
-      outcome: "Indeferido",
-      tone,
-      counterparty: opposingParty,
-      court: jurisdictionLabel,
-      summary: `Pedido rejeitado em caso parecido por falta de nexo claro com a conduta de ${opposingParty}.`,
-      highlight: `O órgão julgador considerou o conjunto probatório insuficiente para responsabilização plena.`,
-      reason: `Motivo central: nexo causal e extensão do dano não ficaram objetivamente comprovados.`
-    },
-    {
-      outcome: "Indeferido",
-      tone,
-      counterparty: opposingParty,
-      court: jurisdictionLabel,
-      summary: `${sentenceStart(claim)} afastado porque o recorte exigia prova mais robusta do que a apresentada.`,
-      highlight: `A corte distinguiu o caso de precedentes favoráveis em razão de fragilidade documental.`,
-      reason: `Motivo central: lacuna probatória relevante para sustentar o pedido integral.`
-    }
-  ];
-};
-
-const buildOutcomeSampleCases = (
-  form: JurisprudenceIntakeForm,
-  areaConfig: (typeof jurisprudenceAreaOptions)[number] | null,
-  proofSignals: string[],
-  jurisdictionLabel: string,
-  tone: JurisprudenceOutcomeTone,
-  count: number
-): JurisprudenceSimilarCase[] => {
-  if (!form.area || !form.claimType.trim() || !form.objective.trim() || count <= 0) return [];
-
-  const claim = form.claimType.trim().toLowerCase();
-  const objective = form.objective.trim().toLowerCase();
-  const proofLead = proofSignals[0]?.toLowerCase() || (areaConfig?.proofFocus.toLowerCase() ?? "base probatória limitada");
-  const opposingParty = form.opposingParty.trim() || "a parte contrária";
-  const profiles = buildSampleCaseProfiles(tone, claim, objective, opposingParty, proofLead, jurisdictionLabel);
-  const limit = Math.min(3, count);
-  const toneOffset = tone === "granted" ? 0 : tone === "partial" ? 10 : 20;
-
-  return Array.from({ length: limit }, (_, index) => {
-    const profile = profiles[index % profiles.length];
-    return {
-      ...profile,
-      number: buildSyntheticJurisprudenceNumber(form, toneOffset + index),
-      decidedAt: buildSyntheticDecisionDate(form, toneOffset + index),
-      organ: buildSyntheticOrgan(form, toneOffset + index)
-    };
-  });
 };
 
 const buildJurisprudenceAnalysis = (form: JurisprudenceIntakeForm) => {
@@ -3108,55 +2836,13 @@ const buildJurisprudenceAnalysis = (form: JurisprudenceIntakeForm) => {
           : "Fixar qual resultado o cliente realmente espera do caso.",
         "Revisar se a narrativa cobre fato, prova, reação da parte contrária e impacto prático em ordem cronológica."
       ];
-  const precedentAggregate = buildSyntheticPrecedentAggregate(form, proofSignals, completionScore);
-  const caseSamples = {
-    granted: buildOutcomeSampleCases(
-      form,
-      areaConfig,
-      proofSignals,
-      jurisdictionLabel,
-      "granted",
-      precedentAggregate.grantedCount
-    ),
-    partial: buildOutcomeSampleCases(
-      form,
-      areaConfig,
-      proofSignals,
-      jurisdictionLabel,
-      "partial",
-      precedentAggregate.partialCount
-    ),
-    denied: buildOutcomeSampleCases(
-      form,
-      areaConfig,
-      proofSignals,
-      jurisdictionLabel,
-      "denied",
-      precedentAggregate.deniedCount
-    )
-  };
-  const readinessTone =
-    precedentAggregate.dominantTone === "granted"
-      ? "ready"
-      : precedentAggregate.dominantTone === "denied"
-        ? "pending"
-        : "attention";
-  const readinessLabel =
-    precedentAggregate.dominantShare >= 45
-      ? `Predomínio ${jurisprudenceOutcomeLabelMap[precedentAggregate.dominantTone].toLowerCase()}`
-      : "Panorama equilibrado";
-  const precedentMixLabel = `${precedentAggregate.grantedCount} deferido(s), ${precedentAggregate.partialCount} parcial(is) e ${precedentAggregate.deniedCount} indeferido(s)`;
-  const precedentMixSummary =
-    precedentAggregate.dominantTone === "granted"
-      ? "Os processos parecidos tendem mais ao deferimento, mas a prova e o recorte ainda deslocam bastante o resultado."
-      : precedentAggregate.dominantTone === "denied"
-        ? "Os processos parecidos tendem mais ao indeferimento, normalmente por fragilidade de prova ou recorte jurídico insuficiente."
-        : "Os processos parecidos ficam mais espalhados entre procedência parcial e distinções de contexto.";
+  const readinessTone = completionScore >= 90 ? "ready" : completionScore >= 70 ? "attention" : "pending";
+  const readinessLabel = completionScore >= 90 ? "Pronto para consulta oficial" : "Dados a completar";
   return {
     areaConfig,
     requiredChecks,
     completionScore,
-    score: precedentAggregate.defermentScore,
+    score: completionScore,
     readinessTone,
     readinessLabel,
     criticalGaps,
@@ -3171,32 +2857,40 @@ const buildJurisprudenceAnalysis = (form: JurisprudenceIntakeForm) => {
     officeLanguage,
     searchTerms,
     jurisprudenceFocus,
-    nextSteps,
-    totalSimilarCases: precedentAggregate.total,
-    grantedCount: precedentAggregate.grantedCount,
-    partialCount: precedentAggregate.partialCount,
-    deniedCount: precedentAggregate.deniedCount,
-    dominantOutcomeLabel: precedentAggregate.dominantLabel,
-    dominantOutcomeShare: precedentAggregate.dominantShare,
-    dominantOutcomeTone: precedentAggregate.dominantTone,
-    caseSamples,
-    precedentMixLabel,
-    precedentMixSummary
+    nextSteps
   };
+};
+
+const formatJurisprudenceTotal = (result: JurisprudenceSearchResponse | null) => {
+  if (!result) return "Aguardando";
+  if (result.status !== "ok" && result.status !== "empty") return "Indisponível";
+  const suffix = result.total_relation === "gte" ? "+" : "";
+  return `${result.total_hits}${suffix}`;
+};
+
+const formatVerifiedDate = (value?: string | null) => {
+  if (!value) return "Sem data";
+  const [year, month, day] = value.slice(0, 10).split("-");
+  if (!year || !month || !day) return value;
+  return `${day}/${month}/${year}`;
 };
 
 function StatisticsWorkbench() {
   const [form, setForm] = useState<JurisprudenceIntakeForm>(() => buildEmptyJurisprudenceForm());
   const [analysisRequested, setAnalysisRequested] = useState(false);
   const [isCaseModalOpen, setIsCaseModalOpen] = useState(false);
-  const [samplesTab, setSamplesTab] = useState<JurisprudenceSamplesTab>("summary");
+  const [jurisprudenceResult, setJurisprudenceResult] = useState<JurisprudenceSearchResponse | null>(null);
+  const [isSearchingJurisprudence, setIsSearchingJurisprudence] = useState(false);
+  const [jurisprudenceSearchError, setJurisprudenceSearchError] = useState("");
   const analysis = useMemo(() => buildJurisprudenceAnalysis(form), [form]);
   const areaConfig = analysis.areaConfig;
   const narrativeLength = form.narrative.trim().length;
   const filledChecksCount = analysis.requiredChecks.filter((item) => item.done).length;
   const canGenerateJurisprudence = analysis.requiredChecks.every((item) => item.done);
+  const verifiedCases = jurisprudenceResult?.cases ?? [];
   const hasAnyCaseData = Boolean(
     form.area ||
+      form.processNumber.trim() ||
       form.claimType.trim() ||
       form.objective.trim() ||
       form.narrative.trim() ||
@@ -3213,11 +2907,10 @@ function StatisticsWorkbench() {
       form.hasAdministrativeAttempt ||
       form.needsExpertEvidence
   );
-  const activeSamples = samplesTab === "summary" ? [] : analysis.caseSamples[samplesTab];
-
   useEffect(() => {
     if (analysisRequested && !canGenerateJurisprudence) {
       setAnalysisRequested(false);
+      setJurisprudenceResult(null);
     }
   }, [analysisRequested, canGenerateJurisprudence]);
 
@@ -3226,6 +2919,9 @@ function StatisticsWorkbench() {
     (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
       const target = event.target;
       const value = target instanceof HTMLInputElement && target.type === "checkbox" ? target.checked : target.value;
+      setAnalysisRequested(false);
+      setJurisprudenceResult(null);
+      setJurisprudenceSearchError("");
       setForm((current) => ({
         ...current,
         [field]: value
@@ -3233,24 +2929,49 @@ function StatisticsWorkbench() {
     };
 
   const applyClaimSuggestion = (value: string) => {
+    setAnalysisRequested(false);
+    setJurisprudenceResult(null);
+    setJurisprudenceSearchError("");
     setForm((current) => ({
       ...current,
       claimType: value
     }));
   };
 
-  const handleGenerate = () => {
-    if (!canGenerateJurisprudence) return;
+  const handleGenerate = async () => {
+    if (!canGenerateJurisprudence || isSearchingJurisprudence) return;
     setAnalysisRequested(true);
-    setSamplesTab("summary");
     setIsCaseModalOpen(false);
+    setIsSearchingJurisprudence(true);
+    setJurisprudenceResult(null);
+    setJurisprudenceSearchError("");
+    try {
+      const result = await apiSearchJurisprudenceStats({
+        area: form.area || undefined,
+        claim_type: form.claimType.trim(),
+        objective: form.objective.trim(),
+        narrative: form.narrative.trim(),
+        opposing_party: form.opposingParty.trim(),
+        jurisdiction: form.jurisdiction,
+        fact_period: form.factPeriod.trim(),
+        evidence_summary: form.evidenceSummary.trim(),
+        process_number: form.processNumber.trim() || undefined,
+        limit: 6
+      });
+      setJurisprudenceResult(result);
+    } catch (error) {
+      setJurisprudenceSearchError((error as Error)?.message || "Não foi possível consultar uma fonte confiável agora.");
+    } finally {
+      setIsSearchingJurisprudence(false);
+    }
   };
 
   const handleReset = () => {
     setForm(buildEmptyJurisprudenceForm());
     setAnalysisRequested(false);
     setIsCaseModalOpen(false);
-    setSamplesTab("summary");
+    setJurisprudenceResult(null);
+    setJurisprudenceSearchError("");
   };
 
   return (
@@ -3293,30 +3014,27 @@ function StatisticsWorkbench() {
             <>
               <div className="stats-lab-score-card">
                 <div className="stats-lab-score-head">
-                  <span>Deferimentos no recorte ampliado</span>
-                  <strong>{analysis.score}/100</strong>
+                  <span>Consulta oficial de processos</span>
+                  <strong>{isSearchingJurisprudence ? "Buscando..." : formatJurisprudenceTotal(jurisprudenceResult)}</strong>
                 </div>
                 <div className="stats-lab-score-track" aria-hidden="true">
                   <span className="stats-lab-score-fill" style={{ width: `${analysis.score}%` }} />
                 </div>
-                <div className="field-hint">
-                  {analysis.grantedCount} de {analysis.totalSimilarCases} processos parecidos foram deferidos. Recorte atual: {analysis.researchScope}.
-                </div>
-                <div className="field-hint">
-                  Julgado que mais aparece: {analysis.dominantOutcomeLabel} ({analysis.dominantOutcomeShare}% do recorte). {analysis.precedentMixSummary}
-                </div>
+                <div className="field-hint">Recorte atual: {analysis.researchScope}.</div>
+                <div className="field-hint">Os números de processo abaixo só aparecem quando retornam da fonte oficial. Sem retorno confiável, a tela fica vazia.</div>
+                {jurisprudenceSearchError && <div className="error">{jurisprudenceSearchError}</div>}
               </div>
 
               <div className="stats-lab-insight-grid">
                 <div className="stats-lab-insight-card" data-tone="neutral">
-                  <span>Total de processos parecidos</span>
-                  <strong>{analysis.totalSimilarCases}</strong>
-                  <p>Volume sintético do recorte jurisprudencial usado para montar a leitura do comportamento predominante.</p>
+                  <span>Fonte dos processos</span>
+                  <strong>{jurisprudenceResult?.source_name || "DataJud/CNJ"}</strong>
+                  <p>{jurisprudenceResult?.message || "A consulta ainda está em andamento ou aguardando retorno da fonte oficial."}</p>
                 </div>
                 <div className="stats-lab-insight-card" data-tone={analysis.readinessTone === "ready" ? "accent" : "warning"}>
-                  <span>Julgado dominante</span>
-                  <strong>{analysis.dominantOutcomeLabel}</strong>
-                  <p>{analysis.precedentMixLabel}. O número grande mede só deferimentos, mas o dominante mostra o que mais apareceu no conjunto.</p>
+                  <span>Processos verificados</span>
+                  <strong>{formatJurisprudenceTotal(jurisprudenceResult)}</strong>
+                  <p>Total informado pela API pública consultada para os termos do recorte.</p>
                 </div>
                 <div className="stats-lab-insight-card" data-tone="neutral">
                   <span>Base probatória</span>
@@ -3324,69 +3042,64 @@ function StatisticsWorkbench() {
                   <p>Quanto mais claro o suporte documental, mais limpa tende a ser a leitura da jurisprudência.</p>
                 </div>
                 <div className="stats-lab-insight-card" data-tone="accent">
-                  <span>Amostra em tela</span>
-                  <strong>Até 3 processos por aba</strong>
-                  <p>O conjunto pode ter muitos precedentes parecidos, mas a tela exibe só uma amostra curta para leitura rápida.</p>
+                  <span>Resultado de mérito</span>
+                  <strong>Não inferido</strong>
+                  <p>Deferimento, improcedência ou parcial só serão mostrados quando vierem de dado auditável da fonte.</p>
                 </div>
               </div>
 
               <div className="stats-lab-section">
                 <div className="stats-lab-section-head">
-                  <div className="stats-lab-section-title">Processos parecidos no recorte</div>
-                  <div className="wallets-switch stats-lab-tabs" role="tablist" aria-label="Filtro de precedentes">
-                    {(["summary", "granted", "denied", "partial"] as JurisprudenceSamplesTab[]).map((tab) => (
-                      <button
-                        key={tab}
-                        type="button"
-                        className={`wallets-switch-btn ${samplesTab === tab ? "active" : ""}`}
-                        onClick={() => setSamplesTab(tab)}
-                      >
-                        {jurisprudenceOutcomeTabLabelMap[tab]}
-                      </button>
-                    ))}
-                  </div>
+                  <div className="stats-lab-section-title">Processos verificados no recorte</div>
                 </div>
-                <span className="stats-lab-section-caption">A tela mostra até 3 exemplos por aba, mas o resumo usa o recorte inteiro.</span>
-                {samplesTab === "summary" ? (
-                  <div className="stats-lab-summary-board">
-                    <div className="stats-lab-summary-metric">
-                      <span>Deferidos</span>
-                      <strong>{analysis.grantedCount}</strong>
-                      <p>{Math.round((analysis.grantedCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
-                    </div>
-                    <div className="stats-lab-summary-metric">
-                      <span>Parciais</span>
-                      <strong>{analysis.partialCount}</strong>
-                      <p>{Math.round((analysis.partialCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
-                    </div>
-                    <div className="stats-lab-summary-metric">
-                      <span>Indeferidos</span>
-                      <strong>{analysis.deniedCount}</strong>
-                      <p>{Math.round((analysis.deniedCount / analysis.totalSimilarCases) * 100)}% do recorte ampliado.</p>
-                    </div>
-                    <div className="stats-lab-summary-metric">
-                      <span>O que mais aparece</span>
-                      <strong>{analysis.dominantOutcomeLabel}</strong>
-                      <p>{analysis.dominantOutcomeShare}% dos processos parecidos ficaram nesse resultado.</p>
-                    </div>
+                <span className="stats-lab-section-caption">Amostra retornada diretamente pelo DataJud/CNJ. Nenhum número é criado pelo sistema.</span>
+                {isSearchingJurisprudence ? (
+                  <div className="stats-lab-placeholder">
+                    <strong>Consultando fonte oficial...</strong>
+                    <p>Buscando processos públicos no tribunal selecionado.</p>
+                  </div>
+                ) : !jurisprudenceResult || jurisprudenceSearchError ? (
+                  <div className="stats-lab-placeholder">
+                    <strong>Sem consulta verificada.</strong>
+                    <p>{jurisprudenceSearchError || "Gere a leitura para consultar processos reais na fonte oficial."}</p>
+                  </div>
+                ) : verifiedCases.length === 0 ? (
+                  <div className="stats-lab-placeholder">
+                    <strong>Nenhum processo público encontrado.</strong>
+                    <p>{jurisprudenceResult.message}</p>
                   </div>
                 ) : (
                   <div className="stats-lab-similar-cases">
-                    {activeSamples.map((item) => (
+                    {verifiedCases.map((item) => (
                       <div key={item.number} className="stats-lab-similar-case">
                         <div className="stats-lab-similar-head">
-                          <strong>{item.number}</strong>
-                          <span className={`stats-lab-case-status ${item.tone}`}>{item.outcome}</span>
+                          <strong>{item.formatted_number || item.number}</strong>
+                          <span className="stats-lab-case-status granted">Verificado</span>
                         </div>
                         <div className="stats-lab-similar-meta">
-                          <span>{item.court}</span>
-                          <span>{item.organ}</span>
-                          <span>Julgado em {item.decidedAt}</span>
-                          <span>Contraparte: {item.counterparty}</span>
+                          {item.court && <span>{item.court}</span>}
+                          {item.degree && <span>Grau {item.degree}</span>}
+                          {item.organ && <span>{item.organ}</span>}
+                          <span>Atualizado em {formatVerifiedDate(item.updated_at)}</span>
+                          {item.filed_at && <span>Ajuizado em {formatVerifiedDate(item.filed_at)}</span>}
                         </div>
-                        <p>{item.summary}</p>
-                        <div className="field-hint">{item.reason}</div>
-                        <div className="field-hint">{item.highlight}</div>
+                        <p>{item.class_name || "Classe processual não informada pela fonte."}</p>
+                        {item.subjects.length > 0 && (
+                          <div className="stats-lab-tags">
+                            {item.subjects.map((subject) => (
+                              <span key={subject} className="stats-lab-tag">
+                                {subject}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {item.movements.length > 0 && <div className="field-hint">Movimentos recentes: {item.movements.join(" · ")}</div>}
+                        <div className="field-hint">
+                          Fonte:{" "}
+                          <a href={item.source_url} target="_blank" rel="noreferrer">
+                            {item.source_name}
+                          </a>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -3498,6 +3211,15 @@ function StatisticsWorkbench() {
                     </option>
                   ))}
                 </select>
+              </div>
+              <div className="field span-2">
+                <label>Número CNJ do processo base</label>
+                <input
+                  value={form.processNumber}
+                  onChange={updateField("processNumber")}
+                  placeholder="Opcional. Ex.: 0000000-00.0000.0.00.0000"
+                />
+                <div className="field-hint">Se informado, a busca prioriza esse número na fonte oficial.</div>
               </div>
               <div className="field">
                 <label>Controvérsia principal *</label>
@@ -3613,8 +3335,8 @@ function StatisticsWorkbench() {
             </div>
 
             <div className="modal-actions">
-              <button className="btn small" type="button" onClick={handleGenerate} disabled={!canGenerateJurisprudence}>
-                Montar leitura jurisprudencial
+              <button className="btn small" type="button" onClick={handleGenerate} disabled={!canGenerateJurisprudence || isSearchingJurisprudence}>
+                {isSearchingJurisprudence ? "Consultando fonte oficial..." : "Montar leitura jurisprudencial"}
               </button>
               <button className="btn ghost small" type="button" onClick={() => setIsCaseModalOpen(false)}>
                 Fechar
@@ -3637,6 +3359,458 @@ function Placeholder({ title }: { title: string }) {
           <div className="page-subtitle">Os atalhos e cadastros principais ficam na área de Pessoas.</div>
         </div>
         <div className="pill">Prévia</div>
+      </div>
+    </div>
+  );
+}
+
+const serviceIntakeStatusOptions: Array<{ value: ApiServiceIntake["status"]; label: string }> = [
+  { value: "registrado", label: "Registrado" },
+  { value: "proposta", label: "Proposta" },
+  { value: "fechado", label: "Fechado" },
+  { value: "nao_avancou", label: "Não avançou" }
+];
+
+const serviceMeetingModeOptions = [
+  { value: "presencial", label: "Presencial" },
+  { value: "online", label: "Online" },
+  { value: "telefone", label: "Telefone" },
+  { value: "whatsapp", label: "WhatsApp" }
+];
+
+const serviceStatusLabelMap: Record<ApiServiceIntake["status"], string> = {
+  registrado: "Registrado",
+  proposta: "Proposta",
+  fechado: "Fechado",
+  nao_avancou: "Não avançou"
+};
+
+const buildEmptyServiceIntakeForm = (user: AuthUser | null): ServiceIntakeFormState => ({
+  leadName: "",
+  document: "",
+  email: "",
+  phone: "",
+  legalArea: "",
+  referralSource: "",
+  meetingDate: formatIsoDate(new Date()),
+  meetingTime: "",
+  meetingMode: "presencial",
+  summary: "",
+  processOverview: "",
+  nextSteps: "",
+  agreedFee: "",
+  paymentTerms: "",
+  handledByName: user?.name || "",
+  status: "registrado"
+});
+
+const mapServiceIntakeToForm = (record: ApiServiceIntake): ServiceIntakeFormState => ({
+  leadName: record.lead_name || "",
+  document: record.document || "",
+  email: record.email || "",
+  phone: record.phone || "",
+  legalArea: record.legal_area || "",
+  referralSource: record.referral_source || "",
+  meetingDate: record.meeting_date || "",
+  meetingTime: record.meeting_time || "",
+  meetingMode: record.meeting_mode || "presencial",
+  summary: record.summary || "",
+  processOverview: record.process_overview || "",
+  nextSteps: record.next_steps || "",
+  agreedFee: typeof record.agreed_fee === "number" ? formatCurrencyBRL(record.agreed_fee) : "",
+  paymentTerms: record.payment_terms || "",
+  handledByName: record.handled_by_name || "",
+  status: record.status || "registrado"
+});
+
+const getServiceIntakeTimestamp = (record: ApiServiceIntake) =>
+  record.meeting_date || record.updated_at || record.created_at || "";
+
+const sortServiceIntakes = (items: ApiServiceIntake[]) =>
+  [...items].sort((left, right) => getServiceIntakeTimestamp(right).localeCompare(getServiceIntakeTimestamp(left)));
+
+const getServiceIntakePreview = (record: ApiServiceIntake) =>
+  record.summary?.trim() || record.process_overview?.trim() || record.next_steps?.trim() || "Sem síntese registrada.";
+
+function Service({ user }: { user: AuthUser | null }) {
+  const [records, setRecords] = useState<ApiServiceIntake[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [form, setForm] = useState<ServiceIntakeFormState>(() => buildEmptyServiceIntakeForm(user));
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const [inlineMessage, setInlineMessage] = useState("");
+
+  useEffect(() => {
+    if (!inlineMessage) return;
+    const timeout = window.setTimeout(() => setInlineMessage(""), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [inlineMessage]);
+
+  useEffect(() => {
+    if (!selectedId && !form.handledByName && user?.name) {
+      setForm((prev) => ({ ...prev, handledByName: user.name }));
+    }
+  }, [form.handledByName, selectedId, user?.name]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRecords = async () => {
+      setIsLoading(true);
+      setError("");
+      try {
+        const data = await apiListServiceIntakes();
+        if (cancelled) return;
+        setRecords(sortServiceIntakes(data));
+      } catch (err) {
+        if (cancelled) return;
+        setError(extractApiErrorMessage(err, "Não foi possível carregar os atendimentos."));
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+    void loadRecords();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const selectedRecord = useMemo(
+    () => records.find((item) => item.id === selectedId) ?? null,
+    [records, selectedId]
+  );
+
+  const statusCounts = useMemo(
+    () =>
+      records.reduce(
+        (acc, item) => {
+          acc.total += 1;
+          if (item.status === "proposta") acc.proposta += 1;
+          if (item.status === "fechado") acc.fechado += 1;
+          return acc;
+        },
+        { total: 0, proposta: 0, fechado: 0 }
+      ),
+    [records]
+  );
+
+  const resetForm = () => {
+    setSelectedId(null);
+    setForm(buildEmptyServiceIntakeForm(user));
+    setError("");
+  };
+
+  const handleSelectRecord = (record: ApiServiceIntake) => {
+    setSelectedId(record.id);
+    setForm(mapServiceIntakeToForm(record));
+    setError("");
+  };
+
+  const handleChangeField =
+    <K extends keyof ServiceIntakeFormState>(key: K) =>
+    (event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+      const nextValue = event.target.value;
+      setForm((prev) => ({
+        ...prev,
+        [key]: key === "agreedFee" ? formatCurrencyInputBRL(nextValue) : nextValue
+      }));
+    };
+
+  const buildPayload = () => ({
+    lead_name: form.leadName.trim(),
+    document: form.document.trim() || undefined,
+    email: form.email.trim() || undefined,
+    phone: form.phone.trim() || undefined,
+    legal_area: form.legalArea.trim() || undefined,
+    referral_source: form.referralSource.trim() || undefined,
+    meeting_date: form.meetingDate || undefined,
+    meeting_time: form.meetingTime || undefined,
+    meeting_mode: form.meetingMode || undefined,
+    summary: form.summary.trim() || undefined,
+    process_overview: form.processOverview.trim() || undefined,
+    next_steps: form.nextSteps.trim() || undefined,
+    agreed_fee: form.agreedFee ? parseCurrencyBRL(form.agreedFee) : undefined,
+    payment_terms: form.paymentTerms.trim() || undefined,
+    handled_by_name: form.handledByName.trim() || undefined,
+    status: form.status
+  });
+
+  const handleSave = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!form.leadName.trim()) {
+      setError("Preencha o nome do interessado.");
+      return;
+    }
+    setIsSaving(true);
+    setError("");
+    try {
+      const payload = buildPayload();
+      const saved = selectedRecord
+        ? await apiUpdateServiceIntake(selectedRecord.id, payload)
+        : await apiCreateServiceIntake(payload);
+      setRecords((prev) => {
+        const next = selectedRecord ? prev.map((item) => (item.id === saved.id ? saved : item)) : [saved, ...prev];
+        return sortServiceIntakes(next);
+      });
+      setSelectedId(saved.id);
+      setForm(mapServiceIntakeToForm(saved));
+      setInlineMessage(selectedRecord ? "Atendimento atualizado." : "Atendimento registrado.");
+    } catch (err) {
+      setError(extractApiErrorMessage(err, "Não foi possível salvar o atendimento."));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!selectedRecord) return;
+    if (!window.confirm(`Remover o atendimento de ${selectedRecord.lead_name}?`)) return;
+    setIsDeleting(true);
+    setError("");
+    try {
+      await apiDeleteServiceIntake(selectedRecord.id);
+      setRecords((prev) => prev.filter((item) => item.id !== selectedRecord.id));
+      resetForm();
+      setInlineMessage("Atendimento removido.");
+    } catch (err) {
+      setError(extractApiErrorMessage(err, "Não foi possível remover o atendimento."));
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  return (
+    <div className="content-card page-card service-page">
+      <div className="page-header service-header">
+        <div>
+          <div className="eyebrow">Atendimento</div>
+          <h1 className="page-title">Ficha de atendimento</h1>
+          <div className="page-subtitle">
+            Registre quem é o interessado, como foi a reunião, a estratégia inicial e os valores combinados.
+          </div>
+        </div>
+        <button type="button" className="btn small" onClick={resetForm}>
+          Novo atendimento
+        </button>
+      </div>
+
+      <div className="service-summary-row">
+        <div className="service-summary-card">
+          <span>Atendimentos</span>
+          <strong>{statusCounts.total}</strong>
+        </div>
+        <div className="service-summary-card">
+          <span>Em proposta</span>
+          <strong>{statusCounts.proposta}</strong>
+        </div>
+        <div className="service-summary-card">
+          <span>Fechados</span>
+          <strong>{statusCounts.fechado}</strong>
+        </div>
+      </div>
+
+      {error && <div className="error">{error}</div>}
+      {inlineMessage && <div className="agenda-inline">{inlineMessage}</div>}
+
+      <div className="service-layout">
+        <aside className="service-sidebar">
+          <div className="service-list-card">
+            <div className="service-list-head">
+              <strong>Histórico</strong>
+              <span className="pill">{records.length}</span>
+            </div>
+            {isLoading ? (
+              <div className="service-empty">Carregando atendimentos...</div>
+            ) : records.length > 0 ? (
+              <div className="service-list">
+                {records.map((record) => (
+                  <button
+                    type="button"
+                    key={record.id}
+                    className={`service-list-item ${record.id === selectedId ? "active" : ""}`}
+                    onClick={() => handleSelectRecord(record)}
+                  >
+                    <div className="service-list-top">
+                      <strong>{record.lead_name}</strong>
+                      <span className={`service-status-pill tone-${record.status}`}>{serviceStatusLabelMap[record.status]}</span>
+                    </div>
+                    <div className="service-list-meta">
+                      <span>{record.meeting_date ? formatBrazilDate(record.meeting_date) : "Sem data"}</span>
+                      <span>{record.meeting_time || "Sem horário"}</span>
+                    </div>
+                    <div className="service-list-note">{getServiceIntakePreview(record)}</div>
+                    <div className="service-list-footer">
+                      <span>{record.handled_by_name || "Sem responsável"}</span>
+                      <span>{typeof record.agreed_fee === "number" ? formatCurrencyBRL(record.agreed_fee) : "Sem valor"}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="service-empty">Nenhum atendimento registrado ainda.</div>
+            )}
+          </div>
+        </aside>
+
+        <section className="service-main">
+          <form className="service-form-card" onSubmit={handleSave}>
+            <div className="service-form-head">
+              <div>
+                <strong>{selectedRecord ? "Editar atendimento" : "Novo atendimento"}</strong>
+                <span>{selectedRecord ? "Atualize a ficha e mantenha o histórico da reunião." : "Preencha a ficha simples do atendimento."}</span>
+              </div>
+              {selectedRecord?.updated_at ? (
+                <div className="service-form-updated">
+                  Atualizado em {new Date(selectedRecord.updated_at).toLocaleString("pt-BR")}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="service-section">
+              <div className="service-section-title">Cadastro básico</div>
+              <div className="service-form-grid">
+                <label>
+                  Nome do interessado *
+                  <input value={form.leadName} onChange={handleChangeField("leadName")} placeholder="Nome completo" />
+                </label>
+                <label>
+                  CPF/CNPJ
+                  <input value={form.document} onChange={handleChangeField("document")} placeholder="Documento" />
+                </label>
+                <label>
+                  Telefone / WhatsApp
+                  <input value={form.phone} onChange={handleChangeField("phone")} placeholder="(00) 00000-0000" />
+                </label>
+                <label>
+                  E-mail
+                  <input type="email" value={form.email} onChange={handleChangeField("email")} placeholder="email@cliente.com" />
+                </label>
+              </div>
+            </div>
+
+            <div className="service-section">
+              <div className="service-section-title">Reunião</div>
+              <div className="service-form-grid">
+                <label>
+                  Área / assunto
+                  <input value={form.legalArea} onChange={handleChangeField("legalArea")} placeholder="Ex.: Trabalhista, família, consumidor" />
+                </label>
+                <label>
+                  Onde nos conheceu
+                  <input value={form.referralSource} onChange={handleChangeField("referralSource")} placeholder="Indicação, Instagram, Google..." />
+                </label>
+                <label>
+                  Data do atendimento
+                  <input type="date" value={form.meetingDate} onChange={handleChangeField("meetingDate")} />
+                </label>
+                <label>
+                  Horário
+                  <input type="time" value={form.meetingTime} onChange={handleChangeField("meetingTime")} />
+                </label>
+                <label>
+                  Forma do atendimento
+                  <select value={form.meetingMode} onChange={handleChangeField("meetingMode")}>
+                    {serviceMeetingModeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Responsável pelo atendimento
+                  <input value={form.handledByName} onChange={handleChangeField("handledByName")} placeholder="Quem conduziu a reunião" />
+                </label>
+                <label>
+                  Status
+                  <select value={form.status} onChange={handleChangeField("status")}>
+                    {serviceIntakeStatusOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="service-section">
+              <div className="service-section-title">Conteúdo do atendimento</div>
+              <div className="service-form-grid service-form-grid-wide">
+                <label className="service-field-span-2">
+                  Síntese da reunião
+                  <textarea
+                    value={form.summary}
+                    onChange={handleChangeField("summary")}
+                    placeholder="Resumo objetivo do que o cliente trouxe e do que foi conversado."
+                    rows={4}
+                  />
+                </label>
+                <label className="service-field-span-2">
+                  Como será o processo
+                  <textarea
+                    value={form.processOverview}
+                    onChange={handleChangeField("processOverview")}
+                    placeholder="Explique a estratégia inicial, documentos necessários, riscos e caminho processual."
+                    rows={4}
+                  />
+                </label>
+                <label className="service-field-span-2">
+                  Próximos passos
+                  <textarea
+                    value={form.nextSteps}
+                    onChange={handleChangeField("nextSteps")}
+                    placeholder="Ex.: enviar proposta, aguardar documentos, abrir pasta, agendar retorno."
+                    rows={3}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="service-section">
+              <div className="service-section-title">Financeiro do atendimento</div>
+              <div className="service-form-grid">
+                <label>
+                  Valor acordado
+                  <input
+                    value={form.agreedFee}
+                    onChange={handleChangeField("agreedFee")}
+                    placeholder="R$ 0,00"
+                    inputMode="decimal"
+                  />
+                </label>
+                <label className="service-field-span-2">
+                  Condições / observações financeiras
+                  <textarea
+                    value={form.paymentTerms}
+                    onChange={handleChangeField("paymentTerms")}
+                    placeholder="Parcelamento, entrada, consulta paga, êxito, pendência de aprovação..."
+                    rows={3}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="modal-actions service-actions">
+              {selectedRecord ? (
+                <button className="btn ghost danger small" type="button" onClick={handleDelete} disabled={isDeleting || isSaving}>
+                  Excluir atendimento
+                </button>
+              ) : (
+                <span />
+              )}
+              <div className="service-actions-right">
+                <button className="btn ghost small" type="button" onClick={resetForm} disabled={isSaving}>
+                  Limpar
+                </button>
+                <button className="btn small" type="submit" disabled={isSaving || !form.leadName.trim()}>
+                  {isSaving ? "Salvando..." : selectedRecord ? "Salvar alterações" : "Registrar atendimento"}
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
       </div>
     </div>
   );
@@ -6186,11 +6360,13 @@ function NewLawAssistantModal({
   );
 }
 
-function Home() {
+function Home({ user }: { user: AuthUser | null }) {
   const [clock, setClock] = useState(() => new Date());
   const [events, setEvents] = useState<AgendaItem[]>([]);
+  const [teamMembers, setTeamMembers] = useState<ApiTeamMember[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
+  const [updatingTaskIds, setUpdatingTaskIds] = useState<number[]>([]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setClock(new Date()), 30000);
@@ -6243,6 +6419,24 @@ function Home() {
     };
   }, [weekEndKey, weekStartKey]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadTeamMembers = async () => {
+      try {
+        const data = await apiListTeamMembers();
+        if (cancelled) return;
+        setTeamMembers(data.filter((member) => member.is_active && member.email.trim()));
+      } catch {
+        if (cancelled) return;
+        setTeamMembers([]);
+      }
+    };
+    void loadTeamMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const titleCaseLabel = (value: string) =>
     value.replace(/\b([a-zà-ÿ])/gi, (match) => match.toUpperCase());
 
@@ -6253,6 +6447,20 @@ function Home() {
     year: "numeric"
   });
   const currentTimeLabel = clock.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const assigneeNameLookup = useMemo(() => {
+    const lookup = new Map<string, string>();
+    teamMembers.forEach((member) => {
+      const email = member.email.trim().toLowerCase();
+      const fullName = member.full_name.trim();
+      if (email && fullName) lookup.set(email, fullName);
+    });
+    const currentUserEmail = user?.email?.trim().toLowerCase();
+    const currentUserName = user?.name?.trim();
+    if (currentUserEmail && currentUserName && !lookup.has(currentUserEmail)) {
+      lookup.set(currentUserEmail, currentUserName);
+    }
+    return lookup;
+  }, [teamMembers, user?.email, user?.name]);
 
   const internalWeekItems = useMemo(
     () =>
@@ -6263,19 +6471,31 @@ function Home() {
   );
 
   const isAgendaItemDone = (item: AgendaItem) => (item.status || "").trim().toLowerCase() === "concluido";
+  const homeAssigneesLabel = (item: AgendaItem) => {
+    const rawValue = item.assignees || item.assignee_name || "";
+    if (!rawValue.trim()) return "";
+    return rawValue
+      .split(/[;,]+/)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => assigneeNameLookup.get(part.toLowerCase()) || part)
+      .join("; ");
+  };
   const homeMetaLabel = (item: AgendaItem) => {
-    const labels = [item.reference, agendaEventAssigneesLabel(item), item.location].filter(Boolean);
+    const labels = [item.reference, homeAssigneesLabel(item), item.location].filter(Boolean);
     return labels.join(" · ");
   };
 
   const deadlinesToday = internalWeekItems.filter(
     (item) => item.event_type === "deadline" && getAgendaDateKey(item.starts_at) === todayKey
   );
+  const fatalDeadlinesToday = deadlinesToday.filter((item) => !isAgendaItemDone(item));
   const hearingsWeek = internalWeekItems.filter((item) => item.event_type === "hearing");
   const deadlinesWeek = internalWeekItems.filter((item) => {
     const dateKey = getAgendaDateKey(item.starts_at);
     return item.event_type === "deadline" && dateKey > todayKey && dateKey <= weekEndKey;
   });
+  const pendingDeadlinesWeek = deadlinesWeek.filter((item) => !isAgendaItemDone(item));
   const tasksToday = internalWeekItems
     .filter((item) => {
       const isTaskType =
@@ -6285,10 +6505,32 @@ function Home() {
       return isTaskType && getAgendaDateKey(item.starts_at) === todayKey;
     })
     .sort((left, right) => Number(isAgendaItemDone(left)) - Number(isAgendaItemDone(right)));
+  const pendingTasksToday = tasksToday.filter((item) => !isAgendaItemDone(item));
 
-  const completedTodayCount = internalWeekItems.filter(
-    (item) => getAgendaDateKey(item.starts_at) === todayKey && isAgendaItemDone(item)
-  ).length;
+  const handleToggleHomeTask = async (item: AgendaItem) => {
+    if (item.source !== "internal") return;
+    const nextCompleted = !isAgendaItemDone(item);
+    const previousStatus = item.status;
+    setUpdatingTaskIds((prev) => (prev.includes(item.entity_id) ? prev : [...prev, item.entity_id]));
+    setError("");
+    setEvents((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id ? { ...entry, status: nextCompleted ? "concluido" : "pendente" } : entry
+      )
+    );
+    try {
+      const updated = await apiUpdateAgendaDeadline(item.entity_id, { is_completed: nextCompleted });
+      setEvents((prev) => prev.map((entry) => (entry.id === item.id ? updated : entry)));
+    } catch (err) {
+      setEvents((prev) =>
+        prev.map((entry) => (entry.id === item.id ? { ...entry, status: previousStatus } : entry))
+      );
+      setError(extractApiErrorMessage(err, "Não foi possível atualizar a tarefa."));
+    } finally {
+      setUpdatingTaskIds((prev) => prev.filter((entryId) => entryId !== item.entity_id));
+    }
+  };
+
   const weekDayItems = useMemo(
     () =>
       Array.from({ length: 7 }, (_, index) => {
@@ -6316,39 +6558,6 @@ function Home() {
       }),
     [internalWeekItems, todayKey, weekStartKey]
   );
-
-  const homeKpis = [
-    {
-      id: "fatal",
-      tone: "red",
-      value: deadlinesToday.filter((item) => !isAgendaItemDone(item)).length,
-      label: "Prazos fatais hoje"
-    },
-    {
-      id: "hearings",
-      tone: "amber",
-      value: hearingsWeek.length,
-      label: "Audiências na semana"
-    },
-    {
-      id: "deadlines",
-      tone: "blue",
-      value: deadlinesWeek.filter((item) => !isAgendaItemDone(item)).length,
-      label: "Prazos na semana"
-    },
-    {
-      id: "tasks",
-      tone: "violet",
-      value: tasksToday.filter((item) => !isAgendaItemDone(item)).length,
-      label: "Tarefas pendentes"
-    },
-    {
-      id: "done",
-      tone: "green",
-      value: completedTodayCount,
-      label: "Encerrados hoje"
-    }
-  ];
 
   return (
     <div className="content-card page-card home-card">
@@ -6381,31 +6590,20 @@ function Home() {
       {isLoading ? (
         <div className="home-loading">Carregando visão operacional...</div>
       ) : (
-        <>
-          <div className="home-kpi-grid">
-            {homeKpis.map((item) => (
-              <article key={item.id} className={`home-kpi-card tone-${item.tone}`}>
-                <div className="home-kpi-icon" />
-                <div>
-                  <div className="home-kpi-value">{item.value}</div>
-                  <div className="home-kpi-label">{item.label}</div>
-                </div>
-              </article>
-            ))}
-          </div>
-
-          <div className="home-focus-grid">
+        <div className="home-focus-grid">
             <section className="home-focus-card">
               <div className="home-focus-head tone-red">
-                <span className="home-focus-dot" />
-                <strong>Prazos Fatais — Hoje</strong>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Prazos Fatais</strong>
+                </div>
+                <span className="home-focus-count">{fatalDeadlinesToday.length}</span>
               </div>
               <div className="home-focus-list">
-                {deadlinesToday.length > 0 ? (
-                  deadlinesToday.map((item) => (
+                {fatalDeadlinesToday.length > 0 ? (
+                  fatalDeadlinesToday.map((item) => (
                     <div key={item.id} className="home-focus-item">
                       <div className="home-focus-main">
-                        <span className="home-focus-pill danger">Fatal</span>
                         <div>
                           <div className="home-focus-title">{item.title}</div>
                           <div className="home-focus-meta">{homeMetaLabel(item) || "Prazo interno do escritório"}</div>
@@ -6422,8 +6620,11 @@ function Home() {
 
             <section className="home-focus-card">
               <div className="home-focus-head tone-blue">
-                <span className="home-focus-dot" />
-                <strong>Audiências da Semana</strong>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Audiências da Semana</strong>
+                </div>
+                <span className="home-focus-count">{hearingsWeek.length}</span>
               </div>
               <div className="home-focus-list">
                 {hearingsWeek.length > 0 ? (
@@ -6450,12 +6651,15 @@ function Home() {
 
             <section className="home-focus-card">
               <div className="home-focus-head tone-amber">
-                <span className="home-focus-dot" />
-                <strong>Prazos da Semana</strong>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Prazos da Semana</strong>
+                </div>
+                <span className="home-focus-count">{pendingDeadlinesWeek.length}</span>
               </div>
               <div className="home-focus-list">
-                {deadlinesWeek.length > 0 ? (
-                  deadlinesWeek.map((item) => (
+                {pendingDeadlinesWeek.length > 0 ? (
+                  pendingDeadlinesWeek.map((item) => (
                     <div key={item.id} className="home-focus-item">
                       <div className="home-focus-main">
                         <span className="home-focus-pill amber">
@@ -6477,30 +6681,43 @@ function Home() {
 
             <section className="home-focus-card">
               <div className="home-focus-head tone-green">
-                <span className="home-focus-dot" />
-                <strong>Tarefas do Dia</strong>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Tarefas Pendentes</strong>
+                </div>
+                <span className="home-focus-count">{pendingTasksToday.length}</span>
               </div>
               <div className="home-focus-list">
                 {tasksToday.length > 0 ? (
                   tasksToday.map((item) => {
                     const done = isAgendaItemDone(item);
+                    const isUpdating = updatingTaskIds.includes(item.entity_id);
                     return (
-                      <div key={item.id} className={`home-task-item ${done ? "done" : ""}`}>
-                        <span className={`home-task-check ${done ? "done" : ""}`}>{done ? "✓" : ""}</span>
-                        <div className={`home-task-copy ${done ? "done" : ""}`}>
-                          <div className="home-focus-title">{item.title}</div>
-                          <div className="home-focus-meta">{homeMetaLabel(item) || "Tarefa operacional do dia"}</div>
-                        </div>
+                    <div key={item.id} className={`home-task-item ${done ? "done" : ""}`}>
+                      <button
+                        type="button"
+                        className={`home-task-check ${done ? "done" : ""}`}
+                        onClick={() => void handleToggleHomeTask(item)}
+                        disabled={isUpdating}
+                        aria-label={done ? `Desmarcar tarefa ${item.title}` : `Marcar tarefa ${item.title} como concluída`}
+                        aria-pressed={done}
+                      >
+                        {done ? "✓" : ""}
+                      </button>
+                      <div className={`home-task-copy ${done ? "done" : ""}`}>
+                        <div className="home-focus-title">{item.title}</div>
+                        <div className="home-focus-meta">{homeMetaLabel(item) || "Tarefa operacional do dia"}</div>
                       </div>
-                    );
+                    </div>
+                  );
                   })
                 ) : (
-                  <div className="home-focus-empty">Nenhuma tarefa do dia cadastrada para hoje.</div>
+                  <div className="home-focus-empty">Nenhuma tarefa cadastrada para hoje.</div>
                 )}
               </div>
             </section>
+
           </div>
-        </>
       )}
     </div>
   );
@@ -7895,6 +8112,9 @@ function Publications({ user }: { user: AuthUser | null }) {
   const [isSavingPublicationRegistrationCase, setIsSavingPublicationRegistrationCase] = useState(false);
   const [processingPublicationSourceKey, setProcessingPublicationSourceKey] = useState("");
   const publicationResultsRef = useRef<HTMLDivElement | null>(null);
+  const storedSessionOab = loadAuthSession()?.user?.oab || "";
+  const currentPublicationOab = splitStoredOab(user?.oab || storedSessionOab);
+  const hasCurrentPublicationOab = currentPublicationOab.number.length === 6 && Boolean(currentPublicationOab.uf);
 
   const buildPublicationContextFallback = async (items: TodayPublicationItem[]) => {
     const storedMap = loadPublicationFallbackContextMap(user);
@@ -8090,6 +8310,9 @@ function Publications({ user }: { user: AuthUser | null }) {
     setTodayPublicationsInlineMessage("");
     setPublicationActionError("");
     try {
+      if (!hasCurrentPublicationOab) {
+        throw new Error("OAB não cadastrada no seu membro da equipe. Cadastre a OAB para consultar publicações.");
+      }
       const data = await apiGetTodayPublications(selectedPublicationDate);
       if (data.oab) {
         const session = loadAuthSession();
@@ -8776,7 +8999,9 @@ function Publications({ user }: { user: AuthUser | null }) {
           <div>
             <div className="publication-title">Buscar publicações da minha OAB</div>
             <div className="publication-live-subtitle">
-              Selecione uma data no campo abaixo para consultar o DJEN da OAB vinculada ao seu login.
+              {hasCurrentPublicationOab
+                ? "Selecione uma data no campo abaixo para consultar o DJEN da OAB vinculada ao seu login."
+                : "OAB não cadastrada no seu membro da equipe. Cadastre a OAB para consultar o DJEN por esta área."}
             </div>
           </div>
         </div>
@@ -8790,7 +9015,7 @@ function Publications({ user }: { user: AuthUser | null }) {
             />
           </div>
           <div className="publication-search-actions">
-            <button className="btn ghost small" type="submit" disabled={isLoadingTodayPublications}>
+            <button className="btn ghost small" type="submit" disabled={isLoadingTodayPublications || !hasCurrentPublicationOab}>
               {isLoadingTodayPublications ? "Consultando..." : "Buscar publicações"}
             </button>
           </div>
@@ -12097,6 +12322,19 @@ function Wallets({ canManage }: { canManage: boolean }) {
   );
 }
 
+const teamRoleOptions = [
+  "Advogado(a)",
+  "Advogado(a) Sênior",
+  "Coordenador(a) Jurídico",
+  "Analista Jurídico",
+  "Assistente Jurídico",
+  "Paralegal",
+  "Estagiário(a) Jurídico",
+  "Atendimento",
+  "Financeiro",
+  "Administrativo"
+] as const;
+
 const buildEmptyTeamForm = () => ({
   fullName: "",
   email: "",
@@ -12127,11 +12365,9 @@ const getTeamFormValidationMessage = (form: TeamForm) => {
   if (!isValidCpf(form.cpf)) {
     return "Informe um CPF válido.";
   }
-  if (form.oabNumber.trim().length !== 6) {
-    return "Informe os 6 números da OAB do membro.";
-  }
-  if (!form.oabUf.trim()) {
-    return "Selecione a UF da OAB.";
+  const hasAnyOabInput = Boolean(form.oabNumber.trim() || form.oabUf.trim());
+  if (hasAnyOabInput && (form.oabNumber.trim().length !== 6 || !form.oabUf.trim())) {
+    return "Informe os 6 números e a UF da OAB ou deixe ambos em branco.";
   }
   if (!form.roleTitle.trim()) {
     return "Informe o cargo do membro.";
@@ -12219,7 +12455,7 @@ function Team({ canManage }: { canManage: boolean }) {
     if (!term) return members;
     return members.filter((member) => {
       const haystack =
-        `${member.full_name} ${member.email} ${member.cpf} ${member.oab} ${member.role_title} ${member.team_name} ${member.account_role || ""}`.toLowerCase();
+        `${member.full_name} ${member.email} ${member.cpf} ${member.oab || ""} ${member.role_title} ${member.team_name} ${member.account_role || ""}`.toLowerCase();
       return haystack.includes(term);
     });
   }, [members, searchTerm]);
@@ -12234,6 +12470,13 @@ function Team({ canManage }: { canManage: boolean }) {
   const teamValidationMessage = getTeamFormValidationMessage(form);
   const cpfInvalid = form.cpf.trim().length > 0 && !isValidCpf(form.cpf);
   const createBlockedByLimit = !editingId && form.isActive && limitReached;
+  const availableRoleOptions = useMemo(() => {
+    const currentRole = form.roleTitle.trim();
+    if (!currentRole || teamRoleOptions.includes(currentRole as (typeof teamRoleOptions)[number])) {
+      return [...teamRoleOptions];
+    }
+    return [...teamRoleOptions, currentRole];
+  }, [form.roleTitle]);
   const editingMember = useMemo(
     () => (editingId ? members.find((member) => member.id === editingId) ?? null : null),
     [editingId, members]
@@ -12257,9 +12500,9 @@ function Team({ canManage }: { canManage: boolean }) {
 
   const enforceAdminNavAccess = (keys: NavKey[], isAdmin: boolean): NavKey[] => {
     const normalized = normalizeNavKeys(keys);
-    const withSettings: NavKey[] = normalized.includes("settings") ? [...normalized] : [...normalized, "settings"];
+    const withSettings = normalized.includes("settings") ? [...normalized] : [...normalized, "settings"];
     if (!isAdmin) return withSettings;
-    const output: NavKey[] = [...withSettings];
+    const output = [...withSettings];
     for (const required of adminRequiredNavKeys) {
       if (!output.includes(required)) output.push(required);
     }
@@ -12301,12 +12544,14 @@ function Team({ canManage }: { canManage: boolean }) {
     setSaveError("");
     setSaveSuccess("");
     try {
+      const normalizedOabNumber = form.oabNumber.trim();
+      const normalizedOabUf = form.oabUf.trim().toUpperCase();
       const payload = {
         full_name: form.fullName.trim(),
         email: form.email.trim(),
         phone: form.phone.trim() || undefined,
         cpf: normalizeCpfDigits(form.cpf),
-        oab: `${form.oabNumber.trim()}/${form.oabUf.trim().toUpperCase()}`,
+        oab: normalizedOabNumber && normalizedOabUf ? `${normalizedOabNumber}/${normalizedOabUf}` : "",
         role_title: form.roleTitle.trim(),
         team_name: form.teamName.trim(),
         notes: form.notes.trim() || undefined,
@@ -12548,7 +12793,7 @@ function Team({ canManage }: { canManage: boolean }) {
                     <div>{member.team_name}</div>
                     <div>{member.role_title}</div>
                     <div>{formatCpfFromDigits(member.cpf)}</div>
-                    <div>{member.oab || "—"}</div>
+                    <div>{member.oab || "OAB não cadastrada"}</div>
                     <div>
                       {member.is_active ? "Ativo" : "Inativo"}
                       {member.is_read_only && !member.is_master_account ? " · Somente leitura" : ""}
@@ -12583,7 +12828,7 @@ function Team({ canManage }: { canManage: boolean }) {
             <div className="processes-eyebrow">Equipe</div>
             <h2>{editingId ? "Editar membro" : "Cadastrar novo membro"}</h2>
             <div className="wallets-form-hint">
-              Campos obrigatórios: Nome, Email, CPF, número OAB, UF da OAB, Cargo e Equipe.
+              Campos obrigatórios: Nome, Email, CPF, Cargo e Equipe. OAB é opcional.
               {typeof userLimit === "number" && (
                 <> Limite de usuários ativos: {activeUsers}/{userLimit} (disponíveis: {availableSlots ?? 0}).</>
               )}
@@ -12617,7 +12862,7 @@ function Team({ canManage }: { canManage: boolean }) {
                 {cpfInvalid && <div className="error-inline">Informe um CPF válido.</div>}
               </div>
               <div className="field">
-                <label>Número OAB *</label>
+                <label>Número OAB</label>
                 <input
                   value={form.oabNumber}
                   onChange={(event) => setForm((prev) => ({ ...prev, oabNumber: formatOabNumber(event.target.value) }))}
@@ -12626,7 +12871,7 @@ function Team({ canManage }: { canManage: boolean }) {
                 />
               </div>
               <div className="field">
-                <label>UF da OAB *</label>
+                <label>UF da OAB</label>
                 <select value={form.oabUf} onChange={(event) => setForm((prev) => ({ ...prev, oabUf: event.target.value }))}>
                   <option value="">Selecione</option>
                   {brazilUfOptions.map((uf) => (
@@ -12638,7 +12883,14 @@ function Team({ canManage }: { canManage: boolean }) {
               </div>
               <div className="field">
                 <label>Cargo *</label>
-                <input value={form.roleTitle} onChange={(event) => setForm((prev) => ({ ...prev, roleTitle: event.target.value }))} />
+                <select value={form.roleTitle} onChange={(event) => setForm((prev) => ({ ...prev, roleTitle: event.target.value }))}>
+                  <option value="">Selecione</option>
+                  {availableRoleOptions.map((role) => (
+                    <option key={role} value={role}>
+                      {role}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="field">
                 <label>Equipe *</label>
@@ -12664,8 +12916,8 @@ function Team({ canManage }: { canManage: boolean }) {
                   <input
                     type="checkbox"
                     checked={form.isAdmin || editingMasterAccount}
-                    onChange={(event) => handleToggleAdmin(event.target.checked)}
                     disabled={editingMasterAccount}
+                    onChange={(event) => handleToggleAdmin(event.target.checked)}
                   />
                   Administrador da equipe (pode cadastrar membros e criar carteiras)
                 </label>
@@ -12811,6 +13063,10 @@ function Settings({
   const [profileForm, setProfileForm] = useState<UserProfilePreferences>(profile);
   const [profileError, setProfileError] = useState("");
   const [profileInlineMessage, setProfileInlineMessage] = useState("");
+  const linkedOfficeName = user?.organization_name?.trim() || MASTER_OFFICE_NAME;
+  const linkedRoleTitle =
+    user?.role_title?.trim() ||
+    (user?.role === "superadmin" || user?.role === "owner" || user?.role === "admin" ? "Responsável master" : "Membro da equipe");
 
   useEffect(() => {
     setProfileForm(profile);
@@ -13265,11 +13521,11 @@ function Settings({
           {profileInlineMessage && <div className="agenda-inline">{profileInlineMessage}</div>}
           <div className="settings-profile-layout">
             <div className="settings-profile-preview">
-              <ProfileAvatar avatarDataUrl={profileForm.avatarDataUrl} label={MASTER_OFFICE_NAME} size="settings" />
+              <ProfileAvatar avatarDataUrl={profileForm.avatarDataUrl} label={linkedOfficeName} size="settings" />
               <div className="settings-profile-preview-copy">
-                <strong>{MASTER_OFFICE_NAME}</strong>
+                <strong>{linkedOfficeName}</strong>
                 <span>{profileForm.displayName.trim() || user?.name || "Responsável da conta"}</span>
-                <small>{profileForm.roleLabel.trim() || "Login master"}</small>
+                <small>{linkedRoleTitle}</small>
               </div>
               <input
                 ref={profilePhotoInputRef}
@@ -13300,13 +13556,8 @@ function Settings({
                   />
                 </div>
                 <div className="field">
-                  <label>Cargo / função</label>
-                  <input
-                    value={profileForm.roleLabel}
-                    onChange={handleProfileFieldChange("roleLabel")}
-                    placeholder="Login master"
-                    maxLength={50}
-                  />
+                  <label>Cargo cadastrado</label>
+                  <input value={linkedRoleTitle} readOnly />
                 </div>
                 <div className="field">
                   <label>Telefone para contato</label>
@@ -13330,7 +13581,7 @@ function Settings({
               <div className="settings-profile-locked">
                 <div className="settings-profile-locked-item">
                   <span>Escritório vinculado</span>
-                  <strong>{MASTER_OFFICE_NAME}</strong>
+                  <strong>{linkedOfficeName}</strong>
                 </div>
                 <div className="settings-profile-locked-item">
                   <span>E-mail de acesso</span>
@@ -13338,7 +13589,7 @@ function Settings({
                 </div>
                 <div className="settings-profile-locked-item">
                   <span>Nível de acesso</span>
-                  <strong>Login master</strong>
+                  <strong>{linkedRoleTitle}</strong>
                 </div>
               </div>
               <div className="settings-profile-actions">
@@ -13766,7 +14017,15 @@ function App() {
   const activeNav = visibleNavItems.some((item) => item.key === active) ? active : (visibleNavItems[0]?.key ?? "settings");
   const effectiveProfilePreferences = profilePreview ?? profilePreferences;
   const sidebarDisplayName = effectiveProfilePreferences.displayName || user?.name || "Responsável da conta";
-  const sidebarRoleLabel = effectiveProfilePreferences.roleLabel || "Login master";
+  const sidebarFooterName = (() => {
+    const parts = sidebarDisplayName.trim().split(/\s+/).filter(Boolean);
+    if (parts.length <= 2) return parts.join(" ");
+    return `${parts[0]} ${parts[parts.length - 1]}`;
+  })();
+  const sidebarOfficeName = user?.organization_name?.trim() || MASTER_OFFICE_NAME;
+  const sidebarRoleLabel =
+    user?.role_title?.trim() ||
+    (user?.role === "superadmin" || user?.role === "owner" || user?.role === "admin" ? "Responsável master" : "Membro da equipe");
 
   useEffect(() => {
     if (!token) return;
@@ -13908,7 +14167,7 @@ function App() {
   const render = () => {
     switch (activeNav) {
       case "home":
-        return <Home />;
+        return <Home user={user} />;
       case "dashboard":
         return <Dashboard />;
       case "people":
@@ -13943,7 +14202,7 @@ function App() {
       case "progress":
         return <Progress />;
       case "service":
-      case "reports":
+        return <Service user={user} />;
       case "templates":
         return <Placeholder title={navItems.find((n) => n.key === activeNav)?.label || "Em breve"} />;
       case "stats":
@@ -13960,9 +14219,9 @@ function App() {
       <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top">
           <div className="sidebar-account">
-            <ProfileAvatar avatarDataUrl={effectiveProfilePreferences.avatarDataUrl} label={MASTER_OFFICE_NAME} size="sidebar" />
+            <ProfileAvatar avatarDataUrl={effectiveProfilePreferences.avatarDataUrl} label={sidebarOfficeName} size="sidebar" />
             <div className="brand">
-              <span className="brand-full">{MASTER_OFFICE_NAME}</span>
+              <span className="brand-full">{sidebarOfficeName}</span>
               <span className="brand-meta">{sidebarRoleLabel}</span>
             </div>
           </div>
@@ -13984,11 +14243,7 @@ function App() {
           ))}
         </div>
         <div className="sidebar-footer">
-          <div className="sidebar-user">
-            {sidebarDisplayName}
-            <br />
-            {user?.email || "usuario@newlaw.app.br"}
-          </div>
+          <div className="sidebar-user">{sidebarFooterName}</div>
           <button
             className={`sidebar-ai-trigger ${isAssistantOpen ? "active" : ""}`}
             type="button"

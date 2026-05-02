@@ -9,7 +9,6 @@ export type NavKey =
   | "team"
   | "billing"
   | "service"
-  | "reports"
   | "stats"
   | "official"
   | "progress"
@@ -39,5 +38,14 @@ export interface Case {
 
 export interface LoginState {
   token: string | null;
-  user: { email: string; name: string; role: string; is_admin?: boolean; allowed_nav_keys?: string[] } | null;
+  user: {
+    email: string;
+    name: string;
+    role: string;
+    organization_name?: string | null;
+    role_title?: string | null;
+    team_name?: string | null;
+    is_admin?: boolean;
+    allowed_nav_keys?: string[];
+  } | null;
 }

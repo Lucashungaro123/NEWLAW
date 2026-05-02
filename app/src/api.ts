@@ -18,6 +18,9 @@ export type AuthUser = {
   oab?: string | null;
   role: string;
   organization_id?: number | null;
+  organization_name?: string | null;
+  role_title?: string | null;
+  team_name?: string | null;
   is_admin?: boolean;
   allowed_nav_keys?: string[];
 };
@@ -47,6 +50,49 @@ export type CreateClientPayload = {
   organization_id?: number;
 };
 export type UpdateClientPayload = CreateClientPayload;
+export type ServiceIntakeStatus = "registrado" | "proposta" | "fechado" | "nao_avancou";
+export type ApiServiceIntake = {
+  id: number;
+  organization_id?: number | null;
+  handled_by_user_id?: number | null;
+  lead_name: string;
+  document?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  legal_area?: string | null;
+  referral_source?: string | null;
+  meeting_date?: string | null;
+  meeting_time?: string | null;
+  meeting_mode?: string | null;
+  summary?: string | null;
+  process_overview?: string | null;
+  next_steps?: string | null;
+  agreed_fee?: number | null;
+  payment_terms?: string | null;
+  handled_by_name?: string | null;
+  status: ServiceIntakeStatus;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+export type CreateServiceIntakePayload = {
+  lead_name: string;
+  document?: string;
+  email?: string;
+  phone?: string;
+  legal_area?: string;
+  referral_source?: string;
+  meeting_date?: string;
+  meeting_time?: string;
+  meeting_mode?: string;
+  summary?: string;
+  process_overview?: string;
+  next_steps?: string;
+  agreed_fee?: number;
+  payment_terms?: string;
+  handled_by_name?: string;
+  status?: ServiceIntakeStatus;
+};
+export type UpdateServiceIntakePayload = CreateServiceIntakePayload;
 export type ApiCaseClosingObligation = {
   id: string;
   title: string;
@@ -100,6 +146,43 @@ export type CreateCasePayload = {
   organization_id?: number;
 };
 export type UpdateCasePayload = CreateCasePayload;
+export type JurisprudenceSearchPayload = {
+  area?: string;
+  claim_type?: string;
+  objective?: string;
+  narrative?: string;
+  opposing_party?: string;
+  jurisdiction: string;
+  fact_period?: string;
+  evidence_summary?: string;
+  process_number?: string;
+  limit?: number;
+};
+export type JurisprudenceVerifiedCase = {
+  number: string;
+  formatted_number: string;
+  court?: string | null;
+  degree?: string | null;
+  organ?: string | null;
+  class_name?: string | null;
+  subjects: string[];
+  filed_at?: string | null;
+  updated_at?: string | null;
+  movements: string[];
+  source_name: string;
+  source_url: string;
+};
+export type JurisprudenceSearchResponse = {
+  source_name: string;
+  source_url: string;
+  status: string;
+  reliable: boolean;
+  total_hits: number;
+  total_relation: string;
+  query_terms: string[];
+  cases: JurisprudenceVerifiedCase[];
+  message: string;
+};
 export type UpdateCaseClosingPayload = {
   closure_type?: string;
   result?: string;
@@ -152,7 +235,7 @@ export type ApiTeamMember = {
   email: string;
   phone?: string | null;
   cpf: string;
-  oab: string;
+  oab?: string | null;
   role_title: string;
   team_name: string;
   notes?: string | null;
@@ -415,7 +498,7 @@ export type CreateTeamMemberPayload = {
   email: string;
   phone?: string;
   cpf: string;
-  oab: string;
+  oab?: string;
   role_title: string;
   team_name: string;
   notes?: string;
@@ -556,6 +639,27 @@ export async function logout() {
   clearAuthSession();
 }
 
+export async function listServiceIntakes(organizationId?: number) {
+  const params = organizationId ? { organization_id: organizationId } : undefined;
+  const { data } = await api.get("/service/intakes", { params });
+  return data as ApiServiceIntake[];
+}
+
+export async function createServiceIntake(payload: CreateServiceIntakePayload) {
+  const { data } = await api.post("/service/intakes", payload);
+  return data as ApiServiceIntake;
+}
+
+export async function updateServiceIntake(recordId: number, payload: UpdateServiceIntakePayload) {
+  const { data } = await api.put(`/service/intakes/${recordId}`, payload);
+  return data as ApiServiceIntake;
+}
+
+export async function deleteServiceIntake(recordId: number) {
+  const { data } = await api.delete(`/service/intakes/${recordId}`);
+  return data as { status: string; id: number };
+}
+
 export async function listClients(organizationId?: number) {
   const params = organizationId ? { organization_id: organizationId } : undefined;
   const { data } = await api.get("/clients", { params });
@@ -598,6 +702,35 @@ export async function saveCaseClosing(caseId: number, payload: UpdateCaseClosing
   return data as ApiCase;
 }
 
+export async function searchJurisprudenceStats(payload: JurisprudenceSearchPayload) {
+  try {
+    const { data } = await api.post("/stats/jurisprudence/search", payload, { timeout: 35000 });
+    return data as JurisprudenceSearchResponse;
+  } catch (error) {
+    const status = (error as AxiosError).response?.status;
+    if (status === 404 && canTryLocalApiFallback) {
+      try {
+        await invoke("start_backend");
+      } catch {
+        // The desktop shell usually starts the local backend on boot; continue and let the HTTP call report any failure.
+      }
+      try {
+        const { data } = await axios.post(`${LOCAL_API_BASE_URL}/stats/jurisprudence/search`, payload, { timeout: 35000 });
+        return data as JurisprudenceSearchResponse;
+      } catch (localError) {
+        const detail = (localError as AxiosError<{ detail?: string }>).response?.data?.detail;
+        throw new Error(detail || "A API remota ainda não tem esta consulta e o backend local não respondeu.");
+      }
+    }
+    if (status === 404) {
+      throw new Error("A API atual ainda não tem a consulta oficial de estatísticas. Atualize o backend antes de usar esta função.");
+    }
+    const detail = (error as AxiosError<{ detail?: string }>).response?.data?.detail;
+    if (detail) throw new Error(detail);
+    throw error;
+  }
+}
+
 function buildHttpError(status: number, detail: string) {
   const error = new Error(detail) as Error & { response?: { status: number; data: { detail: string } } };
   error.response = { status, data: { detail } };
@@ -609,6 +742,11 @@ const isDesktopRemoteApi =
   isTauri() &&
   !baseURL.startsWith("http://127.0.0.1") &&
   !baseURL.startsWith("http://localhost");
+const canTryLocalApiFallback =
+  typeof window !== "undefined" &&
+  !baseURL.startsWith("http://127.0.0.1") &&
+  !baseURL.startsWith("http://localhost") &&
+  (isTauri() || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
 type DeleteResponseBody = {
   detail?: string;
