@@ -6437,8 +6437,10 @@ function Home({ user }: { user: AuthUser | null }) {
     };
   }, []);
 
-  const titleCaseLabel = (value: string) =>
-    value.replace(/\b([a-zà-ÿ])/gi, (match) => match.toUpperCase());
+  const titleCaseLabel = (value: string) => {
+    const normalized = value.trim().toLocaleLowerCase("pt-BR");
+    return normalized ? `${normalized.charAt(0).toLocaleUpperCase("pt-BR")}${normalized.slice(1)}` : "";
+  };
 
   const weekdayTitle = titleCaseLabel(today.toLocaleDateString("pt-BR", { weekday: "long" }));
   const currentDateLabel = today.toLocaleDateString("pt-BR", {
