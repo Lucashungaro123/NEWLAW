@@ -72,7 +72,6 @@ import {
   logout as apiLogout,
   ping,
   resetTeamMemberPassword as apiResetTeamMemberPassword,
-  runPublicationAutomationNow as apiRunPublicationAutomationNow,
   saveCaseClosing as apiSaveCaseClosing,
   saveAuthSession,
   me as apiMe,
@@ -139,11 +138,9 @@ type FilesFolderTarget =
   | { scope: "case"; caseId: number; folderLabel: string };
 
 const textScaleOptions = [
-  { label: "Normal", value: 1 },
-  { label: "Pouco maior", value: 1.05 },
-  { label: "Confortável", value: 1.1 },
-  { label: "Maior", value: 1.15 },
-  { label: "Grande", value: 1.2 }
+  { label: "Pequeno", value: 0.98, previewSize: 12 },
+  { label: "Médio", value: 1.02, previewSize: 13 },
+  { label: "Grande", value: 1.06, previewSize: 14 }
 ] as const;
 
 const filesAllowedUploadExtensions = [".pdf", ".doc", ".docx"];
@@ -211,6 +208,8 @@ const adminRequiredNavKeys: NavKey[] = ["team", "wallets"];
 const MASTER_OFFICE_NAME = "NEWLAW";
 const PROFILE_STORAGE_KEY_PREFIX = "newlaw-profile-preferences";
 const profilePhotoMaxSizeBytes = 2 * 1024 * 1024;
+const supportedProfilePhotoTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
+const supportedProfilePhotoExtensions = [".jpg", ".jpeg", ".png", ".webp"];
 
 type UserProfilePreferences = {
   avatarDataUrl: string;
@@ -224,7 +223,7 @@ const buildDefaultProfilePreferences = (user: AuthUser | null): UserProfilePrefe
   avatarDataUrl: "",
   displayName: user?.name?.trim() || "",
   roleLabel: "Login master",
-  phone: "",
+  phone: user?.phone?.trim() || "",
   bio: ""
 });
 
@@ -233,15 +232,16 @@ const normalizeProfilePreferences = (
   user: AuthUser | null
 ): UserProfilePreferences => {
   const defaults = buildDefaultProfilePreferences(user);
+  const hasField = (field: keyof UserProfilePreferences) => Object.prototype.hasOwnProperty.call(value ?? {}, field);
   return {
     avatarDataUrl:
       typeof value?.avatarDataUrl === "string" && value.avatarDataUrl.startsWith("data:image/")
         ? value.avatarDataUrl
         : "",
-    displayName: typeof value?.displayName === "string" && value.displayName.trim() ? value.displayName.trim() : defaults.displayName,
+    displayName: hasField("displayName") && typeof value?.displayName === "string" ? value.displayName.slice(0, 60) : defaults.displayName,
     roleLabel: typeof value?.roleLabel === "string" && value.roleLabel.trim() ? value.roleLabel.trim() : defaults.roleLabel,
-    phone: typeof value?.phone === "string" ? value.phone.trim().slice(0, 32) : defaults.phone,
-    bio: typeof value?.bio === "string" ? value.bio.trim().slice(0, 220) : defaults.bio
+    phone: hasField("phone") && typeof value?.phone === "string" ? value.phone.slice(0, 32) : defaults.phone,
+    bio: hasField("bio") && typeof value?.bio === "string" ? value.bio.slice(0, 220) : defaults.bio
   };
 };
 
@@ -260,6 +260,20 @@ const loadStoredProfilePreferences = (user: AuthUser | null): UserProfilePrefere
     return normalizeProfilePreferences(JSON.parse(raw) as Partial<UserProfilePreferences>, user);
   } catch {
     return buildDefaultProfilePreferences(user);
+  }
+};
+
+const hasStoredProfilePhonePreference = (user: AuthUser | null) => {
+  if (typeof window === "undefined") return false;
+  const storageKey = getProfileStorageKey(user);
+  if (!storageKey) return false;
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return false;
+    const value = JSON.parse(raw) as Partial<UserProfilePreferences>;
+    return Object.prototype.hasOwnProperty.call(value, "phone");
+  } catch {
+    return false;
   }
 };
 
@@ -13040,7 +13054,7 @@ function Settings({
   const runningInTauri = typeof window !== "undefined" && isTauri();
   const [appVersion, setAppVersion] = useState("0.1.8");
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
-  const [updateMessage, setUpdateMessage] = useState("Clique em verificar atualização.");
+  const [updateMessage, setUpdateMessage] = useState("");
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -13053,27 +13067,77 @@ function Settings({
   const [syncingProvider, setSyncingProvider] = useState<CalendarProvider | null>(null);
   const [disconnectingProvider, setDisconnectingProvider] = useState<CalendarProvider | null>(null);
   const [publicationSettings, setPublicationSettings] = useState<PublicationAutomationSettings | null>(null);
-  const [publicationForm, setPublicationForm] = useState({ is_enabled: false, schedule_time: "06:00" });
+  const [publicationForm, setPublicationForm] = useState({ is_enabled: false, email_enabled: false, schedule_time: "06:00" });
   const [isLoadingPublicationSettings, setIsLoadingPublicationSettings] = useState(true);
   const [publicationSettingsError, setPublicationSettingsError] = useState("");
   const [publicationInlineMessage, setPublicationInlineMessage] = useState("");
   const [savingPublicationSettings, setSavingPublicationSettings] = useState(false);
-  const [runningPublicationSync, setRunningPublicationSync] = useState(false);
   const pollIntervalRef = useRef<number | null>(null);
   const profilePhotoInputRef = useRef<HTMLInputElement | null>(null);
-  const currentTextScale = textScaleOptions[clampTextScaleIndex(textScaleIndex)] ?? textScaleOptions[0];
   const [profileForm, setProfileForm] = useState<UserProfilePreferences>(profile);
   const [profileError, setProfileError] = useState("");
   const [profileInlineMessage, setProfileInlineMessage] = useState("");
+  const profileFormRef = useRef<UserProfilePreferences>(profile);
   const linkedOfficeName = user?.organization_name?.trim() || MASTER_OFFICE_NAME;
   const linkedRoleTitle =
     user?.role_title?.trim() ||
     (user?.role === "superadmin" || user?.role === "owner" || user?.role === "admin" ? "Responsável master" : "Membro da equipe");
 
+  const saveProfileAutomatically = (nextProfile: UserProfilePreferences, message = "") => {
+    try {
+      const savedProfile = onSaveProfile(nextProfile);
+      setProfileForm(savedProfile);
+      profileFormRef.current = savedProfile;
+      onPreviewProfile(null);
+      setProfileError("");
+      setProfileInlineMessage(message);
+      return savedProfile;
+    } catch (error) {
+      setProfileForm(nextProfile);
+      profileFormRef.current = nextProfile;
+      onPreviewProfile(nextProfile);
+      setProfileInlineMessage("");
+      setProfileError(extractRuntimeErrorMessage(error, "Não foi possível salvar o perfil automaticamente."));
+      return nextProfile;
+    }
+  };
+
   useEffect(() => {
     setProfileForm(profile);
+    profileFormRef.current = profile;
     onPreviewProfile(null);
   }, [profile, onPreviewProfile]);
+
+  useEffect(() => {
+    profileFormRef.current = profileForm;
+  }, [profileForm]);
+
+  useEffect(() => {
+    if (!user || profileForm.phone.trim() || hasStoredProfilePhonePreference(user)) return;
+    let cancelled = false;
+    const userEmail = user.email.trim().toLowerCase();
+    void apiListTeamMembers(undefined, { includeMasterAccounts: true })
+      .then((members) => {
+        if (cancelled || hasStoredProfilePhonePreference(user)) return;
+        const matchedMember =
+          members.find((member) => member.email.trim().toLowerCase() === userEmail) ||
+          members.find((member) => member.is_master_account && member.organization_id === user.organization_id);
+        const registeredPhone = matchedMember?.phone?.trim();
+        if (!registeredPhone) return;
+        const currentProfile = profileFormRef.current;
+        if (currentProfile.phone.trim()) return;
+        saveProfileAutomatically({
+          ...currentProfile,
+          phone: registeredPhone.slice(0, 32)
+        });
+      })
+      .catch(() => {
+        // The phone is only a convenience fallback; the profile remains editable if the team list is unavailable.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [profileForm.phone, user]);
 
   useEffect(() => {
     return () => {
@@ -13133,22 +13197,18 @@ function Settings({
         ...profileForm,
         [field]: event.target.value
       };
-      setProfileForm(nextProfile);
-      onPreviewProfile(nextProfile);
-      setProfileError("");
-      setProfileInlineMessage("");
+      saveProfileAutomatically(nextProfile);
     };
 
   const handleProfilePhotoChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      setProfileError("Selecione uma imagem JPG, PNG ou WEBP.");
-      return;
-    }
-    if (file.size > profilePhotoMaxSizeBytes) {
-      setProfileError("A foto deve ter no máximo 2 MB.");
+    const hasSupportedType = supportedProfilePhotoTypes.has(file.type);
+    const lowerName = file.name.toLowerCase();
+    const hasSupportedExtension = supportedProfilePhotoExtensions.some((extension) => lowerName.endsWith(extension));
+    if ((!hasSupportedType && !hasSupportedExtension) || file.size > profilePhotoMaxSizeBytes) {
+      setProfileError("Arquivo fora do padrão suportado. Envie uma imagem JPG, PNG ou WEBP com até 2 MB.");
       return;
     }
     try {
@@ -13157,10 +13217,7 @@ function Settings({
         ...profileForm,
         avatarDataUrl
       };
-      setProfileForm(nextProfile);
-      onPreviewProfile(nextProfile);
-      setProfileError("");
-      setProfileInlineMessage("Foto aplicada no topo. Clique em salvar perfil para persistir a alteração.");
+      saveProfileAutomatically(nextProfile, "Foto salva automaticamente.");
     } catch (error) {
       setProfileError(extractRuntimeErrorMessage(error, "Não foi possível carregar a foto do perfil."));
     }
@@ -13171,22 +13228,7 @@ function Settings({
       ...profileForm,
       avatarDataUrl: ""
     };
-    setProfileForm(nextProfile);
-    onPreviewProfile(nextProfile);
-    setProfileError("");
-    setProfileInlineMessage("Foto removida do topo. Clique em salvar perfil para persistir a alteração.");
-  };
-
-  const handleSaveProfile = () => {
-    try {
-      const nextProfile = onSaveProfile(profileForm);
-      setProfileForm(nextProfile);
-      onPreviewProfile(null);
-      setProfileError("");
-      setProfileInlineMessage("Perfil atualizado com sucesso.");
-    } catch (error) {
-      setProfileError(extractRuntimeErrorMessage(error, "Não foi possível salvar o perfil."));
-    }
+    saveProfileAutomatically(nextProfile, "Foto removida automaticamente.");
   };
 
   const loadCalendarConnections = async () => {
@@ -13210,6 +13252,7 @@ function Settings({
       setPublicationSettings(data);
       setPublicationForm({
         is_enabled: data.is_enabled,
+        email_enabled: data.is_enabled ? data.email_enabled : false,
         schedule_time: data.schedule_time || "06:00"
       });
     } catch (err) {
@@ -13348,20 +13391,25 @@ function Settings({
     }
   };
 
-  const handleSavePublicationSettings = async () => {
+  const savePublicationSettingsAutomatically = async (
+    nextForm: typeof publicationForm,
+    successMessage = "Configuração salva."
+  ) => {
     setSavingPublicationSettings(true);
     setPublicationSettingsError("");
     try {
       const data = await apiUpdatePublicationAutomationSettings({
-        is_enabled: publicationForm.is_enabled,
-        schedule_time: publicationForm.schedule_time
+        is_enabled: nextForm.is_enabled,
+        email_enabled: nextForm.is_enabled ? nextForm.email_enabled : false,
+        schedule_time: nextForm.schedule_time
       });
       setPublicationSettings(data);
       setPublicationForm({
         is_enabled: data.is_enabled,
+        email_enabled: data.is_enabled ? data.email_enabled : false,
         schedule_time: data.schedule_time
       });
-      setPublicationInlineMessage(data.is_enabled ? "Download automático atualizado." : "Download automático desativado.");
+      setPublicationInlineMessage(successMessage);
     } catch (err) {
       const error = err as { response?: { status?: number } };
       if (error.response?.status === 404) {
@@ -13374,27 +13422,41 @@ function Settings({
     }
   };
 
-  const handleRunPublicationSync = async () => {
-    setRunningPublicationSync(true);
-    setPublicationSettingsError("");
-    try {
-      const result = await apiRunPublicationAutomationNow();
-      setPublicationSettings(result.config);
-      setPublicationForm({
-        is_enabled: result.config.is_enabled,
-        schedule_time: result.config.schedule_time
-      });
-      setPublicationInlineMessage(result.message);
-    } catch (err) {
-      const error = err as { response?: { status?: number } };
-      if (error.response?.status === 404) {
-        setPublicationSettingsError("Esse recurso ainda não está disponível no servidor atual. A API principal ainda não recebeu a atualização de publicações automáticas.");
-      } else {
-        setPublicationSettingsError(extractApiErrorMessage(err, "Não foi possível executar a busca automática de publicações."));
-      }
-    } finally {
-      setRunningPublicationSync(false);
-    }
+  const handlePublicationScheduleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const nextForm = {
+      ...publicationForm,
+      schedule_time: event.target.value || "06:00"
+    };
+    setPublicationForm(nextForm);
+    void savePublicationSettingsAutomatically(nextForm);
+  };
+
+  const handlePublicationDownloadToggle = () => {
+    const willEnable = !publicationForm.is_enabled;
+    const nextForm = {
+      ...publicationForm,
+      is_enabled: willEnable,
+      email_enabled: willEnable ? publicationForm.email_enabled : false
+    };
+    setPublicationForm(nextForm);
+    void savePublicationSettingsAutomatically(
+      nextForm,
+      willEnable ? "Download automático ativado." : "Download automático desativado."
+    );
+  };
+
+  const handlePublicationEmailToggle = () => {
+    if (!publicationForm.is_enabled) return;
+    const willEnable = !publicationForm.email_enabled;
+    const nextForm = {
+      ...publicationForm,
+      email_enabled: willEnable
+    };
+    setPublicationForm(nextForm);
+    void savePublicationSettingsAutomatically(
+      nextForm,
+      willEnable ? "Envio por e-mail ativado." : "Envio por e-mail desativado."
+    );
   };
 
   const calendarConnectionMap = useMemo(() => {
@@ -13403,22 +13465,8 @@ function Settings({
       return acc;
     }, {});
   }, [calendarConnections]);
-  const publicationStatusTone =
-    publicationSettings?.last_status === "error"
-      ? "error"
-      : publicationSettings?.last_status === "warning"
-        ? "warning"
-        : publicationSettings?.last_status === "success"
-          ? "success"
-          : "";
-  const publicationRecentRecords = publicationSettings?.recent_records ?? [];
-  const getPublicationMatchLabel = (matchedVia?: string | null) => {
-    if (matchedVia === "case_number") return "match por processo";
-    if (matchedVia === "client_name") return "match por cliente";
-    return "match automático";
-  };
   const publicationFeatureUnavailable = !publicationSettings && publicationSettingsError.toLowerCase().includes("não está disponível");
-  const isPublicationBusy = isLoadingPublicationSettings || savingPublicationSettings || runningPublicationSync || Boolean(publicationSettings?.is_running);
+  const isPublicationBusy = isLoadingPublicationSettings || savingPublicationSettings || Boolean(publicationSettings?.is_running);
 
   const handleCheckForUpdates = async () => {
     if (!runningInTauri) return;
@@ -13486,17 +13534,18 @@ function Settings({
 
   const canCheckUpdate = runningInTauri && updateStatus !== "checking" && !installingUpdate;
   const canInstallUpdate = runningInTauri && availableUpdate !== null && !installingUpdate;
-
   const updateStatusLabel =
     downloadProgress !== null && (updateStatus === "downloading" || updateStatus === "installing")
       ? `${updateMessage} (${downloadProgress}%)`
       : updateMessage;
-
-  const updateMeta = availableUpdate ? `Canal Estável · nova versão ${availableUpdate.version}` : "Canal Estável";
-  const updateDescription = availableUpdate?.body || "As atualizações são baixadas e instaladas pelo próprio aplicativo.";
-  const manualUpdateUrl = availableUpdate
-    ? `https://github.com/Lucashungaro123/NEWLAW/releases/tag/v${availableUpdate.version}`
-    : "https://github.com/Lucashungaro123/NEWLAW/releases/latest";
+  const updateStatusTone =
+    updateStatus === "error"
+      ? "error"
+      : updateStatus === "available"
+        ? "available"
+        : updateStatus === "up-to-date" || updateStatus === "installed"
+          ? "success"
+          : "";
 
   return (
     <div className="content-card page-card settings-page">
@@ -13504,22 +13553,41 @@ function Settings({
         <div>
           <div className="eyebrow">Configurações</div>
           <h1 className="page-title">Preferências do sistema</h1>
-          <div className="page-subtitle">Perfil, aparência, atualizações e ajustes gerais do NEWLAW.</div>
         </div>
-        <div className="pill">Painel</div>
+        <div className="theme-options settings-header-theme-options">
+          <button
+            type="button"
+            className={`theme-option ${theme === "light" ? "active" : ""}`}
+            onClick={() => onThemeChange("light")}
+            aria-pressed={theme === "light"}
+          >
+            <span className="theme-dot light" aria-hidden="true" />
+            Claro
+          </button>
+          <button
+            type="button"
+            className={`theme-option ${theme === "dark" ? "active" : ""}`}
+            onClick={() => onThemeChange("dark")}
+            aria-pressed={theme === "dark"}
+          >
+            <span className="theme-dot dark" aria-hidden="true" />
+            Escuro
+          </button>
+        </div>
       </div>
       <div className="settings-grid">
         <div className="settings-card settings-profile-card">
           <div className="settings-row">
             <div>
               <div className="settings-title">Perfil</div>
-              <div className="settings-sub">
-                Personalize foto e informações complementares. Os dados já cadastrados na conta principal ficam bloqueados.
-              </div>
             </div>
             <div className="pill">Conta master</div>
           </div>
-          {profileError && <div className="error">{profileError}</div>}
+          {profileError && (
+            <div className="profile-upload-notice" role="alert">
+              {profileError}
+            </div>
+          )}
           {profileInlineMessage && <div className="agenda-inline">{profileInlineMessage}</div>}
           <div className="settings-profile-layout">
             <div className="settings-profile-preview">
@@ -13544,7 +13612,6 @@ function Settings({
                   Remover foto
                 </button>
               </div>
-              <div className="field-hint">JPG, PNG ou WEBP com até 2 MB. O topo acompanha a prévia e a alteração fica salva ao clicar em salvar perfil.</div>
             </div>
             <div className="settings-profile-form">
               <div className="settings-profile-form-grid">
@@ -13594,91 +13661,28 @@ function Settings({
                   <strong>{linkedRoleTitle}</strong>
                 </div>
               </div>
-              <div className="settings-profile-actions">
-                <button className="btn small" type="button" onClick={handleSaveProfile}>
-                  Salvar perfil
-                </button>
-              </div>
             </div>
           </div>
-          <div className="settings-note">
-            Esta área edita apenas preferências visuais e dados complementares do perfil. Cadastro principal e permissões continuam somente leitura.
-          </div>
-        </div>
-        <div className="settings-card">
-          <div className="settings-row">
-            <div>
-              <div className="settings-title">Tema</div>
-              <div className="settings-sub">Aplicação imediata da paleta azul.</div>
-            </div>
-            <div className="theme-options">
-              <button
-                type="button"
-                className={`theme-option ${theme === "light" ? "active" : ""}`}
-                onClick={() => onThemeChange("light")}
-                aria-pressed={theme === "light"}
-              >
-                <span className="theme-dot light" aria-hidden="true" />
-                Claro
-              </button>
-              <button
-                type="button"
-                className={`theme-option ${theme === "dark" ? "active" : ""}`}
-                onClick={() => onThemeChange("dark")}
-                aria-pressed={theme === "dark"}
-              >
-                <span className="theme-dot dark" aria-hidden="true" />
-                Escuro
-              </button>
-            </div>
-          </div>
-          <div className="settings-note">Paleta aplicada: branco + azul #0f1e3f.</div>
         </div>
         <div className="settings-card">
           <div className="settings-row settings-row-scale">
             <div>
               <div className="settings-title">Tamanho do texto</div>
-              <div className="settings-sub">Ajuste a leitura do aplicativo sem reiniciar.</div>
             </div>
             <div className="settings-scale-box">
-              <div className="settings-scale-current">{currentTextScale.label}</div>
-              <input
-                className="settings-scale-range"
-                type="range"
-                min={0}
-                max={textScaleOptions.length - 1}
-                step={1}
-                value={textScaleIndex}
-                onChange={(event) => onTextScaleChange(clampTextScaleIndex(Number(event.target.value)))}
-                aria-label="Tamanho do texto"
-                style={{
-                  background: `linear-gradient(90deg, var(--accent) 0%, var(--accent) ${
-                    (textScaleIndex / (textScaleOptions.length - 1)) * 100
-                  }%, var(--panel-strong) ${(textScaleIndex / (textScaleOptions.length - 1)) * 100}%, var(--panel-strong) 100%)`
-                }}
-              />
-              <div className="settings-scale-markers" aria-hidden="true">
-                {textScaleOptions.map((option, index) => (
-                  <span key={option.label} className={`settings-scale-marker ${index <= textScaleIndex ? "active" : ""}`} />
-                ))}
-              </div>
-              <div className="settings-scale-labels">
-                <span>Normal</span>
-                <span>Grande</span>
-              </div>
+              {textScaleOptions.map((option, index) => (
+                <button
+                  key={option.label}
+                  type="button"
+                  className={`settings-scale-option ${textScaleIndex === index ? "active" : ""}`}
+                  onClick={() => onTextScaleChange(index)}
+                  aria-pressed={textScaleIndex === index}
+                  style={{ fontSize: `${option.previewSize}px` }}
+                >
+                  {option.label}
+                </button>
+              ))}
             </div>
-          </div>
-          <div className="settings-note">Preferência salva neste computador e aplicada em toda a interface.</div>
-        </div>
-        <div className="settings-card">
-          <div className="settings-row">
-            <div>
-              <div className="settings-title">Sessão</div>
-              <div className="settings-sub">Encerre sua sessão atual com segurança.</div>
-            </div>
-            <button className="btn ghost small" type="button" onClick={onLogout}>
-              Encerrar sessão
-            </button>
           </div>
         </div>
         <div className="settings-card">
@@ -13779,133 +13783,70 @@ function Settings({
           <div className="settings-row">
             <div>
               <div className="settings-title">Publicações automáticas</div>
-              <div className="settings-sub">
-                Consulta o DJEN por OAB ativa da equipe, vincula pelo processo cadastrado e salva a certidão em <strong>Arquivos &gt; Publicações</strong>.
-              </div>
             </div>
-            <button
-              className="btn ghost small"
-              type="button"
-              onClick={loadPublicationAutomation}
-              disabled={isPublicationBusy}
-            >
-              {isLoadingPublicationSettings ? "Atualizando..." : "Atualizar"}
-            </button>
           </div>
           {publicationSettingsError && <div className="error">{publicationSettingsError}</div>}
           {publicationInlineMessage && <div className="agenda-inline">{publicationInlineMessage}</div>}
-          <div className="settings-publications-grid">
-            <label className="settings-checkbox settings-publications-span">
-              <input
-                type="checkbox"
-                checked={publicationForm.is_enabled}
-                onChange={(event) =>
-                  setPublicationForm((prev) => ({
-                    ...prev,
-                    is_enabled: event.target.checked
-                  }))
-                }
-                disabled={isPublicationBusy || publicationFeatureUnavailable}
-              />
-              <span>Ativar download automático diário</span>
-            </label>
-            <div className="field settings-field">
-              <label>Horário diário</label>
+          <div className="settings-publications-simple">
+            <div className="field settings-field settings-publications-time">
+              <label>Melhor horário para baixar</label>
               <input
                 type="time"
                 value={publicationForm.schedule_time}
-                onChange={(event) =>
-                  setPublicationForm((prev) => ({
-                    ...prev,
-                    schedule_time: event.target.value
-                  }))
-                }
+                onChange={handlePublicationScheduleChange}
                 disabled={isPublicationBusy || publicationFeatureUnavailable}
               />
             </div>
-            <div className="settings-publications-actions">
-              <button className="btn small" type="button" onClick={handleSavePublicationSettings} disabled={isPublicationBusy || publicationFeatureUnavailable}>
-                {savingPublicationSettings ? "Salvando..." : "Salvar automação"}
+            <div className="settings-publications-toggle-row">
+              <button
+                className={`settings-publication-toggle ${publicationForm.is_enabled ? "active" : ""}`}
+                type="button"
+                onClick={handlePublicationDownloadToggle}
+                disabled={isPublicationBusy || publicationFeatureUnavailable}
+                aria-pressed={publicationForm.is_enabled}
+              >
+                Baixar automaticamente
               </button>
-              <button className="btn ghost small" type="button" onClick={handleRunPublicationSync} disabled={isPublicationBusy || publicationFeatureUnavailable}>
-                {runningPublicationSync || publicationSettings?.is_running ? "Baixando..." : "Baixar agora"}
+              <button
+                className={`settings-publication-toggle ${publicationForm.email_enabled ? "active" : ""}`}
+                type="button"
+                onClick={handlePublicationEmailToggle}
+                disabled={isPublicationBusy || publicationFeatureUnavailable || !publicationForm.is_enabled}
+                aria-pressed={publicationForm.email_enabled}
+              >
+                Enviar por e-mail
               </button>
             </div>
-          </div>
-          <div className="settings-publications-meta">
-            <div className="settings-publications-meta-item">
-              <span>Última execução</span>
-              <strong>{publicationSettings?.last_run_at ? formatDateTimePtBr(publicationSettings.last_run_at) : "Ainda não executado"}</strong>
-            </div>
-            <div className="settings-publications-meta-item">
-              <span>Próxima execução</span>
-              <strong>{publicationSettings?.next_run_at ? formatDateTimePtBr(publicationSettings.next_run_at) : "--"}</strong>
-            </div>
-            <div className="settings-publications-meta-item">
-              <span>Último resultado</span>
-              <strong>
-                {publicationSettings
-                  ? `${publicationSettings.last_new_records} novas · ${publicationSettings.last_existing_records} repetidas`
-                  : "--"}
-              </strong>
-            </div>
-          </div>
-          <div className={`settings-publications-status ${publicationStatusTone}`}>
-            {publicationSettings?.last_message || "Configure o horário e clique em Baixar agora para iniciar a primeira varredura."}
-          </div>
-          <div className="settings-publications-list">
-            <div className="settings-publications-list-title">Últimas publicações baixadas</div>
-            {publicationRecentRecords.length === 0 ? (
-              <div className="settings-publications-empty">Nenhuma publicação automática baixada ainda.</div>
-            ) : (
-              publicationRecentRecords.map((record: PublicationAutomationRecord) => (
-                <div key={record.id} className="settings-publications-record">
-                  <div>
-                    <div className="settings-publications-record-title">{record.title}</div>
-                    <div className="settings-publications-record-meta">
-                      {record.case_number ? `Processo ${record.case_number}` : record.client_name || "Cliente vinculado"}
-                      {" · "}
-                      {getPublicationMatchLabel(record.matched_via)}
-                    </div>
-                  </div>
-                  <div className="settings-publications-record-date">{formatDateTimePtBr(record.created_at)}</div>
-                </div>
-              ))
-            )}
-          </div>
-          <div className="settings-note">
-            A rotina usa as OABs ativas da equipe no horário configurado. Se o app abrir depois desse horário, a execução pendente é recuperada automaticamente.
           </div>
         </div>
         <div className="settings-card update-card">
-          <div className="settings-title">Central de Atualizações NEWLAW</div>
+          <div className="settings-title">Atualizações do sistema</div>
           <div className="update-shell">
             <div className="update-info">
               <img className="update-logo" src="/logo_new_law_teste.png" alt="NEWLAW" />
               <div>
                 <div className="update-name">NEWLAW {appVersion}</div>
-                <div className="update-meta">{updateMeta}</div>
               </div>
             </div>
             <div className="update-actions">
-              <button className="btn secondary small" type="button" onClick={handleCheckForUpdates} disabled={!canCheckUpdate}>
-                {updateStatus === "checking" ? "Verificando..." : "Verificar atualização"}
-              </button>
-              <button className="btn small" type="button" onClick={handleInstallUpdate} disabled={!canInstallUpdate}>
-                {installingUpdate ? "Instalando..." : "Baixar e instalar"}
-              </button>
+              <div className="update-buttons">
+                <button className="btn secondary small" type="button" onClick={handleCheckForUpdates} disabled={!canCheckUpdate}>
+                  {updateStatus === "checking" ? "Verificando..." : "Verificar atualização"}
+                </button>
+                <button className="btn small" type="button" onClick={handleInstallUpdate} disabled={!canInstallUpdate}>
+                  {installingUpdate ? "Instalando..." : "Baixar e instalar"}
+                </button>
+              </div>
+              <div className={`update-status-line ${updateStatusTone}`} aria-live="polite">
+                {updateStatusLabel || "\u00a0"}
+              </div>
             </div>
           </div>
-          <div className="update-description">{updateDescription}</div>
-          <div className="update-footer">
-            <div className={`update-status ${updateStatus === "error" ? "error" : ""}`}>{updateStatusLabel}</div>
-            <button className="link-btn" type="button" onClick={handleCheckForUpdates} disabled={!canCheckUpdate}>
-              Verificar novamente
-            </button>
-            <a className="link-btn" href={manualUpdateUrl} target="_blank" rel="noreferrer">
-              Baixar manual
-            </a>
-          </div>
+        </div>
+        <div className="settings-logout-row">
+          <button className="btn small settings-logout-button" type="button" onClick={onLogout}>
+            Encerrar sessão
+          </button>
         </div>
       </div>
     </div>

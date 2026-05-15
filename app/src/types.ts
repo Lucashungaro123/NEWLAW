@@ -41,6 +41,7 @@ export interface LoginState {
   user: {
     email: string;
     name: string;
+    phone?: string | null;
     role: string;
     organization_name?: string | null;
     role_title?: string | null;

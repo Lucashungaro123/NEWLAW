@@ -15,6 +15,7 @@ export type AuthUser = {
   id: number;
   email: string;
   name: string;
+  phone?: string | null;
   oab?: string | null;
   role: string;
   organization_id?: number | null;
@@ -439,6 +440,7 @@ export type PublicationSearchByOabPayload = {
 export type PublicationAutomationSettings = {
   organization_id: number;
   is_enabled: boolean;
+  email_enabled: boolean;
   schedule_time: string;
   last_run_at?: string | null;
   next_run_at?: string | null;
@@ -452,6 +454,7 @@ export type PublicationAutomationSettings = {
 };
 export type UpdatePublicationAutomationPayload = {
   is_enabled: boolean;
+  email_enabled: boolean;
   schedule_time: string;
 };
 export type RunPublicationAutomationResponse = {

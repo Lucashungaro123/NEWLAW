@@ -354,6 +354,7 @@ def serialize_auth_user(session: Session, user: User) -> dict:
         "id": user.id,
         "email": user.email,
         "name": user.full_name,
+        "phone": user.phone,
         "role": user.role,
         "organization_id": user.organization_id,
         "organization_name": organization.name if organization else None,
