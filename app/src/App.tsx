@@ -6374,6 +6374,179 @@ function NewLawAssistantModal({
   );
 }
 
+type HomeAgendaEditForm = {
+  title: string;
+  dueDate: string;
+  startTime: string;
+  endTime: string;
+  eventType: InternalAgendaEventType;
+  assignees: string;
+  meetingUrl: string;
+  reference: string;
+  notes: string;
+  isAllDay: boolean;
+  isCompleted: boolean;
+};
+
+const getAgendaTimeInputValue = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", hour12: false });
+};
+
+const buildHomeAgendaEditForm = (item: AgendaItem): HomeAgendaEditForm => ({
+  title: item.title || "",
+  dueDate: getAgendaDateKey(item.starts_at),
+  startTime: item.is_all_day ? "" : getAgendaTimeInputValue(item.starts_at),
+  endTime: item.is_all_day ? "" : getAgendaTimeInputValue(item.ends_at),
+  eventType: (item.event_type || (item.kind === "deadline" ? "deadline" : "task")) as InternalAgendaEventType,
+  assignees: item.assignees || item.assignee_name || "",
+  meetingUrl: item.meeting_url || "",
+  reference: item.reference || "",
+  notes: item.description || "",
+  isAllDay: item.is_all_day,
+  isCompleted: isAgendaItemCompleted(item)
+});
+
+function HomeAgendaEditModal({
+  item,
+  form,
+  saving,
+  deleting,
+  errorMessage,
+  onClose,
+  onChange,
+  onSave,
+  onDelete
+}: {
+  item: AgendaItem | null;
+  form: HomeAgendaEditForm;
+  saving: boolean;
+  deleting: boolean;
+  errorMessage: string;
+  onClose: () => void;
+  onChange: (field: keyof HomeAgendaEditForm, value: string | boolean) => void;
+  onSave: (event: React.FormEvent) => void;
+  onDelete: () => void;
+}) {
+  if (!item) return null;
+  const isBusy = saving || deleting;
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card home-agenda-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Editar compromisso</h2>
+            <div className="publication-meta">
+              {agendaEventTagLabel(item)} · {agendaSourceLabel(item.source)}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={isBusy}>
+            ×
+          </button>
+        </div>
+
+        {errorMessage && <div className="error">{errorMessage}</div>}
+
+        <form onSubmit={onSave}>
+          <div className="modal-grid home-agenda-modal-grid">
+            <div className="field span-2">
+              <label>Título *</label>
+              <input value={form.title} onChange={(event) => onChange("title", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Tipo</label>
+              <select value={form.eventType} onChange={(event) => onChange("eventType", event.target.value as InternalAgendaEventType)}>
+                {internalAgendaTypeOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>Status</label>
+              <label className="home-agenda-check">
+                <input type="checkbox" checked={form.isCompleted} onChange={(event) => onChange("isCompleted", event.target.checked)} />
+                <span>{form.isCompleted ? "Concluído" : "Em aberto"}</span>
+              </label>
+            </div>
+            <div className="field">
+              <label>Data *</label>
+              <input type="date" value={form.dueDate} onChange={(event) => onChange("dueDate", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Dia inteiro</label>
+              <label className="home-agenda-check">
+                <input type="checkbox" checked={form.isAllDay} onChange={(event) => onChange("isAllDay", event.target.checked)} />
+                <span>{form.isAllDay ? "Sem horário" : "Com horário"}</span>
+              </label>
+            </div>
+            <div className="field">
+              <label>Início</label>
+              <input
+                type="time"
+                value={form.startTime}
+                onChange={(event) => onChange("startTime", event.target.value)}
+                disabled={form.isAllDay}
+              />
+            </div>
+            <div className="field">
+              <label>Fim</label>
+              <input
+                type="time"
+                value={form.endTime}
+                onChange={(event) => onChange("endTime", event.target.value)}
+                disabled={form.isAllDay}
+              />
+            </div>
+            <div className="field span-2">
+              <label>Responsáveis</label>
+              <input
+                value={form.assignees}
+                onChange={(event) => onChange("assignees", event.target.value)}
+                placeholder="Nome ou e-mail; separe por ponto e vírgula"
+              />
+            </div>
+            <div className="field">
+              <label>Referência</label>
+              <input value={form.reference} onChange={(event) => onChange("reference", event.target.value)} placeholder="Processo/cliente" />
+            </div>
+            <div className="field">
+              <label>Link</label>
+              <input value={form.meetingUrl} onChange={(event) => onChange("meetingUrl", event.target.value)} placeholder="https://..." />
+            </div>
+            <div className="field span-2">
+              <label>Comentários</label>
+              <textarea
+                className="home-agenda-comments"
+                value={form.notes}
+                onChange={(event) => onChange("notes", event.target.value)}
+                placeholder="Anotações, andamento, providências tomadas ou próximos passos."
+              />
+            </div>
+          </div>
+
+          <div className="modal-actions home-agenda-modal-actions">
+            <button className="btn ghost danger" type="button" onClick={onDelete} disabled={isBusy}>
+              {deleting ? "Removendo..." : "Remover"}
+            </button>
+            <div className="home-agenda-modal-actions-right">
+              <button className="btn ghost" type="button" onClick={onClose} disabled={isBusy}>
+                Cancelar
+              </button>
+              <button className="btn" type="submit" disabled={isBusy || !form.title.trim() || !form.dueDate}>
+                {saving ? "Salvando..." : "Salvar alterações"}
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function Home({ user }: { user: AuthUser | null }) {
   const [clock, setClock] = useState(() => new Date());
   const [events, setEvents] = useState<AgendaItem[]>([]);
@@ -6381,6 +6554,23 @@ function Home({ user }: { user: AuthUser | null }) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
   const [updatingTaskIds, setUpdatingTaskIds] = useState<number[]>([]);
+  const [selectedHomeAgendaItem, setSelectedHomeAgendaItem] = useState<AgendaItem | null>(null);
+  const [homeAgendaForm, setHomeAgendaForm] = useState<HomeAgendaEditForm>(() => ({
+    title: "",
+    dueDate: formatIsoDate(new Date()),
+    startTime: "",
+    endTime: "",
+    eventType: "deadline",
+    assignees: "",
+    meetingUrl: "",
+    reference: "",
+    notes: "",
+    isAllDay: true,
+    isCompleted: false
+  }));
+  const [homeAgendaModalError, setHomeAgendaModalError] = useState("");
+  const [isSavingHomeAgenda, setIsSavingHomeAgenda] = useState(false);
+  const [isDeletingHomeAgenda, setIsDeletingHomeAgenda] = useState(false);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setClock(new Date()), 30000);
@@ -6547,6 +6737,93 @@ function Home({ user }: { user: AuthUser | null }) {
     }
   };
 
+  const handleOpenHomeAgendaItem = (item: AgendaItem) => {
+    if (item.source !== "internal") return;
+    setSelectedHomeAgendaItem(item);
+    setHomeAgendaForm(buildHomeAgendaEditForm(item));
+    setHomeAgendaModalError("");
+  };
+
+  const handleCloseHomeAgendaModal = () => {
+    if (isSavingHomeAgenda || isDeletingHomeAgenda) return;
+    setSelectedHomeAgendaItem(null);
+    setHomeAgendaModalError("");
+  };
+
+  const handleChangeHomeAgendaForm = (field: keyof HomeAgendaEditForm, value: string | boolean) => {
+    setHomeAgendaModalError("");
+    setHomeAgendaForm((prev) => ({
+      ...prev,
+      [field]: value,
+      ...(field === "isAllDay" && value === true ? { startTime: "", endTime: "" } : {})
+    }));
+  };
+
+  const handleSubmitHomeAgendaForm = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selectedHomeAgendaItem) return;
+    if (!homeAgendaForm.title.trim() || !homeAgendaForm.dueDate) return;
+    if (!homeAgendaForm.isAllDay && homeAgendaForm.endTime && !homeAgendaForm.startTime) {
+      setHomeAgendaModalError("Preencha o horário de início antes do horário final.");
+      return;
+    }
+    if (!homeAgendaForm.isAllDay && homeAgendaForm.startTime && homeAgendaForm.endTime && homeAgendaForm.endTime <= homeAgendaForm.startTime) {
+      setHomeAgendaModalError("O horário final deve ser maior que o horário de início.");
+      return;
+    }
+
+    const dueDateValue =
+      !homeAgendaForm.isAllDay && homeAgendaForm.startTime
+        ? `${homeAgendaForm.dueDate}T${homeAgendaForm.startTime}:00`
+        : homeAgendaForm.dueDate;
+    setIsSavingHomeAgenda(true);
+    setHomeAgendaModalError("");
+    try {
+      const updated = await apiUpdateAgendaDeadline(selectedHomeAgendaItem.entity_id, {
+        title: homeAgendaForm.title.trim(),
+        due_date: dueDateValue,
+        reference: homeAgendaForm.reference.trim(),
+        notes: homeAgendaForm.notes.trim(),
+        event_type: homeAgendaForm.eventType,
+        meeting_url: homeAgendaForm.meetingUrl.trim(),
+        assignees: homeAgendaForm.assignees.trim(),
+        end_time: homeAgendaForm.isAllDay ? "" : homeAgendaForm.endTime,
+        is_all_day: homeAgendaForm.isAllDay,
+        is_completed: homeAgendaForm.isCompleted
+      });
+      setEvents((prev) => prev.map((entry) => (entry.id === selectedHomeAgendaItem.id ? updated : entry)));
+      setSelectedHomeAgendaItem(updated);
+      setHomeAgendaForm(buildHomeAgendaEditForm(updated));
+    } catch (err) {
+      setHomeAgendaModalError(extractApiErrorMessage(err, "Não foi possível salvar o compromisso."));
+    } finally {
+      setIsSavingHomeAgenda(false);
+    }
+  };
+
+  const handleDeleteHomeAgendaItem = async () => {
+    if (!selectedHomeAgendaItem) return;
+    const confirmed = window.confirm("Remover este compromisso da agenda?");
+    if (!confirmed) return;
+    setIsDeletingHomeAgenda(true);
+    setHomeAgendaModalError("");
+    try {
+      await apiDeleteAgendaDeadline(selectedHomeAgendaItem.entity_id);
+      setEvents((prev) => prev.filter((entry) => entry.id !== selectedHomeAgendaItem.id));
+      setSelectedHomeAgendaItem(null);
+    } catch (err) {
+      setHomeAgendaModalError(extractApiErrorMessage(err, "Não foi possível remover o compromisso."));
+    } finally {
+      setIsDeletingHomeAgenda(false);
+    }
+  };
+
+  const handleHomeAgendaItemKeyDown = (event: React.KeyboardEvent, item: AgendaItem) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    handleOpenHomeAgendaItem(item);
+  };
+
   const weekDayItems = useMemo(
     () =>
       Array.from({ length: 7 }, (_, index) => {
@@ -6618,7 +6895,14 @@ function Home({ user }: { user: AuthUser | null }) {
               <div className="home-focus-list">
                 {fatalDeadlinesToday.length > 0 ? (
                   fatalDeadlinesToday.map((item) => (
-                    <div key={item.id} className="home-focus-item">
+                    <div
+                      key={item.id}
+                      className="home-focus-item clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
                       <div className="home-focus-main">
                         <div>
                           <div className="home-focus-title">{item.title}</div>
@@ -6645,7 +6929,14 @@ function Home({ user }: { user: AuthUser | null }) {
               <div className="home-focus-list">
                 {hearingsWeek.length > 0 ? (
                   hearingsWeek.map((item) => (
-                    <div key={item.id} className="home-focus-item">
+                    <div
+                      key={item.id}
+                      className="home-focus-item clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
                       <div className="home-focus-main">
                         <span className="home-focus-pill blue">{agendaEventTagLabel(item).slice(0, 3).toUpperCase()}</span>
                         <div>
@@ -6676,7 +6967,14 @@ function Home({ user }: { user: AuthUser | null }) {
               <div className="home-focus-list">
                 {pendingDeadlinesWeek.length > 0 ? (
                   pendingDeadlinesWeek.map((item) => (
-                    <div key={item.id} className="home-focus-item">
+                    <div
+                      key={item.id}
+                      className="home-focus-item clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
                       <div className="home-focus-main">
                         <span className="home-focus-pill amber">
                           {weekDays[new Date(item.starts_at).getDay() === 0 ? 6 : new Date(item.starts_at).getDay() - 1]}
@@ -6709,11 +7007,21 @@ function Home({ user }: { user: AuthUser | null }) {
                     const done = isAgendaItemDone(item);
                     const isUpdating = updatingTaskIds.includes(item.entity_id);
                     return (
-                    <div key={item.id} className={`home-task-item ${done ? "done" : ""}`}>
+                    <div
+                      key={item.id}
+                      className={`home-task-item clickable ${done ? "done" : ""}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
                       <button
                         type="button"
                         className={`home-task-check ${done ? "done" : ""}`}
-                        onClick={() => void handleToggleHomeTask(item)}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleToggleHomeTask(item);
+                        }}
                         disabled={isUpdating}
                         aria-label={done ? `Desmarcar tarefa ${item.title}` : `Marcar tarefa ${item.title} como concluída`}
                         aria-pressed={done}
@@ -6735,28 +7043,27 @@ function Home({ user }: { user: AuthUser | null }) {
 
           </div>
       )}
+      <HomeAgendaEditModal
+        item={selectedHomeAgendaItem}
+        form={homeAgendaForm}
+        saving={isSavingHomeAgenda}
+        deleting={isDeletingHomeAgenda}
+        errorMessage={homeAgendaModalError}
+        onClose={handleCloseHomeAgendaModal}
+        onChange={handleChangeHomeAgendaForm}
+        onSave={handleSubmitHomeAgendaForm}
+        onDelete={handleDeleteHomeAgendaItem}
+      />
     </div>
   );
 }
 
-const dashboardPalette = ["#e1ba3b", "#54c3c1", "#5f95e6", "#ff6b6b", "#a256ed", "#37c978"];
+const dashboardPalette = ["#2f66b3", "#2d8f83", "#c4841d", "#7c6fd8", "#c95d5d", "#667085"];
 
 const formatDashboardTrend = (value: number | null | undefined) => {
   if (value == null || !Number.isFinite(value)) return "sem base";
   const rounded = value.toFixed(Math.abs(value) >= 10 ? 0 : 1).replace(".", ",");
   return `${value > 0 ? "+" : ""}${rounded}%`;
-};
-
-const buildDashboardConicGradient = (items: Array<{ value: number; color: string }>) => {
-  const total = items.reduce((sum, item) => sum + item.value, 0);
-  if (total <= 0) return "conic-gradient(rgba(255,255,255,0.08) 0 100%)";
-  let cursor = 0;
-  const stops = items.map((item) => {
-    const start = cursor;
-    cursor += (item.value / total) * 100;
-    return `${item.color} ${start}% ${cursor}%`;
-  });
-  return `conic-gradient(${stops.join(", ")})`;
 };
 
 function Dashboard() {
@@ -6767,6 +7074,10 @@ function Dashboard() {
   const [agendaItems, setAgendaItems] = useState<AgendaItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
+  const [selectedRevenueMonthKey, setSelectedRevenueMonthKey] = useState("");
+  const [selectedRevenueDayKey, setSelectedRevenueDayKey] = useState("");
+  const [selectedTeamName, setSelectedTeamName] = useState("");
+  const [selectedTeamMemberId, setSelectedTeamMemberId] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -6858,6 +7169,8 @@ function Dashboard() {
     [revenueEntries]
   );
   const receiptRate = expectedRevenue > 0 ? Math.round((receivedRevenue / expectedRevenue) * 100) : 0;
+  const openRevenue = Math.max(expectedRevenue - receivedRevenue, 0);
+  const overdueRevenueShare = expectedRevenue > 0 ? Math.round((overdueRevenue / expectedRevenue) * 100) : 0;
   const casesById = useMemo(() => new Map(cases.map((item) => [item.id, item] as const)), [cases]);
   const casesByNumber = useMemo(
     () => new Map(cases.map((item) => [normalizeCaseDigits(item.number), item] as const)),
@@ -6883,13 +7196,13 @@ function Dashboard() {
       counts.set(item.status, (counts.get(item.status) || 0) + 1);
     });
     return [
-      { label: "Ativos", value: counts.get("Ativo") || 0, color: "#5f95e6" },
-      { label: "Em andamento", value: counts.get("Em andamento") || 0, color: "#37c978" },
-      { label: "Arquivados", value: counts.get("Arquivado") || 0, color: "#ffb020" }
+      { label: "Ativos", value: counts.get("Ativo") || 0, color: "#2f66b3" },
+      { label: "Em andamento", value: counts.get("Em andamento") || 0, color: "#2d8f83" },
+      { label: "Arquivados", value: counts.get("Arquivado") || 0, color: "#667085" }
     ];
   }, [normalizedCaseRows]);
   const totalStatusCases = statusDistribution.reduce((sum, item) => sum + item.value, 0);
-  const donutGradient = useMemo(() => buildDashboardConicGradient(statusDistribution), [statusDistribution]);
+  const archivedCases = statusDistribution.find((item) => item.label === "Arquivados")?.value || 0;
 
   const activeMembers = members.filter((member) => member.is_active).length;
   const activeTeamsCount = new Set(
@@ -6899,22 +7212,46 @@ function Dashboard() {
       .filter(Boolean)
   ).size;
   const membersByTeam = useMemo(() => {
-    const counts = new Map<string, number>();
+    const buckets = new Map<
+      string,
+      { label: string; active: number; inactive: number; total: number; members: ApiTeamMember[] }
+    >();
     members.forEach((member) => {
-      if (!member.is_active) return;
       const label = member.team_name.trim() || member.role_title.trim() || "Sem equipe";
-      counts.set(label, (counts.get(label) || 0) + 1);
+      const current = buckets.get(label) || { label, active: 0, inactive: 0, total: 0, members: [] };
+      current.total += 1;
+      current.members.push(member);
+      if (member.is_active) {
+        current.active += 1;
+      } else {
+        current.inactive += 1;
+      }
+      buckets.set(label, current);
     });
-    return [...counts.entries()]
-      .map(([label, value], index) => ({
-        label,
-        value,
+    return [...buckets.values()]
+      .sort((left, right) => right.active - left.active || right.total - left.total || left.label.localeCompare(right.label, "pt-BR"))
+      .slice(0, 8)
+      .map((item, index) => ({
+        ...item,
         color: dashboardPalette[index % dashboardPalette.length]
-      }))
-      .sort((left, right) => right.value - left.value)
-      .slice(0, 6);
+      }));
   }, [members]);
-  const maxMembersByTeam = Math.max(...membersByTeam.map((item) => item.value), 1);
+  const maxMembersByTeam = Math.max(...membersByTeam.map((item) => item.total), 1);
+  const selectedTeamLabel =
+    selectedTeamName && membersByTeam.some((item) => item.label === selectedTeamName)
+      ? selectedTeamName
+      : membersByTeam[0]?.label || "";
+  const selectedTeam = membersByTeam.find((item) => item.label === selectedTeamLabel) || null;
+  const selectedTeamMembers = useMemo(
+    () =>
+      [...(selectedTeam?.members || [])].sort((left, right) => {
+        if (left.is_active !== right.is_active) return left.is_active ? -1 : 1;
+        return left.full_name.localeCompare(right.full_name, "pt-BR");
+      }),
+    [selectedTeam]
+  );
+  const selectedTeamMember =
+    selectedTeamMembers.find((member) => member.id === selectedTeamMemberId) || selectedTeamMembers[0] || null;
 
   const successByWallet = useMemo(() => {
     const buckets = new Map<string, { expected: number; received: number }>();
@@ -6987,25 +7324,119 @@ function Dashboard() {
       })),
     [monthlyRevenueScale]
   );
-  const monthlyRevenuePoints = useMemo(
+  const monthlyRevenueBars = useMemo(
     () =>
-      monthlyRevenueValues.map((value, index) => ({
-        value,
-        x: monthlyRevenueValues.length === 1 ? 50 : (index / (monthlyRevenueValues.length - 1)) * 100,
-        y: ((monthlyRevenueScale.max - value) / monthlyRevenueScale.range) * 100
-      })),
-    [monthlyRevenueScale, monthlyRevenueValues]
+      monthlyRevenueSeries.map((item) => {
+        const percent = monthlyRevenueScale.max > 0 ? (item.value / monthlyRevenueScale.max) * 100 : 0;
+        return {
+          ...item,
+          height: `${item.value > 0 ? Math.max(8, percent) : 0}%`
+        };
+    }),
+    [monthlyRevenueScale.max, monthlyRevenueSeries]
   );
-  const monthlyRevenueLine = useMemo(() => buildSmoothChartPath(monthlyRevenuePoints), [monthlyRevenuePoints]);
-  const monthlyRevenueArea = useMemo(() => {
-    if (!monthlyRevenuePoints.length) return "";
-    const first = monthlyRevenuePoints[0];
-    const last = monthlyRevenuePoints[monthlyRevenuePoints.length - 1];
-    return `${monthlyRevenueLine} L ${last.x} 100 L ${first.x} 100 Z`;
-  }, [monthlyRevenueLine, monthlyRevenuePoints]);
+  const defaultRevenueMonthKey =
+    [...monthlyRevenueSeries].reverse().find((item) => item.value > 0)?.key ||
+    monthlyRevenueSeries[monthlyRevenueSeries.length - 1]?.key ||
+    "";
+  const activeRevenueMonthKey =
+    selectedRevenueMonthKey && monthlyRevenueSeries.some((item) => item.key === selectedRevenueMonthKey)
+      ? selectedRevenueMonthKey
+      : defaultRevenueMonthKey;
+  const isRevenueDayView = Boolean(selectedRevenueMonthKey && monthlyRevenueSeries.some((item) => item.key === selectedRevenueMonthKey));
+  const selectedRevenueMonth = monthlyRevenueSeries.find((item) => item.key === activeRevenueMonthKey) || monthlyRevenueSeries[0];
+  const selectedRevenueMonthEntries = useMemo(() => {
+    if (!activeRevenueMonthKey) return [];
+    return revenueEntries
+      .filter((entry) => {
+        const settledAmount = getFinanceSettledAmount(entry);
+        if (settledAmount <= 0) return false;
+        const reference = toDateStart(entry.paymentDate || entry.dueDate);
+        if (!reference) return false;
+        const key = `${reference.getFullYear()}-${String(reference.getMonth() + 1).padStart(2, "0")}`;
+        return key === activeRevenueMonthKey;
+      })
+      .sort((left, right) => getFinanceSettledAmount(right) - getFinanceSettledAmount(left));
+  }, [activeRevenueMonthKey, revenueEntries]);
+  const selectedRevenueMonthReceived = selectedRevenueMonthEntries.reduce(
+    (sum, entry) => sum + getFinanceSettledAmount(entry),
+    0
+  );
+  const selectedRevenueMonthExpected = selectedRevenueMonthEntries.reduce((sum, entry) => sum + entry.amount, 0);
+  const selectedRevenueMonthOpen = Math.max(selectedRevenueMonthExpected - selectedRevenueMonthReceived, 0);
+  const dailyRevenueSeries = useMemo(() => {
+    const [year, month] = activeRevenueMonthKey.split("-").map(Number);
+    if (!year || !month) return [];
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const buckets = Array.from({ length: daysInMonth }, (_, index) => {
+      const day = index + 1;
+      return {
+        key: `${activeRevenueMonthKey}-${String(day).padStart(2, "0")}`,
+        label: String(day),
+        dateLabel: `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}`,
+        value: 0,
+        expected: 0,
+        entries: [] as FinanceEntry[]
+      };
+    });
+    selectedRevenueMonthEntries.forEach((entry) => {
+      const reference = toDateStart(entry.paymentDate || entry.dueDate);
+      if (!reference) return;
+      const bucket = buckets[reference.getDate() - 1];
+      if (!bucket) return;
+      bucket.value += getFinanceSettledAmount(entry);
+      bucket.expected += entry.amount;
+      bucket.entries.push(entry);
+    });
+    return buckets;
+  }, [activeRevenueMonthKey, selectedRevenueMonthEntries]);
+  const dailyRevenueValues = dailyRevenueSeries.map((item) => item.value);
+  const dailyRevenueScale = useMemo(() => buildNiceChartScale(dailyRevenueValues, 4), [dailyRevenueValues]);
+  const dailyRevenueTicks = useMemo(
+    () =>
+      [...dailyRevenueScale.ticks].reverse().map((tick) => ({
+        value: tick,
+        label: formatCurrencyAxis(tick),
+        top: `${((dailyRevenueScale.max - tick) / dailyRevenueScale.range) * 100}%`
+      })),
+    [dailyRevenueScale]
+  );
+  const dailyRevenueBars = useMemo(
+    () =>
+      dailyRevenueSeries.map((item, index) => {
+        const percent = dailyRevenueScale.max > 0 ? (item.value / dailyRevenueScale.max) * 100 : 0;
+        const isEdge = index === 0 || index === dailyRevenueSeries.length - 1;
+        return {
+          ...item,
+          height: `${item.value > 0 ? Math.max(10, percent) : 0}%`,
+          showLabel: isEdge || item.value > 0 || (index + 1) % 5 === 0
+        };
+      }),
+    [dailyRevenueScale.max, dailyRevenueSeries]
+  );
+  const defaultRevenueDayKey =
+    [...dailyRevenueSeries].sort((left, right) => right.value - left.value)[0]?.key || dailyRevenueSeries[0]?.key || "";
+  const activeRevenueDayKey =
+    selectedRevenueDayKey && dailyRevenueSeries.some((item) => item.key === selectedRevenueDayKey)
+      ? selectedRevenueDayKey
+      : defaultRevenueDayKey;
+  const selectedRevenueDay = dailyRevenueSeries.find((item) => item.key === activeRevenueDayKey) || dailyRevenueSeries[0];
+  const selectedRevenueDayEntries = useMemo(
+    () =>
+      [...(selectedRevenueDay?.entries || [])].sort(
+        (left, right) => getFinanceSettledAmount(right) - getFinanceSettledAmount(left)
+      ),
+    [selectedRevenueDay]
+  );
+  const selectedRevenueDayReceived = selectedRevenueDayEntries.reduce((sum, entry) => sum + getFinanceSettledAmount(entry), 0);
+  const selectedRevenueDayExpected = selectedRevenueDayEntries.reduce((sum, entry) => sum + entry.amount, 0);
+  const selectedRevenueDayOpen = Math.max(selectedRevenueDayExpected - selectedRevenueDayReceived, 0);
+  const revenueChartTicks = isRevenueDayView ? dailyRevenueTicks : monthlyRevenueTicks;
   const currentMonthRevenue = monthlyRevenueSeries[monthlyRevenueSeries.length - 1]?.value || 0;
   const previousMonthRevenue = monthlyRevenueSeries[monthlyRevenueSeries.length - 2]?.value || 0;
   const revenueTrend = previousMonthRevenue > 0 ? ((currentMonthRevenue - previousMonthRevenue) / previousMonthRevenue) * 100 : null;
+  const revenueTrendLabel =
+    revenueTrend != null ? `${formatDashboardTrend(revenueTrend)} no mês` : currentMonthRevenue > 0 ? "novo recebimento" : "sem base";
 
   const criticalDeadlinesCount = useMemo(() => {
     const today = new Date();
@@ -7021,6 +7452,42 @@ function Dashboard() {
       return diff >= 0 && diff <= 7;
     }).length;
   }, [agendaItems]);
+  const upcomingAgendaItems = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const weekEnd = new Date(today);
+    weekEnd.setDate(weekEnd.getDate() + 7);
+    return agendaItems
+      .filter((item) => {
+        if (item.source !== "internal") return false;
+        if (item.event_type !== "deadline" && item.event_type !== "hearing") return false;
+        if ((item.status || "").toLowerCase() === "concluido") return false;
+        const startsAt = new Date(item.starts_at);
+        if (Number.isNaN(startsAt.getTime())) return false;
+        return startsAt >= today && startsAt <= weekEnd;
+      })
+      .sort((left, right) => new Date(left.starts_at).getTime() - new Date(right.starts_at).getTime())
+      .slice(0, 5);
+  }, [agendaItems]);
+  const nextAgendaItem = upcomingAgendaItems[0];
+  const overdueRevenueItems = useMemo(
+    () =>
+      revenueEntries
+        .filter((entry) => getFinanceStatus(entry) === "Vencido")
+        .sort((left, right) => {
+          const leftDate = toDateStart(left.dueDate)?.getTime() || 0;
+          const rightDate = toDateStart(right.dueDate)?.getTime() || 0;
+          return leftDate - rightDate;
+        }),
+    [revenueEntries]
+  );
+  const weakestWallet = useMemo(
+    () =>
+      [...successByWallet]
+        .filter((item) => item.expected > 0)
+        .sort((left, right) => left.rate - right.rate || right.expected - left.expected)[0],
+    [successByWallet]
+  );
 
   const paidClients = new Set(
     revenueEntries
@@ -7031,66 +7498,134 @@ function Dashboard() {
   const averageTicket = paidClients > 0 ? receivedRevenue / paidClients : 0;
   const activeMemberShare = members.length > 0 ? Math.round((activeMembers / members.length) * 100) : 0;
   const indicators = [
-    { label: "Receita prevista", value: formatCurrencyBRL(expectedRevenue), note: "Base de 12 meses" },
-    { label: "Receita em atraso", value: formatCurrencyBRL(overdueRevenue), note: "Lançamentos vencidos" },
-    { label: "Ticket médio", value: formatCurrencyBRL(averageTicket), note: "Por cliente pagante" },
+    { label: "A receber", value: formatCurrencyBRL(openRevenue), note: "Previsto menos recebido" },
+    { label: "Inadimplência", value: `${overdueRevenueShare}%`, note: `${formatCurrencyBRL(overdueRevenue)} em lançamentos vencidos` },
+    { label: "Clientes pagantes", value: String(paidClients), note: `${clients.length} cadastrados · ticket ${formatCurrencyAxis(averageTicket)}` },
     { label: "Equipe ativa", value: `${activeMemberShare}%`, note: `${activeMembers}/${members.length || 0} membros ativos` }
   ];
+  const inactiveMembers = Math.max(members.length - activeMembers, 0);
+  const selectedMemberAgendaItems = useMemo(() => {
+    if (!selectedTeamMember) return [];
+    const memberName = normalizeSearchText(selectedTeamMember.full_name);
+    const memberEmail = normalizeSearchText(selectedTeamMember.email);
+    return agendaItems
+      .filter((item) => {
+        if (item.source !== "internal") return false;
+        if ((item.status || "").toLowerCase() === "concluido") return false;
+        const haystack = normalizeSearchText([item.assignee_name, item.assignees].filter(Boolean).join(" "));
+        return Boolean(haystack) && (haystack.includes(memberName) || (memberEmail && haystack.includes(memberEmail)));
+      })
+      .sort((left, right) => new Date(left.starts_at).getTime() - new Date(right.starts_at).getTime())
+      .slice(0, 4);
+  }, [agendaItems, selectedTeamMember]);
+  const dashboardAttentionItems = [
+    overdueRevenue > 0
+      ? {
+          tone: "red",
+          label: "Financeiro",
+          title: `${formatCurrencyAxis(overdueRevenue)} em atraso`,
+          note: `${overdueRevenueItems.length} lançamento(s) vencido(s)${
+            overdueRevenueItems[0]?.client ? ` · ${overdueRevenueItems[0].client}` : ""
+          }`
+        }
+      : null,
+    criticalDeadlinesCount > 0
+      ? {
+          tone: "amber",
+          label: "Agenda",
+          title: `${criticalDeadlinesCount} prazo(s) nos próximos 7 dias`,
+          note: nextAgendaItem
+            ? `${formatBrazilDate(getAgendaDateKey(nextAgendaItem.starts_at))} · ${formatAgendaTime(
+                nextAgendaItem.starts_at,
+                nextAgendaItem.ends_at,
+                nextAgendaItem.is_all_day
+              )} · ${nextAgendaItem.title}`
+            : "Revisar agenda interna"
+        }
+      : null,
+    weakestWallet && weakestWallet.rate < 80
+      ? {
+          tone: "blue",
+          label: "Carteira",
+          title: `${weakestWallet.label} com ${weakestWallet.rate}% recebido`,
+          note: `${formatCurrencyAxis(weakestWallet.received)} recebidos de ${formatCurrencyAxis(weakestWallet.expected)}`
+        }
+      : null,
+    inactiveMembers > 0
+      ? {
+          tone: "slate",
+          label: "Equipe",
+          title: `${inactiveMembers} membro(s) inativo(s)`,
+          note: `${activeMembers} ativos de ${members.length} cadastrados`
+        }
+      : null
+  ].filter(Boolean) as Array<{ tone: "red" | "amber" | "blue" | "slate" | "green"; label: string; title: string; note: string }>;
+  const resolvedDashboardAttentionItems =
+    dashboardAttentionItems.length > 0
+      ? dashboardAttentionItems
+      : [
+          {
+            tone: "green" as const,
+            label: "Operação",
+            title: "Sem sinais críticos agora",
+            note: "Receitas, agenda e equipe sem alertas nos dados carregados."
+          }
+        ];
 
   const kpis = [
     {
       id: "revenue",
       icon: "R$",
-      tone: "gold",
+      tone: "blue",
       value: formatCurrencyAxis(receivedRevenue),
       label: "Receita recebida",
       note: "Últimos 12 meses",
-      trend: formatDashboardTrend(revenueTrend)
+      trend: revenueTrendLabel
     },
     {
-      id: "success",
-      icon: "EX",
+      id: "forecast",
+      icon: "%",
       tone: "green",
       value: `${receiptRate}%`,
-      label: "Taxa de êxito",
-      note: "Recebido sobre previsto",
-      trend: `${formatCurrencyAxis(receivedRevenue)} de ${formatCurrencyAxis(expectedRevenue)}`
+      label: "Recebimento",
+      note: `${formatCurrencyAxis(receivedRevenue)} de ${formatCurrencyAxis(expectedRevenue)}`,
+      trend: `${formatCurrencyAxis(openRevenue)} em aberto`
     },
     {
-      id: "cases",
-      icon: "PC",
-      tone: "blue",
-      value: String(activeCases),
-      label: "Processos ativos",
-      note: `${cases.length} cadastrados`,
-      trend: `${statusDistribution[2]?.value || 0} arquivados`
+      id: "overdue",
+      icon: "AT",
+      tone: overdueRevenue > 0 ? "red" : "slate",
+      value: formatCurrencyAxis(overdueRevenue),
+      label: "Receita em atraso",
+      note: "Lançamentos vencidos",
+      trend: `${overdueRevenueShare}% da base`
     },
     {
       id: "deadlines",
       icon: "PR",
-      tone: "red",
+      tone: "amber",
       value: String(criticalDeadlinesCount),
-      label: "Prazos críticos",
-      note: "Próximos 7 dias",
-      trend: "Agenda interna"
+      label: "Prazos em 7 dias",
+      note: "Prazos e audiências",
+      trend: "agenda"
+    },
+    {
+      id: "cases",
+      icon: "PC",
+      tone: "indigo",
+      value: String(activeCases),
+      label: "Processos ativos",
+      note: `${cases.length} no acervo`,
+      trend: `${archivedCases} arquivados`
     },
     {
       id: "team",
       icon: "EQ",
-      tone: "violet",
+      tone: "slate",
       value: String(activeMembers),
-      label: "Membros ativos",
+      label: "Equipe ativa",
       note: `${activeTeamsCount} equipes`,
       trend: `${members.length} cadastrados`
-    },
-    {
-      id: "clients",
-      icon: "CL",
-      tone: "amber",
-      value: String(clients.length),
-      label: "Clientes cadastrados",
-      note: `${paidClients} pagantes`,
-      trend: `Ticket ${formatCurrencyAxis(averageTicket)}`
     }
   ];
 
@@ -7127,50 +7662,145 @@ function Dashboard() {
             ))}
           </div>
 
+          <section className="dashboard-panel dashboard-operations-panel">
+            <div className="dashboard-panel-head">
+              <div>
+                <div className="dashboard-panel-title">Sinais de atenção</div>
+                <div className="dashboard-panel-caption">Prioridades operacionais com base nos dados carregados.</div>
+              </div>
+            </div>
+            <div className="dashboard-operations-grid">
+              <div className="dashboard-attention-list">
+                {resolvedDashboardAttentionItems.map((item) => (
+                  <div key={`${item.label}-${item.title}`} className={`dashboard-attention-item tone-${item.tone}`}>
+                    <span>{item.label}</span>
+                    <strong>{item.title}</strong>
+                    <p>{item.note}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="dashboard-indicators-grid dashboard-indicators-grid-compact">
+                {indicators.map((item) => (
+                  <div key={item.label} className="dashboard-indicator-card">
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <p>{item.note}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+
           <div className="dashboard-main-grid">
             <section className="dashboard-panel dashboard-panel-wide">
               <div className="dashboard-panel-head">
                 <div>
-                  <div className="dashboard-panel-title">Evolução mensal de receita</div>
-                  <div className="dashboard-panel-caption">Receitas efetivamente recebidas nos últimos 12 meses.</div>
+                  <div className="dashboard-panel-title">
+                    {isRevenueDayView ? "Receita recebida por dia" : "Receita recebida por mês"}
+                  </div>
+                  <div className="dashboard-panel-caption">
+                    {isRevenueDayView
+                      ? `Mês selecionado: ${selectedRevenueMonth?.label || "-"}. Clique em um dia para ver os lançamentos.`
+                      : "Receitas efetivamente recebidas nos últimos 12 meses. Clique em uma coluna para abrir por dia."}
+                  </div>
                 </div>
                 <div className="dashboard-panel-highlight">
-                  <strong>{formatCurrencyBRL(currentMonthRevenue)}</strong>
-                  <span>mês atual</span>
+                  {isRevenueDayView ? (
+                    <>
+                      <button
+                        type="button"
+                        className="dashboard-chart-back"
+                        onClick={() => {
+                          setSelectedRevenueMonthKey("");
+                          setSelectedRevenueDayKey("");
+                        }}
+                      >
+                        Voltar meses
+                      </button>
+                      <strong>{formatCurrencyBRL(selectedRevenueMonthReceived)}</strong>
+                      <span>{selectedRevenueMonth?.label || "mês selecionado"}</span>
+                    </>
+                  ) : (
+                    <>
+                      <strong>{formatCurrencyBRL(currentMonthRevenue)}</strong>
+                      <span>mês atual</span>
+                    </>
+                  )}
                 </div>
               </div>
 
               {monthlyRevenueSeries.some((item) => item.value > 0) ? (
-                <div className="dashboard-line-shell">
-                  <div className="dashboard-line-yaxis" aria-hidden="true">
-                    {monthlyRevenueTicks.map((tick) => (
+                <div className="dashboard-chart-shell">
+                  <div className="dashboard-chart-yaxis" aria-hidden="true">
+                    {revenueChartTicks.map((tick) => (
                       <span key={tick.value} style={{ top: tick.top }}>
                         {tick.label}
                       </span>
                     ))}
                   </div>
-                  <div className="dashboard-line-plot">
-                    <div className="dashboard-line-area">
-                      {monthlyRevenueTicks.map((tick) => (
-                        <div key={tick.value} className="dashboard-line-gridline" style={{ top: tick.top }} />
+                  <div className="dashboard-chart-plot">
+                    <div className="dashboard-bars-area">
+                      {revenueChartTicks.map((tick) => (
+                        <div key={tick.value} className="dashboard-chart-gridline" style={{ top: tick.top }} />
                       ))}
-                      <svg className="dashboard-line-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-                        <defs>
-                          <linearGradient id="dashboardRevenueFill" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="0%" stopColor="rgba(225, 186, 59, 0.34)" />
-                            <stop offset="100%" stopColor="rgba(225, 186, 59, 0.02)" />
-                          </linearGradient>
-                        </defs>
-                        {monthlyRevenueArea && <path d={monthlyRevenueArea} fill="url(#dashboardRevenueFill)" />}
-                        {monthlyRevenueLine && <path d={monthlyRevenueLine} className="dashboard-line-path" />}
-                        {monthlyRevenuePoints.map((point) => (
-                          <circle key={`${point.x}-${point.y}`} cx={point.x} cy={point.y} r="1.8" className="dashboard-line-point" />
-                        ))}
-                      </svg>
+                      <div
+                        className={`dashboard-revenue-bars ${isRevenueDayView ? "is-day-view" : ""}`}
+                        style={{
+                          gridTemplateColumns: isRevenueDayView
+                            ? `repeat(${dailyRevenueBars.length}, minmax(8px, 1fr))`
+                            : undefined
+                        }}
+                      >
+                        {(isRevenueDayView ? dailyRevenueBars : monthlyRevenueBars).map((item) =>
+                          isRevenueDayView ? (
+                            <button
+                              type="button"
+                              key={item.key}
+                              className={[
+                                "dashboard-revenue-bar",
+                                item.value > 0 ? "has-value" : "",
+                                item.key === activeRevenueDayKey ? "is-selected" : ""
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              aria-label={`${item.dateLabel}: ${formatCurrencyBRL(item.value)}`}
+                              onClick={() => setSelectedRevenueDayKey(item.key)}
+                            >
+                              <div className="dashboard-revenue-bar-fill" style={{ height: item.height }} />
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              key={item.key}
+                              className={[
+                                "dashboard-revenue-bar",
+                                item.value > 0 ? "has-value" : "",
+                                item.key === activeRevenueMonthKey ? "is-selected" : ""
+                              ]
+                                .filter(Boolean)
+                                .join(" ")}
+                              aria-label={`${item.label}: ${formatCurrencyBRL(item.value)}`}
+                              onClick={() => {
+                                setSelectedRevenueMonthKey(item.key);
+                                setSelectedRevenueDayKey("");
+                              }}
+                            >
+                              <div className="dashboard-revenue-bar-fill" style={{ height: item.height }} />
+                            </button>
+                          )
+                        )}
+                      </div>
                     </div>
-                    <div className="dashboard-line-months">
-                      {monthlyRevenueSeries.map((item) => (
-                        <span key={item.key}>{item.label}</span>
+                    <div
+                      className={`dashboard-chart-months ${isRevenueDayView ? "is-day-view" : ""}`}
+                      style={{
+                        gridTemplateColumns: isRevenueDayView
+                          ? `repeat(${dailyRevenueBars.length}, minmax(8px, 1fr))`
+                          : undefined
+                      }}
+                    >
+                      {(isRevenueDayView ? dailyRevenueBars : monthlyRevenueSeries).map((item) => (
+                        <span key={item.key}>{isRevenueDayView ? (item.showLabel ? item.label : "") : item.label}</span>
                       ))}
                     </div>
                   </div>
@@ -7178,13 +7808,49 @@ function Dashboard() {
               ) : (
                 <div className="dashboard-empty">Cadastre receitas para visualizar a evolução mensal.</div>
               )}
+
+              {isRevenueDayView && selectedRevenueMonth && (
+                <div className="dashboard-drilldown-card">
+                  <div className="dashboard-drilldown-head">
+                    <div>
+                      <span>Detalhe do dia</span>
+                      <strong>{selectedRevenueDay?.dateLabel || selectedRevenueMonth.label}</strong>
+                    </div>
+                    <div className="dashboard-drilldown-metrics">
+                      <span>{formatCurrencyAxis(selectedRevenueDayReceived)} recebidos</span>
+                      <span>{selectedRevenueDayEntries.length} lançamento(s)</span>
+                      <span>{formatCurrencyAxis(selectedRevenueDayOpen)} em aberto</span>
+                    </div>
+                  </div>
+                  <div className="dashboard-drilldown-list">
+                    {selectedRevenueDayEntries.length > 0 ? (
+                      selectedRevenueDayEntries.map((entry) => (
+                        <div key={entry.id} className="dashboard-drilldown-row">
+                          <div>
+                            <strong>{entry.client}</strong>
+                            <span>
+                              {entry.category || "Receita"} {entry.process ? `· ${entry.process}` : ""}
+                            </span>
+                          </div>
+                          <div>
+                            <strong>{formatCurrencyAxis(getFinanceSettledAmount(entry))}</strong>
+                            <span>{getFinanceStatus(entry)}</span>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="dashboard-drilldown-empty">Nenhuma receita recebida nesse dia.</div>
+                    )}
+                  </div>
+                </div>
+              )}
             </section>
 
             <section className="dashboard-panel">
               <div className="dashboard-panel-head">
                 <div>
-                  <div className="dashboard-panel-title">Êxito por carteira</div>
-                  <div className="dashboard-panel-caption">Percentual de recebimento por carteira vinculada aos lançamentos.</div>
+                  <div className="dashboard-panel-title">Recebimento por carteira</div>
+                  <div className="dashboard-panel-caption">Percentual recebido sobre o previsto em cada carteira.</div>
                 </div>
               </div>
               <div className="dashboard-bar-list">
@@ -7213,29 +7879,35 @@ function Dashboard() {
             <section className="dashboard-panel">
               <div className="dashboard-panel-head">
                 <div>
-                  <div className="dashboard-panel-title">Processos por status</div>
+                  <div className="dashboard-panel-title">Acervo por status</div>
                   <div className="dashboard-panel-caption">Distribuição atual do acervo processual.</div>
                 </div>
               </div>
 
               {totalStatusCases > 0 ? (
-                <div className="dashboard-donut-shell">
-                  <div className="dashboard-donut-chart" style={{ background: donutGradient }}>
-                    <div className="dashboard-donut-hole">
-                      <strong>{activeCases}</strong>
-                      <span>ativos</span>
-                    </div>
+                <div className="dashboard-status-shell">
+                  <div className="dashboard-status-total">
+                    <span>Processos cadastrados</span>
+                    <strong>{totalStatusCases}</strong>
+                    <p>{activeCases} ativos no momento</p>
                   </div>
-                  <div className="dashboard-donut-legend">
+                  <div className="dashboard-status-list">
                     {statusDistribution.map((item) => (
-                      <div key={item.label} className="dashboard-donut-legend-item">
-                        <span className="dashboard-donut-color" style={{ background: item.color }} />
-                        <div>
-                          <strong>{item.label}</strong>
+                      <div key={item.label} className="dashboard-status-row">
+                        <div className="dashboard-status-head">
                           <span>
-                            {item.value} processo(s) · {Math.round((item.value / totalStatusCases) * 100)}%
+                            <i aria-hidden="true" style={{ background: item.color }} />
+                            {item.label}
                           </span>
+                          <strong>{Math.round((item.value / totalStatusCases) * 100)}%</strong>
                         </div>
+                        <div className="dashboard-bar-track">
+                          <div
+                            className="dashboard-bar-fill"
+                            style={{ width: `${(item.value / totalStatusCases) * 100}%`, background: item.color }}
+                          />
+                        </div>
+                        <small>{item.value} processo(s)</small>
                       </div>
                     ))}
                   </div>
@@ -7248,52 +7920,122 @@ function Dashboard() {
             <section className="dashboard-panel dashboard-panel-wide">
               <div className="dashboard-panel-head">
                 <div>
-                  <div className="dashboard-panel-title">Membros da equipe</div>
-                  <div className="dashboard-panel-caption">Distribuição de usuários ativos por equipe ou núcleo.</div>
+                  <div className="dashboard-panel-title">Equipe e colaboradores</div>
+                  <div className="dashboard-panel-caption">Distribuição por equipe com drill-down por colaborador.</div>
                 </div>
               </div>
 
               {membersByTeam.length > 0 ? (
-                <div className="dashboard-bar-list">
-                  {membersByTeam.map((item) => (
-                    <div key={item.label} className="dashboard-bar-item">
-                      <div className="dashboard-bar-head">
-                        <span>{item.label}</span>
-                        <strong>{item.value}</strong>
-                      </div>
-                      <div className="dashboard-bar-track">
-                        <div
-                          className="dashboard-bar-fill"
-                          style={{ width: `${(item.value / maxMembersByTeam) * 100}%`, background: item.color }}
-                        />
-                      </div>
-                      <div className="dashboard-bar-note">{item.value} membro(s) ativo(s)</div>
+                <div className="dashboard-team-layout">
+                  <div className="dashboard-team-column">
+                    <div className="dashboard-team-label">Por equipe</div>
+                    <div className="dashboard-bar-list">
+                      {membersByTeam.map((item) => (
+                        <button
+                          key={item.label}
+                          type="button"
+                          className={`dashboard-bar-item dashboard-clickable-bar ${
+                            item.label === selectedTeamLabel ? "is-selected" : ""
+                          }`}
+                          onClick={() => {
+                            setSelectedTeamName(item.label);
+                            setSelectedTeamMemberId(null);
+                          }}
+                        >
+                          <div className="dashboard-bar-head">
+                            <span>{item.label}</span>
+                            <strong>{item.active}/{item.total}</strong>
+                          </div>
+                          <div className="dashboard-bar-track">
+                            <div
+                              className="dashboard-bar-fill"
+                              style={{ width: `${(item.total / maxMembersByTeam) * 100}%`, background: item.color }}
+                            />
+                          </div>
+                          <div className="dashboard-bar-note">
+                            {item.active} ativo(s) {item.inactive > 0 ? `· ${item.inactive} inativo(s)` : ""}
+                          </div>
+                        </button>
+                      ))}
                     </div>
-                  ))}
+                  </div>
+
+                  <div className="dashboard-team-column">
+                    <div className="dashboard-team-label">Colaboradores</div>
+                    <div className="dashboard-team-members-list">
+                      {selectedTeamMembers.map((member) => (
+                        <button
+                          key={member.id}
+                          type="button"
+                          className={`dashboard-team-member-button ${
+                            selectedTeamMember?.id === member.id ? "is-selected" : ""
+                          }`}
+                          onClick={() => setSelectedTeamMemberId(member.id)}
+                        >
+                          <div>
+                            <strong>{member.full_name}</strong>
+                            <span>{member.role_title || "Sem cargo"}</span>
+                          </div>
+                          <span className={`dashboard-member-status ${member.is_active ? "active" : "inactive"}`}>
+                            {member.is_active ? "Ativo" : "Inativo"}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedTeamMember && (
+                      <div className="dashboard-member-detail">
+                        <div className="dashboard-member-detail-head">
+                          <div>
+                            <span>Colaborador selecionado</span>
+                            <strong>{selectedTeamMember.full_name}</strong>
+                          </div>
+                          <span className={`dashboard-member-status ${selectedTeamMember.is_active ? "active" : "inactive"}`}>
+                            {selectedTeamMember.is_active ? "Ativo" : "Inativo"}
+                          </span>
+                        </div>
+                        <div className="dashboard-member-detail-grid">
+                          <div>
+                            <span>Equipe</span>
+                            <strong>{selectedTeamLabel || "Sem equipe"}</strong>
+                          </div>
+                          <div>
+                            <span>Cargo</span>
+                            <strong>{selectedTeamMember.role_title || "-"}</strong>
+                          </div>
+                          <div>
+                            <span>E-mail</span>
+                            <strong>{selectedTeamMember.email || "-"}</strong>
+                          </div>
+                          <div>
+                            <span>Agenda vinculada</span>
+                            <strong>{selectedMemberAgendaItems.length}</strong>
+                          </div>
+                        </div>
+                        <div className="dashboard-member-agenda">
+                          {selectedMemberAgendaItems.length > 0 ? (
+                            selectedMemberAgendaItems.map((item) => (
+                              <div key={item.id}>
+                                <strong>{item.title}</strong>
+                                <span>
+                                  {formatBrazilDate(getAgendaDateKey(item.starts_at))} ·{" "}
+                                  {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}
+                                </span>
+                              </div>
+                            ))
+                          ) : (
+                            <span>Nenhum item de agenda vinculado a este colaborador.</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="dashboard-empty">Cadastre membros para visualizar a composição da equipe.</div>
               )}
             </section>
           </div>
-
-          <section className="dashboard-panel">
-            <div className="dashboard-panel-head">
-              <div>
-                <div className="dashboard-panel-title">Indicadores rápidos</div>
-                <div className="dashboard-panel-caption">Sinais complementares para leitura executiva do escritório.</div>
-              </div>
-            </div>
-            <div className="dashboard-indicators-grid">
-              {indicators.map((item) => (
-                <div key={item.label} className="dashboard-indicator-card">
-                  <span>{item.label}</span>
-                  <strong>{item.value}</strong>
-                  <p>{item.note}</p>
-                </div>
-              ))}
-            </div>
-          </section>
         </>
       )}
     </div>
@@ -7325,7 +8067,7 @@ const splitStoredOab = (value: string) => {
   };
 };
 
-type PublicationActionMode = "task" | "deadline" | "register";
+type PublicationActionMode = "details" | "task" | "deadline" | "hearing" | "register";
 
 type PublicationTaskFormState = {
   title: string;
@@ -7344,6 +8086,16 @@ type PublicationDeadlineFormState = {
   responsibleEmail: string;
   priority: PublicationDeadlinePriority;
   reminderDays: PublicationDeadlineReminder;
+  observations: string;
+};
+
+type PublicationHearingFormState = {
+  title: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  location: string;
+  responsibleEmail: string;
   observations: string;
 };
 
@@ -7710,6 +8462,8 @@ const publicationDeadlineKeywordHints = [
   "responda"
 ];
 
+const publicationHearingKeywordHints = ["audiencia", "audiência", "concilia", "pericia", "perícia", "sessao", "sessão"];
+
 const publicationDeadlinePriorityOptions: { value: PublicationDeadlinePriority; label: string }[] = [
   { value: "low", label: "Baixa" },
   { value: "medium", label: "Média" },
@@ -7778,6 +8532,66 @@ const extractSuggestedPublicationDueDate = (publication: TodayPublicationItem) =
   return null;
 };
 
+const extractSuggestedPublicationHearingDate = (publication: TodayPublicationItem) => {
+  const haystack = [publication.title, publication.summary, publication.communication_type, publication.court_name]
+    .filter(Boolean)
+    .join(" ");
+  if (!haystack.trim()) return null;
+
+  const explicitDatePattern = /\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b|\b(\d{4})-(\d{2})-(\d{2})\b/g;
+
+  for (const match of haystack.matchAll(explicitDatePattern)) {
+    const index = match.index ?? 0;
+    const excerptStart = Math.max(0, index - 96);
+    const excerptEnd = Math.min(haystack.length, index + match[0].length + 96);
+    const excerpt = normalizeLooseText(haystack.slice(excerptStart, excerptEnd));
+    const hasHearingHint = publicationHearingKeywordHints.some((keyword) => excerpt.includes(normalizeLooseText(keyword)));
+    if (!hasHearingHint) continue;
+    const isoDate = normalizePublicationDateMatch(match);
+    if (isoDate) return isoDate;
+  }
+
+  return null;
+};
+
+const formatPublicationTimeValue = (hour: number, minute: number) => {
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return "";
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+};
+
+const extractSuggestedPublicationHearingTime = (publication: TodayPublicationItem) => {
+  const haystack = normalizeLooseText([publication.summary, publication.title].filter(Boolean).join(" "));
+  const timePatterns = [
+    /\b(?:as|às)\s+(\d{1,2})(?:(?::|h)\s*(\d{2})|\s*horas?)?\b/i,
+    /\b(\d{1,2})h(\d{2})?\b/i,
+    /\b(\d{1,2}):(\d{2})\b/
+  ];
+
+  for (const pattern of timePatterns) {
+    const match = haystack.match(pattern);
+    if (!match) continue;
+    const hour = Number(match[1]);
+    const minute = Number(match[2] || "0");
+    const formatted = formatPublicationTimeValue(hour, minute);
+    if (formatted) return formatted;
+  }
+
+  return "";
+};
+
+const addOneHourToPublicationTime = (value: string) => {
+  const [hour, minute] = value.split(":").map(Number);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return "";
+  return formatPublicationTimeValue((hour + 1) % 24, minute);
+};
+
+const extractSuggestedPublicationHearingLocation = (publication: TodayPublicationItem) => {
+  const text = [publication.summary, publication.court_name].filter(Boolean).join(" ");
+  const locationMatch = text.match(/\ba ser realizad[ao]\s+(?:no|na|em)\s+([^.;]+)/i);
+  const rawLocation = (locationMatch?.[1] || publication.court_name || "").split(/\s+-\s+ADV\b/i)[0];
+  return rawLocation.replace(/\s+/g, " ").trim().slice(0, 220);
+};
+
 const extractSuggestedPublicationTermDays = (publication: TodayPublicationItem) => {
   const haystack = normalizeLooseText(
     [publication.title, publication.summary, publication.communication_type, publication.court_name]
@@ -7823,6 +8637,38 @@ const buildPublicationDeadlineTaskDetails = (form: PublicationDeadlineFormState)
   return lines.join("\n");
 };
 
+const buildPublicationHearingTaskDetails = (form: PublicationHearingFormState) => {
+  const lines: string[] = [];
+  if (form.startTime) {
+    lines.push(`Horário: ${form.startTime}${form.endTime ? ` - ${form.endTime}` : ""}`);
+  }
+  if (form.location.trim()) {
+    lines.push(`Local: ${form.location.trim()}`);
+  }
+  if (form.observations.trim()) {
+    lines.push(`Observações: ${form.observations.trim()}`);
+  }
+  return lines.join("\n");
+};
+
+const getPublicationResponsibleOptionsForContext = (
+  officeResponsibleOptions: Array<{ value: string; label: string; note: string }>,
+  user: AuthUser | null,
+  context: PublicationContextItem | null
+) => {
+  if (context?.has_registered_case) return officeResponsibleOptions;
+  const currentUserEmail = user?.email?.trim().toLowerCase() || "";
+  if (!currentUserEmail) return officeResponsibleOptions.slice(0, 1);
+  const currentOption = officeResponsibleOptions.find((option) => option.value.trim().toLowerCase() === currentUserEmail);
+  return [
+    currentOption || {
+      value: currentUserEmail,
+      label: user?.name || currentUserEmail,
+      note: currentUserEmail
+    }
+  ];
+};
+
 const isPublicationAgendaEvent = (item: AgendaItem) =>
   item.created_via === "publication" || Boolean(item.publication_source_key) || (item.reference || "").startsWith("[Publicação]");
 
@@ -7842,6 +8688,103 @@ const isPublicationApiUnavailableError = (err: unknown) => {
   const status = (err as { response?: { status?: number } }).response?.status;
   return status === 404 || status === 405;
 };
+
+const isPublicationAlreadyHandledError = (err: unknown) => {
+  const status = (err as { response?: { status?: number } }).response?.status;
+  if (status !== 400 && status !== 409) return false;
+  return normalizeSearchText(extractApiErrorMessage(err, "")).includes("ja possui uma providencia");
+};
+
+function PublicationActionsModal({
+  open,
+  publication,
+  context,
+  statusLabel,
+  statusTone,
+  hasGeneratedItems,
+  busy,
+  loadingContext,
+  onClose,
+  onSelectAction,
+  onMarkAsRead
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  context: PublicationContextItem | null;
+  statusLabel: string;
+  statusTone: string;
+  hasGeneratedItems: boolean;
+  busy: boolean;
+  loadingContext: boolean;
+  onClose: () => void;
+  onSelectAction: (publication: TodayPublicationItem, mode: PublicationActionMode) => void;
+  onMarkAsRead: (publication: TodayPublicationItem) => void;
+}) {
+  if (!open || !publication) return null;
+
+  const actionDisabled = busy || loadingContext;
+  const canRegisterCase = !context?.has_registered_case;
+  const readDisabled = actionDisabled || hasGeneratedItems || context?.status === "task_created";
+  const processLabel = publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado";
+  const detailMeta = [
+    processLabel,
+    publication.tribunal,
+    publication.communication_type,
+    context?.wallet_name ? `Carteira: ${context.wallet_name}` : "",
+    publication.court_name
+  ].filter(Boolean);
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-detail-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Publicação</h2>
+            <div className="publication-meta">{processLabel}</div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        <div className="publication-detail-body">
+          <div className="publication-detail-title-row">
+            <div className="publication-detail-title">{publication.title}</div>
+            {statusLabel && <span className={`publication-tag publication-status-tag ${statusTone}`}>{statusLabel}</span>}
+          </div>
+          <div className="publication-detail-meta">{detailMeta.join(" · ")}</div>
+          {publication.summary && <div className="publication-detail-summary">{publication.summary}</div>}
+
+          <div className="publication-detail-actions" aria-label="Ações da publicação">
+            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "deadline")} disabled={actionDisabled}>
+              Gerar prazo
+            </button>
+            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "hearing")} disabled={actionDisabled}>
+              Gerar audiência
+            </button>
+            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "task")} disabled={actionDisabled}>
+              Gerar tarefa
+            </button>
+            <button
+              className="btn secondary"
+              type="button"
+              onClick={() => onSelectAction(publication, "register")}
+              disabled={actionDisabled || !canRegisterCase}
+            >
+              {canRegisterCase ? "Cadastrar cliente/processo" : "Processo cadastrado"}
+            </button>
+            <button className="btn secondary" type="button" onClick={() => onMarkAsRead(publication)} disabled={readDisabled}>
+              {context?.status === "read_no_action" ? "Limpar marcação" : "Li e não há providências"}
+            </button>
+          </div>
+
+          {loadingContext && <div className="publication-detail-footnote">Carregando status da publicação...</div>}
+          {context?.warning && <div className="publication-warning-modal">{context.warning}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function PublicationTaskModal({
   open,
@@ -7956,6 +8899,7 @@ function PublicationTaskModal({
 function PublicationDeadlineModal({
   open,
   publication,
+  context,
   user,
   form,
   officeResponsibleOptions,
@@ -7967,6 +8911,7 @@ function PublicationDeadlineModal({
 }: {
   open: boolean;
   publication: TodayPublicationItem | null;
+  context: PublicationContextItem | null;
   user: AuthUser | null;
   form: PublicationDeadlineFormState;
   officeResponsibleOptions: Array<{ value: string; label: string; note: string }>;
@@ -7977,6 +8922,7 @@ function PublicationDeadlineModal({
   onChangeField: <K extends keyof PublicationDeadlineFormState>(field: K, value: PublicationDeadlineFormState[K]) => void;
 }) {
   if (!open || !publication) return null;
+  const responsibleOptions = getPublicationResponsibleOptionsForContext(officeResponsibleOptions, user, context);
 
   return (
     <div className="modal-backdrop">
@@ -8025,7 +8971,7 @@ function PublicationDeadlineModal({
             <div className="field">
               <label>Responsável</label>
               <select value={form.responsibleEmail} onChange={(event) => onChangeField("responsibleEmail", event.target.value)}>
-                {officeResponsibleOptions.map((option) => (
+                {responsibleOptions.map((option) => (
                   <option key={`${option.value || "self"}-${option.note}`} value={option.value}>
                     {option.note ? `${option.label} · ${option.note}` : option.label}
                   </option>
@@ -8086,6 +9032,107 @@ function PublicationDeadlineModal({
   );
 }
 
+function PublicationHearingModal({
+  open,
+  publication,
+  context,
+  user,
+  form,
+  officeResponsibleOptions,
+  busy,
+  errorMessage,
+  onClose,
+  onSubmit,
+  onChangeField
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  context: PublicationContextItem | null;
+  user: AuthUser | null;
+  form: PublicationHearingFormState;
+  officeResponsibleOptions: Array<{ value: string; label: string; note: string }>;
+  busy: boolean;
+  errorMessage: string;
+  onClose: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+  onChangeField: <K extends keyof PublicationHearingFormState>(field: K, value: PublicationHearingFormState[K]) => void;
+}) {
+  if (!open || !publication) return null;
+  const responsibleOptions = getPublicationResponsibleOptionsForContext(officeResponsibleOptions, user, context);
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-task-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Gerar audiência</h2>
+            <div className="publication-meta">
+              {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        {errorMessage && <div className="error">{errorMessage}</div>}
+
+        <form onSubmit={onSubmit}>
+          <div className="modal-grid publication-task-grid">
+            <div className="field span-2">
+              <label>Título *</label>
+              <input value={form.title} onChange={(event) => onChangeField("title", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Data *</label>
+              <input type="date" value={form.date} onChange={(event) => onChangeField("date", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Início</label>
+              <input type="time" value={form.startTime} onChange={(event) => onChangeField("startTime", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Fim</label>
+              <input type="time" value={form.endTime} onChange={(event) => onChangeField("endTime", event.target.value)} />
+            </div>
+            <div className="field">
+              <label>Responsável</label>
+              <select value={form.responsibleEmail} onChange={(event) => onChangeField("responsibleEmail", event.target.value)}>
+                {responsibleOptions.map((option) => (
+                  <option key={`${option.value || "self"}-${option.note}`} value={option.value}>
+                    {option.note ? `${option.label} · ${option.note}` : option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field span-2">
+              <label>Local</label>
+              <input value={form.location} onChange={(event) => onChangeField("location", event.target.value)} />
+            </div>
+            <div className="field span-2">
+              <label>Observações</label>
+              <textarea
+                value={form.observations}
+                onChange={(event) => onChangeField("observations", event.target.value)}
+                placeholder="Adicione orientações ou detalhes da audiência."
+              />
+            </div>
+          </div>
+
+          <div className="modal-actions">
+            <button className="btn ghost" type="button" onClick={onClose} disabled={busy}>
+              Cancelar
+            </button>
+            <button className="btn" type="submit" disabled={!form.title.trim() || !form.date || busy}>
+              {busy ? "Gerando..." : "Salvar audiência"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function Publications({ user }: { user: AuthUser | null }) {
   const [todayPublicationResult, setTodayPublicationResult] = useState<TodayPublicationsResponse | null>(null);
   const [publicationContextMap, setPublicationContextMap] = useState<Record<string, PublicationContextItem>>({});
@@ -8115,6 +9162,15 @@ function Publications({ user }: { user: AuthUser | null }) {
     responsibleEmail: "",
     priority: "medium",
     reminderDays: "3",
+    observations: ""
+  });
+  const [publicationHearingForm, setPublicationHearingForm] = useState<PublicationHearingFormState>({
+    title: "",
+    date: "",
+    startTime: "",
+    endTime: "",
+    location: "",
+    responsibleEmail: "",
     observations: ""
   });
   const [publicationActionError, setPublicationActionError] = useState("");
@@ -8395,11 +9451,18 @@ function Publications({ user }: { user: AuthUser | null }) {
   };
 
   const openPublicationActionModal = (publication: TodayPublicationItem, mode: PublicationActionMode) => {
+    const sourceKey = buildPublicationSourceKey(publication);
+    const context = publicationContextMap[sourceKey] || null;
+    const responsibleOptions = getPublicationResponsibleOptionsForContext(publicationOfficeResponsibleOptions, user, context);
+    const defaultResponsibleEmail = responsibleOptions[0]?.value || user?.email?.trim().toLowerCase() || "";
     setActivePublication(publication);
     setActivePublicationAction(mode);
     setPublicationActionError("");
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
+    if (mode === "details") {
+      return;
+    }
     if (mode === "task") {
       setPublicationTaskForm({
         title: publication.process_number ? `Providência do processo ${publication.process_number}` : "Providência da publicação",
@@ -8431,15 +9494,30 @@ function Publications({ user }: { user: AuthUser | null }) {
       });
       return;
     }
-    setPublicationDeadlineForm({
-      action: "",
-      termDays: extractSuggestedPublicationTermDays(publication),
-      dueDate: extractSuggestedPublicationDueDate(publication) || "",
-      responsibleEmail: publicationOfficeResponsibleOptions[0]?.value || user?.email?.trim().toLowerCase() || "",
-      priority: "medium",
-      reminderDays: "3",
-      observations: ""
-    });
+    if (mode === "deadline") {
+      setPublicationDeadlineForm({
+        action: "",
+        termDays: extractSuggestedPublicationTermDays(publication),
+        dueDate: extractSuggestedPublicationDueDate(publication) || "",
+        responsibleEmail: defaultResponsibleEmail,
+        priority: "medium",
+        reminderDays: "3",
+        observations: ""
+      });
+      return;
+    }
+    if (mode === "hearing") {
+      const suggestedStartTime = extractSuggestedPublicationHearingTime(publication);
+      setPublicationHearingForm({
+        title: publication.process_number ? `Audiência do processo ${publication.process_number}` : "Audiência da publicação",
+        date: extractSuggestedPublicationHearingDate(publication) || selectedPublicationDate,
+        startTime: suggestedStartTime,
+        endTime: suggestedStartTime ? addOneHourToPublicationTime(suggestedStartTime) : "",
+        location: extractSuggestedPublicationHearingLocation(publication),
+        responsibleEmail: defaultResponsibleEmail,
+        observations: ""
+      });
+    }
   };
 
   const closePublicationActionModal = () => {
@@ -8468,6 +9546,13 @@ function Publications({ user }: { user: AuthUser | null }) {
     value: PublicationDeadlineFormState[K]
   ) => {
     setPublicationDeadlineForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const handlePublicationHearingFormField = <K extends keyof PublicationHearingFormState>(
+    field: K,
+    value: PublicationHearingFormState[K]
+  ) => {
+    setPublicationHearingForm((prev) => ({ ...prev, [field]: value }));
   };
 
   const handlePublicationRegistrationClientFormField = (field: keyof ClientForm, value: ClientForm[keyof ClientForm]) => {
@@ -8614,7 +9699,7 @@ function Publications({ user }: { user: AuthUser | null }) {
     });
   };
 
-  const mergePublicationStatus = (sourceKey: string, status: PublicationHandlingStatus, handledAt: string) => {
+  const mergePublicationStatus = (sourceKey: string, status: PublicationHandlingStatus | null, handledAt: string | null) => {
     mergePublicationContext(sourceKey, {
       status,
       handled_at: handledAt
@@ -8628,6 +9713,9 @@ function Publications({ user }: { user: AuthUser | null }) {
     responsibleEmails,
     includeActorResponsible = true,
     allowOfficeWideResponsibles = false,
+    eventType = "deadline",
+    endTime,
+    isAllDay = true,
     successMessage,
     failureMessage
   }: {
@@ -8637,6 +9725,9 @@ function Publications({ user }: { user: AuthUser | null }) {
     responsibleEmails: string[];
     includeActorResponsible?: boolean;
     allowOfficeWideResponsibles?: boolean;
+    eventType?: InternalAgendaEventType;
+    endTime?: string;
+    isAllDay?: boolean;
     successMessage: string;
     failureMessage: string;
   }) => {
@@ -8659,7 +9750,10 @@ function Publications({ user }: { user: AuthUser | null }) {
         due_date: dueDate,
         responsible_emails: responsibleEmails,
         include_actor_responsible: includeActorResponsible,
-        allow_office_wide_responsibles: allowOfficeWideResponsibles
+        allow_office_wide_responsibles: allowOfficeWideResponsibles,
+        event_type: eventType,
+        end_time: endTime,
+        is_all_day: isAllDay
       });
       mergePublicationStatus(sourceKey, result.status, result.handled_at);
       setTodayPublicationsInlineMessage(successMessage);
@@ -8667,7 +9761,7 @@ function Publications({ user }: { user: AuthUser | null }) {
       setActivePublicationAction(null);
       await loadPublicationAgenda();
     } catch (err) {
-      if (isPublicationApiUnavailableError(err)) {
+      if (isPublicationApiUnavailableError(err) || isPublicationAlreadyHandledError(err)) {
         try {
           const fallbackContext =
             publicationContextMap[sourceKey] ||
@@ -8682,25 +9776,31 @@ function Publications({ user }: { user: AuthUser | null }) {
             (fallbackContext.allowed_responsibles || []).map((item) => [item.email.trim().toLowerCase(), item.name])
           );
           const selectedEmails = responsibleEmails.map((item) => item.trim().toLowerCase()).filter(Boolean);
+          const actorEmail = user?.email?.trim().toLowerCase() || "";
+          const additionalSelectedEmails = selectedEmails.filter((email) => email !== actorEmail);
 
-          if (!fallbackContext.has_registered_case && selectedEmails.length > 0) {
+          if (!fallbackContext.has_registered_case && additionalSelectedEmails.length > 0) {
             throw new Error("Processo não cadastrado. Não é possível adicionar outros responsáveis.");
           }
 
-          const invalidEmail = selectedEmails.find((email) => !responsibleMap.has(email));
+          const invalidEmail = additionalSelectedEmails.find((email) => !responsibleMap.has(email));
           if (invalidEmail) {
             throw new Error("Os responsáveis adicionais precisam ter acesso à carteira do processo.");
           }
 
-          const assigneeLabels = [user?.name || user?.email || "Usuário atual", ...selectedEmails.map((email) => responsibleMap.get(email) || email)];
+          const assigneeLabels = [
+            user?.name || user?.email || "Usuário atual",
+            ...additionalSelectedEmails.map((email) => responsibleMap.get(email) || email)
+          ];
           await apiCreateAgendaDeadline({
             title: taskTitle,
             due_date: dueDate,
             reference: buildPublicationReference(activePublication.process_number),
             notes: taskDetails,
-            event_type: "deadline",
+            event_type: eventType,
             assignees: assigneeLabels.join("; "),
-            is_all_day: true
+            end_time: endTime,
+            is_all_day: isAllDay
           });
 
           const handledAt = new Date().toISOString();
@@ -8736,6 +9836,7 @@ function Publications({ user }: { user: AuthUser | null }) {
       responsibleEmails: publicationTaskForm.responsibleEmails,
       includeActorResponsible: true,
       allowOfficeWideResponsibles: false,
+      eventType: "task",
       successMessage: "Tarefa criada com sucesso a partir da publicação.",
       failureMessage: "Não foi possível gerar a tarefa da publicação."
     });
@@ -8751,13 +9852,50 @@ function Publications({ user }: { user: AuthUser | null }) {
       responsibleEmails: selectedResponsible ? [selectedResponsible] : [],
       includeActorResponsible: false,
       allowOfficeWideResponsibles: true,
+      eventType: "deadline",
       successMessage: "Prazo criado com sucesso a partir da publicação.",
       failureMessage: "Não foi possível gerar o prazo da publicação."
     });
   };
 
+  const handleSubmitPublicationHearing = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (publicationHearingForm.endTime && !publicationHearingForm.startTime) {
+      setPublicationActionError("Preencha o horário de início antes do horário final.");
+      return;
+    }
+    if (
+      publicationHearingForm.startTime &&
+      publicationHearingForm.endTime &&
+      publicationHearingForm.endTime <= publicationHearingForm.startTime
+    ) {
+      setPublicationActionError("O horário final deve ser maior que o horário de início.");
+      return;
+    }
+
+    const selectedResponsible = publicationHearingForm.responsibleEmail.trim().toLowerCase();
+    const dueDateValue = publicationHearingForm.startTime
+      ? `${publicationHearingForm.date}T${publicationHearingForm.startTime}:00`
+      : publicationHearingForm.date;
+    const taskDetails = buildPublicationHearingTaskDetails(publicationHearingForm);
+    await submitPublicationGeneratedAction({
+      taskTitle: publicationHearingForm.title.trim(),
+      taskDetails: taskDetails || undefined,
+      dueDate: dueDateValue,
+      responsibleEmails: selectedResponsible ? [selectedResponsible] : [],
+      includeActorResponsible: false,
+      allowOfficeWideResponsibles: true,
+      eventType: "hearing",
+      endTime: publicationHearingForm.endTime || undefined,
+      isAllDay: !publicationHearingForm.startTime,
+      successMessage: "Audiência criada com sucesso a partir da publicação.",
+      failureMessage: "Não foi possível gerar a audiência da publicação."
+    });
+  };
+
   const handleMarkPublicationAsRead = async (publication: TodayPublicationItem) => {
     const sourceKey = buildPublicationSourceKey(publication);
+    const isClearingReadStatus = publicationContextMap[sourceKey]?.status === "read_no_action";
     setProcessingPublicationSourceKey(sourceKey);
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
@@ -8769,10 +9907,12 @@ function Publications({ user }: { user: AuthUser | null }) {
         process_number: publication.process_number || undefined,
         detail_url: publication.detail_url,
         summary: publication.summary || undefined,
-        action: "read_no_action"
+        action: isClearingReadStatus ? "clear" : "read_no_action"
       });
       mergePublicationStatus(sourceKey, result.status, result.handled_at);
       setTodayPublicationsInlineMessage(result.message);
+      setActivePublication(null);
+      setActivePublicationAction(null);
     } catch (err) {
       if (isPublicationApiUnavailableError(err)) {
         try {
@@ -8788,12 +9928,16 @@ function Publications({ user }: { user: AuthUser | null }) {
           const nextContext: PublicationContextItem = {
             ...fallbackContext,
             source_key: sourceKey,
-            status: "read_no_action",
-            handled_at: handledAt
+            status: isClearingReadStatus ? null : "read_no_action",
+            handled_at: isClearingReadStatus ? null : handledAt
           };
           persistPublicationFallbackContext(sourceKey, nextContext);
           mergePublicationContext(sourceKey, nextContext);
-          setTodayPublicationsInlineMessage("Publicação marcada como lida sem providências.");
+          setTodayPublicationsInlineMessage(
+            isClearingReadStatus ? "Marcação da publicação removida." : "Publicação marcada como lida sem providências."
+          );
+          setActivePublication(null);
+          setActivePublicationAction(null);
         } catch (fallbackErr) {
           setTodayPublicationsError(extractApiErrorMessage(fallbackErr, "Não foi possível registrar a leitura da publicação."));
         }
@@ -8811,6 +9955,10 @@ function Publications({ user }: { user: AuthUser | null }) {
   const fiveDaysKey = formatIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 5));
   const publicationDeadlineItems = useMemo(
     () => publicationAgendaItems.filter((item) => item.kind === "deadline" && isPublicationAgendaEvent(item)),
+    [publicationAgendaItems]
+  );
+  const publicationTaskItems = useMemo(
+    () => publicationAgendaItems.filter((item) => item.event_type === "task" && isPublicationAgendaEvent(item)),
     [publicationAgendaItems]
   );
   const publicationDeadlinesBySourceKey = useMemo(() => {
@@ -8831,14 +9979,36 @@ function Publications({ user }: { user: AuthUser | null }) {
       return acc;
     }, {});
   }, [publicationDeadlineItems]);
+  const publicationTasksBySourceKey = useMemo(() => {
+    return publicationTaskItems.reduce<Record<string, AgendaItem[]>>((acc, item) => {
+      const sourceKey = item.publication_source_key?.trim();
+      if (!sourceKey) return acc;
+      acc[sourceKey] = acc[sourceKey] || [];
+      acc[sourceKey].push(item);
+      return acc;
+    }, {});
+  }, [publicationTaskItems]);
+  const publicationTasksByProcessNumber = useMemo(() => {
+    return publicationTaskItems.reduce<Record<string, AgendaItem[]>>((acc, item) => {
+      const processKey = normalizeCaseDigits(item.publication_process_number || item.reference || "");
+      if (!processKey) return acc;
+      acc[processKey] = acc[processKey] || [];
+      acc[processKey].push(item);
+      return acc;
+    }, {});
+  }, [publicationTaskItems]);
   const publicationEntries = useMemo(() => {
     const items = todayPublicationResult?.items || [];
     return items.map((publication) => {
       const sourceKey = buildPublicationSourceKey(publication);
       const deadlineMap = new Map<string, AgendaItem>();
+      const taskMap = new Map<string, AgendaItem>();
 
       (publicationDeadlinesBySourceKey[sourceKey] || []).forEach((item) => {
         deadlineMap.set(item.id, item);
+      });
+      (publicationTasksBySourceKey[sourceKey] || []).forEach((item) => {
+        taskMap.set(item.id, item);
       });
 
       const processKey = normalizeCaseDigits(publication.process_number);
@@ -8846,16 +10016,41 @@ function Publications({ user }: { user: AuthUser | null }) {
         (publicationDeadlinesByProcessNumber[processKey] || []).forEach((item) => {
           deadlineMap.set(item.id, item);
         });
+        (publicationTasksByProcessNumber[processKey] || []).forEach((item) => {
+          taskMap.set(item.id, item);
+        });
       }
 
       return {
         publication,
         sourceKey,
         context: publicationContextMap[sourceKey] || null,
-        deadlineItems: Array.from(deadlineMap.values())
+        deadlineItems: Array.from(deadlineMap.values()),
+        taskItems: Array.from(taskMap.values())
       };
     });
-  }, [todayPublicationResult, publicationContextMap, publicationDeadlinesByProcessNumber, publicationDeadlinesBySourceKey]);
+  }, [
+    todayPublicationResult,
+    publicationContextMap,
+    publicationDeadlinesByProcessNumber,
+    publicationDeadlinesBySourceKey,
+    publicationTasksByProcessNumber,
+    publicationTasksBySourceKey
+  ]);
+  const activePublicationEntry = activePublication
+    ? publicationEntries.find((entry) => entry.sourceKey === buildPublicationSourceKey(activePublication)) || null
+    : null;
+  const activePublicationHasGeneratedItems = Boolean(
+    activePublicationEntry && (activePublicationEntry.deadlineItems.length > 0 || activePublicationEntry.taskItems.length > 0)
+  );
+  const activePublicationStatusTone = activePublicationHasGeneratedItems ? "task_created" : activePublicationContext?.status || "";
+  const activePublicationStatusLabel = activePublicationHasGeneratedItems
+    ? "Providência registrada"
+    : activePublicationContext?.status === "task_created"
+      ? getPublicationHandlingLabel(activePublicationContext.status)
+      : activePublicationContext?.status === "read_no_action"
+      ? getPublicationHandlingLabel(activePublicationContext.status)
+      : "";
   const hearingItems = useMemo(() => {
     return publicationAgendaItems.filter((item) => {
       const haystack = normalizeLooseText(`${item.title} ${item.reference || ""} ${item.description || ""}`);
@@ -9068,17 +10263,37 @@ function Publications({ user }: { user: AuthUser | null }) {
           <div className="publication-empty">Nenhuma publicação encontrada para o filtro selecionado.</div>
         ) : (
           <div className="publication-list">
-            {filteredPublicationEntries.map(({ publication, sourceKey, context }) => {
-              const handled = Boolean(context?.status);
+            {filteredPublicationEntries.map(({ publication, sourceKey, context, deadlineItems, taskItems }) => {
+              const hasGeneratedItems = deadlineItems.length > 0 || taskItems.length > 0;
+              const handled = context?.status === "read_no_action" || context?.status === "task_created" || hasGeneratedItems;
               const isBusy = processingPublicationSourceKey === sourceKey;
+              const statusTone = hasGeneratedItems || context?.status === "task_created" ? "task_created" : context?.status || "";
+              const statusLabel =
+                hasGeneratedItems || context?.status === "task_created"
+                  ? "Providência registrada"
+                  : context?.status === "read_no_action"
+                    ? getPublicationHandlingLabel(context.status)
+                    : "";
+              const hasLongSummary = Boolean((publication.summary || "").trim().length > 220);
               return (
                 <div
                   key={publication.hash || publication.id}
                   className={`publication-item publication-today-item ${handled ? "handled" : ""} ${
                     context?.status ? `status-${context.status}` : ""
                   }`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Abrir publicação ${publication.title}`}
+                  aria-busy={isBusy}
+                  onClick={() => openPublicationActionModal(publication, "details")}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openPublicationActionModal(publication, "details");
+                    }
+                  }}
                 >
-                  <div>
+                  <div className="publication-today-content">
                     <div className="publication-name">{publication.title}</div>
                     <div className="publication-meta">
                       {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
@@ -9087,57 +10302,18 @@ function Publications({ user }: { user: AuthUser | null }) {
                     </div>
                     {context?.wallet_name && <div className="publication-meta">Carteira: {context.wallet_name}</div>}
                     {publication.court_name && <div className="publication-meta">{publication.court_name}</div>}
-                    {publication.summary && <div className="publication-summary">{publication.summary}</div>}
-                    {context?.warning && <div className="publication-warning">{context.warning}</div>}
+                    {publication.summary && <div className="publication-summary publication-summary-clamped">{publication.summary}</div>}
+                    {hasLongSummary && <div className="publication-see-more">Ver mais</div>}
                   </div>
-                  <div className="publication-today-actions">
-                    <div className="publication-today-tags">
-                      {context?.status && (
-                        <span className={`publication-tag publication-status-tag ${context.status}`}>
-                          {getPublicationHandlingLabel(context.status)}
+                  {statusLabel && (
+                    <div className="publication-today-actions">
+                      <div className="publication-today-tags">
+                        <span className={`publication-tag publication-status-tag ${statusTone}`}>
+                          {statusLabel}
                         </span>
-                      )}
+                      </div>
                     </div>
-                    <div className="publication-action-buttons">
-                      <button
-                        className="btn ghost small"
-                        type="button"
-                        onClick={() => openPublicationActionModal(publication, "register")}
-                        disabled={isBusy || isLoadingPublicationContext || context?.has_registered_case}
-                      >
-                        {context?.has_registered_case ? "Processo cadastrado" : "Cadastrar cliente/processo"}
-                      </button>
-                      <button
-                        className="btn ghost small"
-                        type="button"
-                        onClick={() => openPublicationActionModal(publication, "task")}
-                        disabled={isBusy || isLoadingPublicationContext || context?.status === "task_created"}
-                      >
-                        {context?.status === "task_created" ? "Providência registrada" : "Gerar tarefa"}
-                      </button>
-                      <button
-                        className="btn ghost small"
-                        type="button"
-                        onClick={() => openPublicationActionModal(publication, "deadline")}
-                        disabled={isBusy || isLoadingPublicationContext || context?.status === "task_created"}
-                      >
-                        {context?.status === "task_created" ? "Providência registrada" : "Gerar prazo"}
-                      </button>
-                      <button
-                        className="btn ghost small"
-                        type="button"
-                        onClick={() => void handleMarkPublicationAsRead(publication)}
-                        disabled={
-                          isBusy ||
-                          isLoadingPublicationContext ||
-                          context?.status === "task_created" ||
-                          context?.status === "read_no_action"
-                        }
-                      >
-                        {context?.status === "read_no_action" ? "Sem providências" : "Li e não há providências"}
-                      </button>
-                    </div>
-                  </div>
+                  )}
                 </div>
               );
             })}
@@ -9145,6 +10321,19 @@ function Publications({ user }: { user: AuthUser | null }) {
         )}
       </div>
 
+      <PublicationActionsModal
+        open={Boolean(activePublication && activePublicationAction === "details")}
+        publication={activePublication}
+        context={activePublicationContext}
+        statusLabel={activePublicationStatusLabel}
+        statusTone={activePublicationStatusTone}
+        hasGeneratedItems={activePublicationHasGeneratedItems}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        loadingContext={isLoadingPublicationContext}
+        onClose={closePublicationActionModal}
+        onSelectAction={openPublicationActionModal}
+        onMarkAsRead={(publication) => void handleMarkPublicationAsRead(publication)}
+      />
       <PublicationTaskModal
         open={Boolean(activePublication && activePublicationAction === "task")}
         publication={activePublication}
@@ -9161,6 +10350,7 @@ function Publications({ user }: { user: AuthUser | null }) {
       <PublicationDeadlineModal
         open={Boolean(activePublication && activePublicationAction === "deadline")}
         publication={activePublication}
+        context={activePublicationContext}
         user={user}
         form={publicationDeadlineForm}
         officeResponsibleOptions={publicationOfficeResponsibleOptions}
@@ -9169,6 +10359,19 @@ function Publications({ user }: { user: AuthUser | null }) {
         onClose={closePublicationActionModal}
         onSubmit={handleSubmitPublicationDeadline}
         onChangeField={handlePublicationDeadlineFormField}
+      />
+      <PublicationHearingModal
+        open={Boolean(activePublication && activePublicationAction === "hearing")}
+        publication={activePublication}
+        context={activePublicationContext}
+        user={user}
+        form={publicationHearingForm}
+        officeResponsibleOptions={publicationOfficeResponsibleOptions}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        errorMessage={publicationActionError}
+        onClose={closePublicationActionModal}
+        onSubmit={handleSubmitPublicationHearing}
+        onChangeField={handlePublicationHearingFormField}
       />
       <AddClientModal
         open={Boolean(activePublication && activePublicationAction === "register" && !publicationRegistrationClient)}
@@ -9213,6 +10416,7 @@ const agendaProviders: { provider: CalendarProvider; label: string; description:
 
 const internalAgendaTypeOptions: { value: InternalAgendaEventType; label: string; kind: AgendaItem["kind"] }[] = [
   { value: "deadline", label: "Prazo", kind: "deadline" },
+  { value: "task", label: "Tarefa", kind: "meeting" },
   { value: "meeting", label: "Reunião", kind: "meeting" },
   { value: "hearing", label: "Audiência", kind: "meeting" },
   { value: "audit", label: "Auditoria", kind: "meeting" }
@@ -9249,7 +10453,7 @@ const isAgendaHearingItem = (item: AgendaItem) => {
 
 const isAgendaTaskOrMeetingItem = (item: AgendaItem) => {
   if (isAgendaDeadlineItem(item) || isAgendaHearingItem(item)) return false;
-  return item.kind === "meeting" || item.event_type === "meeting" || item.event_type === "audit";
+  return item.kind === "meeting" || item.event_type === "task" || item.event_type === "meeting" || item.event_type === "audit";
 };
 
 const formatAgendaTime = (startValue: string, endValue: string, isAllDay: boolean) => {
@@ -9290,6 +10494,99 @@ const injectAgendaAssigneeEmail = (value: string, email: string) => {
   return completed.length ? `${completed.join("; ")}; ${cleanEmail}; ` : `${cleanEmail}; `;
 };
 
+type AgendaViewMode = "day" | "three_days" | "work_week" | "week" | "month" | "list";
+
+const agendaViewOptions: { value: AgendaViewMode; label: string }[] = [
+  { value: "day", label: "Dia" },
+  { value: "three_days", label: "Três dias" },
+  { value: "work_week", label: "Semana de trabalho" },
+  { value: "week", label: "Semana" },
+  { value: "month", label: "Mês" },
+  { value: "list", label: "Lista" }
+];
+
+const addLocalDays = (date: Date, amount: number) => {
+  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  next.setDate(next.getDate() + amount);
+  return next;
+};
+
+const getAgendaWeekStart = (date: Date) => {
+  const start = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const offset = (start.getDay() + 6) % 7;
+  start.setDate(start.getDate() - offset);
+  return start;
+};
+
+const getAgendaDayDates = (start: Date, end: Date) => {
+  const dates: Date[] = [];
+  let cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const finalDate = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while (cursor <= finalDate) {
+    dates.push(new Date(cursor));
+    cursor = addLocalDays(cursor, 1);
+  }
+  return dates;
+};
+
+const formatAgendaRangeLabel = (start: Date, end: Date) => {
+  if (formatIsoDate(start) === formatIsoDate(end)) {
+    return start.toLocaleDateString("pt-BR", {
+      day: "2-digit",
+      month: "long",
+      year: "numeric",
+      weekday: "long"
+    });
+  }
+  const sameYear = start.getFullYear() === end.getFullYear();
+  const dateOptions: Intl.DateTimeFormatOptions = sameYear
+    ? { day: "2-digit", month: "short" }
+    : { day: "2-digit", month: "short", year: "numeric" };
+  return `${start.toLocaleDateString("pt-BR", dateOptions)} - ${end.toLocaleDateString("pt-BR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric"
+  })}`;
+};
+
+const getAgendaViewTitle = (viewMode: AgendaViewMode) => {
+  switch (viewMode) {
+    case "day":
+      return "Compromissos do dia";
+    case "three_days":
+      return "Compromissos dos três dias";
+    case "work_week":
+      return "Compromissos da semana de trabalho";
+    case "week":
+      return "Compromissos da semana";
+    case "month":
+      return "Compromissos do mês";
+    case "list":
+      return "Lista de compromissos";
+    default:
+      return "Compromissos";
+  }
+};
+
+const getAgendaViewEmptyMessage = (viewMode: AgendaViewMode) => {
+  switch (viewMode) {
+    case "day":
+      return "Nenhum compromisso para o dia selecionado.";
+    case "three_days":
+      return "Nenhum compromisso para os três dias selecionados.";
+    case "work_week":
+      return "Nenhum compromisso para a semana de trabalho selecionada.";
+    case "week":
+      return "Nenhum compromisso para a semana selecionada.";
+    case "month":
+      return "Nenhum compromisso para o mês selecionado.";
+    case "list":
+      return "Nenhum compromisso para listar neste mês.";
+    default:
+      return "Nenhum compromisso para o período selecionado.";
+  }
+};
+
 function Agenda() {
   const [month, setMonth] = useState(() => {
     const today = new Date();
@@ -9303,11 +10600,13 @@ function Agenda() {
   const [sourceFilter, setSourceFilter] = useState<"all" | "internal" | CalendarProvider>("all");
   const [typeFilter, setTypeFilter] = useState<"all" | "deadline" | "meeting">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "open" | "completed">("all");
+  const [viewMode, setViewMode] = useState<AgendaViewMode>("month");
   const [savingDeadline, setSavingDeadline] = useState(false);
   const [updatingDeadlineId, setUpdatingDeadlineId] = useState<number | null>(null);
   const [teamMembers, setTeamMembers] = useState<ApiTeamMember[]>([]);
   const [isLoadingTeamMembers, setIsLoadingTeamMembers] = useState(false);
   const [isAssigneePickerOpen, setIsAssigneePickerOpen] = useState(false);
+  const [isDeadlineModalOpen, setIsDeadlineModalOpen] = useState(false);
   const [deadlineForm, setDeadlineForm] = useState({
     title: "",
     dueDate: formatIsoDate(new Date()),
@@ -9359,8 +10658,12 @@ function Agenda() {
     options: { refreshExternal?: boolean; silent?: boolean } = {}
   ) => {
     const { refreshExternal = false, silent = false } = options;
-    const rangeStart = `${formatIsoDate(new Date(targetMonth.getFullYear(), targetMonth.getMonth(), 1))}T00:00:00`;
-    const rangeEnd = `${formatIsoDate(new Date(targetMonth.getFullYear(), targetMonth.getMonth() + 1, 0))}T23:59:59`;
+    const startDate = new Date(targetMonth.getFullYear(), targetMonth.getMonth(), 1);
+    startDate.setDate(startDate.getDate() - 7);
+    const endDate = new Date(targetMonth.getFullYear(), targetMonth.getMonth() + 1, 0);
+    endDate.setDate(endDate.getDate() + 7);
+    const rangeStart = `${formatIsoDate(startDate)}T00:00:00`;
+    const rangeEnd = `${formatIsoDate(endDate)}T23:59:59`;
     if (!silent) {
       setIsLoading(true);
     }
@@ -9411,6 +10714,40 @@ function Agenda() {
   const totalCells = Math.ceil((startOffset + daysInMonth) / 7) * 7;
   const todayKey = formatIsoDate(new Date());
 
+  const agendaViewRange = useMemo(() => {
+    const selectedDateValue = parseLocalDate(selectedDate);
+    switch (viewMode) {
+      case "day":
+        return { start: selectedDateValue, end: selectedDateValue };
+      case "three_days":
+        return { start: selectedDateValue, end: addLocalDays(selectedDateValue, 2) };
+      case "work_week": {
+        const start = getAgendaWeekStart(selectedDateValue);
+        return { start, end: addLocalDays(start, 4) };
+      }
+      case "week": {
+        const start = getAgendaWeekStart(selectedDateValue);
+        return { start, end: addLocalDays(start, 6) };
+      }
+      case "month":
+      case "list":
+      default:
+        return {
+          start: new Date(year, monthIndex, 1),
+          end: new Date(year, monthIndex + 1, 0)
+        };
+    }
+  }, [monthIndex, selectedDate, viewMode, year]);
+
+  const agendaViewDates = useMemo(
+    () => getAgendaDayDates(agendaViewRange.start, agendaViewRange.end),
+    [agendaViewRange.end, agendaViewRange.start]
+  );
+  const agendaViewRangeEndExclusive = useMemo(() => addLocalDays(agendaViewRange.end, 1), [agendaViewRange.end]);
+  const agendaViewTitle = getAgendaViewTitle(viewMode);
+  const agendaViewRangeLabel = formatAgendaRangeLabel(agendaViewRange.start, agendaViewRange.end);
+  const selectedViewLabel = agendaViewOptions.find((option) => option.value === viewMode)?.label || "Mês";
+
   const filteredEvents = useMemo(() => {
     return events.filter((item) => {
       if (typeFilter !== "all" && item.kind !== typeFilter) return false;
@@ -9443,26 +10780,42 @@ function Agenda() {
     return markers;
   }, [filteredEvents]);
 
-  const selectedDayEvents = useMemo(() => {
-    const start = parseLocalDate(selectedDate);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
+  const eventsByDate = useMemo(() => {
+    const byDate: Record<string, AgendaItem[]> = {};
+    filteredEvents.forEach((item) => {
+      const startsAt = new Date(item.starts_at);
+      const endsAt = new Date(item.ends_at);
+      const cursor = new Date(startsAt.getFullYear(), startsAt.getMonth(), startsAt.getDate());
+      const finalDate = new Date(endsAt.getFullYear(), endsAt.getMonth(), endsAt.getDate());
+      while (cursor <= finalDate) {
+        const key = formatIsoDate(cursor);
+        if (!byDate[key]) byDate[key] = [];
+        byDate[key].push(item);
+        cursor.setDate(cursor.getDate() + 1);
+      }
+    });
+    Object.values(byDate).forEach((items) => {
+      items.sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime());
+    });
+    return byDate;
+  }, [filteredEvents]);
+
+  const selectedRangeEvents = useMemo(() => {
     return filteredEvents
       .filter((item) => {
         const startsAt = new Date(item.starts_at);
         const endsAt = new Date(item.ends_at);
-        return startsAt < end && endsAt >= start;
+        return startsAt < agendaViewRangeEndExclusive && endsAt >= agendaViewRange.start;
       })
       .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime());
-  }, [filteredEvents, selectedDate]);
+  }, [agendaViewRange.start, agendaViewRangeEndExclusive, filteredEvents]);
 
   const upcomingEvents = useMemo(() => {
-    const selectedStart = parseLocalDate(selectedDate);
     return filteredEvents
-      .filter((item) => new Date(item.starts_at).getTime() >= selectedStart.getTime())
+      .filter((item) => new Date(item.starts_at).getTime() >= agendaViewRangeEndExclusive.getTime())
       .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
       .slice(0, 8);
-  }, [filteredEvents, selectedDate]);
+  }, [agendaViewRangeEndExclusive, filteredEvents]);
 
   const assigneeSearchTerm = useMemo(() => getAgendaAssigneeSearchTerm(deadlineForm.assignees), [deadlineForm.assignees]);
 
@@ -9490,6 +10843,17 @@ function Agenda() {
     setDeadlineForm((prev) => ({ ...prev, assignees: injectAgendaAssigneeEmail(prev.assignees, member.email) }));
     setIsAssigneePickerOpen(false);
     window.setTimeout(() => assigneesInputRef.current?.focus(), 0);
+  };
+
+  const handleOpenDeadlineModal = () => {
+    setDeadlineForm((prev) => ({ ...prev, dueDate: prev.dueDate || selectedDate }));
+    setIsDeadlineModalOpen(true);
+  };
+
+  const handleCloseDeadlineModal = () => {
+    if (savingDeadline) return;
+    setIsDeadlineModalOpen(false);
+    setIsAssigneePickerOpen(false);
   };
 
   const handleCreateDeadline = async (event: React.FormEvent) => {
@@ -9534,6 +10898,7 @@ function Agenda() {
         notes: ""
       }));
       setIsAssigneePickerOpen(false);
+      setIsDeadlineModalOpen(false);
       setInlineMessage("Compromisso interno cadastrado com sucesso.");
       await loadAgendaData(dueMonth);
     } catch (err) {
@@ -9576,11 +10941,43 @@ function Agenda() {
     }
   };
 
-  const handleChangeMonth = (offset: number) => {
-    const nextMonth = new Date(month.getFullYear(), month.getMonth() + offset, 1);
-    setMonth(nextMonth);
-    setSelectedDate(formatIsoDate(new Date(nextMonth.getFullYear(), nextMonth.getMonth(), 1)));
+  const setAgendaFocusDate = (date: Date) => {
+    const normalized = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const dateKey = formatIsoDate(normalized);
+    setSelectedDate(dateKey);
+    setMonth(new Date(normalized.getFullYear(), normalized.getMonth(), 1));
+    setDeadlineForm((prev) => ({ ...prev, dueDate: dateKey }));
   };
+
+  const handleChangeAgendaPeriod = (offset: number) => {
+    if (viewMode === "month" || viewMode === "list") {
+      const nextMonth = new Date(month.getFullYear(), month.getMonth() + offset, 1);
+      setMonth(nextMonth);
+      setSelectedDate(formatIsoDate(nextMonth));
+      setDeadlineForm((prev) => ({ ...prev, dueDate: formatIsoDate(nextMonth) }));
+      return;
+    }
+
+    const daysByView: Record<Exclude<AgendaViewMode, "month" | "list">, number> = {
+      day: 1,
+      three_days: 3,
+      work_week: 7,
+      week: 7
+    };
+    setAgendaFocusDate(addLocalDays(parseLocalDate(selectedDate), offset * daysByView[viewMode]));
+  };
+
+  const handleGoToday = () => {
+    setAgendaFocusDate(new Date());
+  };
+
+  const handleChangeViewMode = (nextViewMode: AgendaViewMode) => {
+    setViewMode(nextViewMode);
+    const selected = parseLocalDate(selectedDate);
+    setMonth(new Date(selected.getFullYear(), selected.getMonth(), 1));
+  };
+
+  const agendaListDates = agendaViewDates.filter((date) => (eventsByDate[formatIsoDate(date)] || []).length > 0);
 
   return (
     <div className="content-card page-card agenda-page">
@@ -9590,6 +10987,23 @@ function Agenda() {
           <h1 className="page-title">Compromissos e Prazos</h1>
           <div className="page-subtitle">Reuniões e prazos em uma única agenda. Gerencie conexões em Configurações.</div>
         </div>
+        <div className="agenda-top-actions">
+          <select
+            className="agenda-view-select"
+            aria-label="Visualização da agenda"
+            value={viewMode}
+            onChange={(event) => handleChangeViewMode(event.target.value as AgendaViewMode)}
+          >
+            {agendaViewOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="btn" onClick={handleOpenDeadlineModal}>
+            + Novo compromisso
+          </button>
+        </div>
       </div>
 
       {error && <div className="error">{error}</div>}
@@ -9598,65 +11012,263 @@ function Agenda() {
       <div className="agenda-grid">
         <div className="agenda-left">
           <div className="calendar-card agenda-calendar-card">
-            <div className="calendar-head">
-              <div className="calendar-title">{monthTitle}</div>
+            <div className="calendar-head agenda-view-head">
+              <div>
+                <div className="calendar-title">{viewMode === "month" || viewMode === "list" ? monthTitle : agendaViewRangeLabel}</div>
+                <div className="agenda-view-subtitle">{selectedViewLabel}</div>
+              </div>
               <div className="calendar-actions">
-                <button type="button" className="btn ghost small" onClick={() => handleChangeMonth(-1)}>
+                <button type="button" className="btn ghost small" onClick={handleGoToday}>
+                  Hoje
+                </button>
+                <button type="button" className="btn ghost small" onClick={() => handleChangeAgendaPeriod(-1)}>
                   Anterior
                 </button>
-                <button type="button" className="btn ghost small" onClick={() => handleChangeMonth(1)}>
+                <button type="button" className="btn ghost small" onClick={() => handleChangeAgendaPeriod(1)}>
                   Próximo
                 </button>
               </div>
             </div>
-            <div className="calendar-week">
-              {weekDays.map((label) => (
-                <div key={label} className="calendar-weekday">
-                  {label}
+
+            {viewMode === "month" && (
+              <>
+                <div className="calendar-week">
+                  {weekDays.map((label) => (
+                    <div key={label} className="calendar-weekday">
+                      {label}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-            <div className="calendar-grid">
-              {Array.from({ length: totalCells }).map((_, index) => {
-                const dayNumber = index - startOffset + 1;
-                if (dayNumber < 1 || dayNumber > daysInMonth) {
-                  return <div key={`empty-${index}`} className="calendar-cell empty" />;
-                }
-                const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
-                const isSelected = dateKey === selectedDate;
-                const dayMarkers = dayMarkersByDate[dateKey];
-                const markerKinds = [
-                  dayMarkers?.deadline ? "deadline" : null,
-                  dayMarkers?.task ? "task" : null,
-                  dayMarkers?.hearing ? "hearing" : null
-                ].filter(Boolean) as Array<"deadline" | "task" | "hearing">;
-                return (
-                  <button
-                    key={dateKey}
-                    type="button"
-                    className={`calendar-cell agenda-day-btn ${markerKinds.length > 0 ? "has-events" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
-                    onClick={() => {
-                      setSelectedDate(dateKey);
-                      setDeadlineForm((prev) => ({ ...prev, dueDate: dateKey }));
-                    }}
-                  >
-                    <div className="calendar-day">{dayNumber}</div>
-                    {markerKinds.length > 0 && (
-                      <div className="calendar-markers" aria-hidden="true">
-                        {markerKinds.map((marker) => (
-                          <span key={marker} className={`calendar-marker ${marker}`} />
-                        ))}
+                <div className="calendar-grid">
+                  {Array.from({ length: totalCells }).map((_, index) => {
+                    const dayNumber = index - startOffset + 1;
+                    if (dayNumber < 1 || dayNumber > daysInMonth) {
+                      return <div key={`empty-${index}`} className="calendar-cell empty" />;
+                    }
+                    const dateKey = formatIsoDate(new Date(year, monthIndex, dayNumber));
+                    const isSelected = dateKey === selectedDate;
+                    const dayMarkers = dayMarkersByDate[dateKey];
+                    const markerKinds = [
+                      dayMarkers?.deadline ? "deadline" : null,
+                      dayMarkers?.task ? "task" : null,
+                      dayMarkers?.hearing ? "hearing" : null
+                    ].filter(Boolean) as Array<"deadline" | "task" | "hearing">;
+                    return (
+                      <button
+                        key={dateKey}
+                        type="button"
+                        className={`calendar-cell agenda-day-btn ${markerKinds.length > 0 ? "has-events" : ""} ${dateKey === todayKey ? "today" : ""} ${isSelected ? "selected" : ""}`}
+                        onClick={() => setAgendaFocusDate(parseLocalDate(dateKey))}
+                      >
+                        <div className="calendar-day">{dayNumber}</div>
+                        {markerKinds.length > 0 && (
+                          <div className="calendar-markers" aria-hidden="true">
+                            {markerKinds.map((marker) => (
+                              <span key={marker} className={`calendar-marker ${marker}`} />
+                            ))}
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
+            {viewMode !== "month" && viewMode !== "list" && (
+              <div className={`agenda-period-grid days-${agendaViewDates.length}`}>
+                {agendaViewDates.map((date) => {
+                  const dateKey = formatIsoDate(date);
+                  const dayEvents = eventsByDate[dateKey] || [];
+                  return (
+                    <button
+                      key={dateKey}
+                      type="button"
+                      className={`agenda-period-day ${dateKey === todayKey ? "today" : ""} ${dateKey === selectedDate ? "selected" : ""}`}
+                      onClick={() => setAgendaFocusDate(date)}
+                    >
+                      <div className="agenda-period-day-head">
+                        <div>
+                          <span>{date.toLocaleDateString("pt-BR", { weekday: "short" })}</span>
+                          <strong>{date.getDate()}</strong>
+                        </div>
+                        <em>{dayEvents.length}</em>
                       </div>
-                    )}
-                  </button>
-                );
-              })}
+                      <div className="agenda-mini-events">
+                        {dayEvents.length === 0 ? (
+                          <span className="agenda-mini-empty">Sem itens</span>
+                        ) : (
+                          <>
+                            {dayEvents.slice(0, 4).map((item) => (
+                              <span key={`${dateKey}-${item.id}`} className={`agenda-mini-event ${item.kind}`}>
+                                {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {item.title}
+                              </span>
+                            ))}
+                            {dayEvents.length > 4 && <span className="agenda-mini-more">+{dayEvents.length - 4}</span>}
+                          </>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {viewMode === "list" && (
+              <div className="agenda-calendar-list">
+                {agendaListDates.length === 0 ? (
+                  <div className="publication-empty">Nenhum compromisso no mês selecionado.</div>
+                ) : (
+                  agendaListDates.map((date) => {
+                    const dateKey = formatIsoDate(date);
+                    const dayEvents = eventsByDate[dateKey] || [];
+                    return (
+                      <button
+                        key={dateKey}
+                        type="button"
+                        className={`agenda-list-day ${dateKey === selectedDate ? "selected" : ""}`}
+                        onClick={() => setAgendaFocusDate(date)}
+                      >
+                        <div>
+                          <strong>{date.toLocaleDateString("pt-BR", { day: "2-digit", month: "short", weekday: "short" })}</strong>
+                          <span>{dayEvents.length} compromisso{dayEvents.length === 1 ? "" : "s"}</span>
+                        </div>
+                        <div className="agenda-list-day-events">
+                          {dayEvents.slice(0, 3).map((item) => (
+                            <span key={`${dateKey}-list-${item.id}`}>
+                              {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {item.title}
+                            </span>
+                          ))}
+                          {dayEvents.length > 3 && <span>+{dayEvents.length - 3} outro{dayEvents.length - 3 === 1 ? "" : "s"}</span>}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="agenda-right">
+          <div className="publication-card agenda-events-card">
+            <div className="agenda-events-head">
+              <div>
+                <div className="publication-title">{agendaViewTitle}</div>
+                <div className="publication-meta">{agendaViewRangeLabel}</div>
+              </div>
+              <div className="agenda-filters">
+                <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as "all" | "internal" | CalendarProvider)}>
+                  <option value="all">Todas origens</option>
+                  <option value="internal">Somente internos</option>
+                  <option value="google">Google</option>
+                  <option value="microsoft">Microsoft</option>
+                </select>
+                <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as "all" | "deadline" | "meeting")}>
+                  <option value="all">Todos tipos</option>
+                  <option value="deadline">Prazos</option>
+                  <option value="meeting">Reuniões e compromissos</option>
+                </select>
+                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | "open" | "completed")}>
+                  <option value="all">Todos status</option>
+                  <option value="open">Em aberto</option>
+                  <option value="completed">Concluídos</option>
+                </select>
+              </div>
             </div>
+
+            {isLoading ? (
+              <div className="publication-empty">Carregando agenda...</div>
+            ) : selectedRangeEvents.length === 0 ? (
+              <div className="publication-empty">{getAgendaViewEmptyMessage(viewMode)}</div>
+            ) : (
+              <div className="publication-list agenda-event-list">
+                {selectedRangeEvents.map((item) => {
+                  const completed = isAgendaItemCompleted(item);
+                  const isUpdating = updatingDeadlineId === item.entity_id;
+                  return (
+                    <div key={item.id} className={`publication-item agenda-event-item ${item.kind} ${completed ? "completed" : ""}`}>
+                      <div>
+                        <div className="publication-name">{item.title}</div>
+                        <div className="publication-meta">
+                          {viewMode !== "day" ? `${new Date(item.starts_at).toLocaleDateString("pt-BR")} · ` : ""}
+                          {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
+                          {item.reference ? ` · ${item.reference}` : ""}
+                        </div>
+                        {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
+                        {item.description && <div className="agenda-event-description">{item.description}</div>}
+                        {item.location && <div className="publication-meta">Local: {item.location}</div>}
+                        {item.meeting_url && (
+                          <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
+                            Entrar na reunião
+                          </a>
+                        )}
+                      </div>
+                      <div className="agenda-event-side">
+                        <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                        {completed && <span className="agenda-status completed">Concluído</span>}
+                        {item.source === "internal" && (
+                          <div className="agenda-event-actions">
+                            <button
+                              type="button"
+                              className={`link-btn ${completed ? "" : "success"}`}
+                              onClick={() => handleToggleDeadlineCompleted(item)}
+                              disabled={isUpdating}
+                            >
+                              {isUpdating ? "Salvando..." : completed ? "Reabrir" : "Concluir"}
+                            </button>
+                            <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
+                              Remover
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
-          <div className="publication-card agenda-deadline-card">
-            <div className="publication-title">Novo compromisso interno</div>
-            <form className="publication-form agenda-deadline-form" onSubmit={handleCreateDeadline}>
+          <div className="publication-card agenda-upcoming-card">
+            <div className="publication-title">Depois desse período</div>
+            {upcomingEvents.length === 0 ? (
+              <div className="publication-empty">Sem itens futuros para os filtros escolhidos.</div>
+            ) : (
+              <div className="publication-list">
+                {upcomingEvents.map((item) => (
+                  <div key={`upcoming-${item.id}`} className={`publication-item agenda-upcoming-item ${isAgendaItemCompleted(item) ? "completed" : ""}`}>
+                    <div>
+                      <div className="publication-name">{item.title}</div>
+                      <div className="publication-meta">
+                      {new Date(item.starts_at).toLocaleDateString("pt-BR")} · {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} ·{" "}
+                        {agendaSourceLabel(item.source)}
+                      </div>
+                      {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
+                    </div>
+                    <div className="agenda-event-side">
+                      <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
+                      {isAgendaItemCompleted(item) && <span className="agenda-status completed">Concluído</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {isDeadlineModalOpen && (
+        <div className="modal-backdrop">
+          <div className="modal-card agenda-deadline-modal-card">
+            <div className="modal-head">
+              <h2 className="modal-title">Novo compromisso interno</h2>
+              <button className="icon-btn" type="button" onClick={handleCloseDeadlineModal} aria-label="Fechar">
+                ×
+              </button>
+            </div>
+            <div className="modal-note">Campos obrigatórios: Título e data.</div>
+            <form className="modal-grid agenda-deadline-form" onSubmit={handleCreateDeadline}>
               <div className="field">
                 <label>Título *</label>
                 <input
@@ -9782,7 +11394,10 @@ function Agenda() {
                   placeholder="Detalhes do compromisso"
                 />
               </div>
-              <div className="publication-actions agenda-deadline-actions">
+              <div className="modal-actions agenda-deadline-actions">
+                <button className="btn ghost" type="button" onClick={handleCloseDeadlineModal} disabled={savingDeadline}>
+                  Cancelar
+                </button>
                 <button className="btn" type="submit" disabled={!deadlineForm.title.trim() || !deadlineForm.dueDate || savingDeadline}>
                   {savingDeadline ? "Salvando..." : "Salvar compromisso"}
                 </button>
@@ -9790,113 +11405,7 @@ function Agenda() {
             </form>
           </div>
         </div>
-
-        <div className="agenda-right">
-          <div className="publication-card agenda-events-card">
-            <div className="agenda-events-head">
-              <div>
-                <div className="publication-title">Compromissos do dia</div>
-                <div className="publication-meta">{formatAgendaHeaderDate(selectedDate)}</div>
-              </div>
-              <div className="agenda-filters">
-                <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value as "all" | "internal" | CalendarProvider)}>
-                  <option value="all">Todas origens</option>
-                  <option value="internal">Somente internos</option>
-                  <option value="google">Google</option>
-                  <option value="microsoft">Microsoft</option>
-                </select>
-                <select value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as "all" | "deadline" | "meeting")}>
-                  <option value="all">Todos tipos</option>
-                  <option value="deadline">Prazos</option>
-                  <option value="meeting">Reuniões e compromissos</option>
-                </select>
-                <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as "all" | "open" | "completed")}>
-                  <option value="all">Todos status</option>
-                  <option value="open">Em aberto</option>
-                  <option value="completed">Concluídos</option>
-                </select>
-              </div>
-            </div>
-
-            {isLoading ? (
-              <div className="publication-empty">Carregando agenda...</div>
-            ) : selectedDayEvents.length === 0 ? (
-              <div className="publication-empty">Nenhum compromisso para o dia selecionado.</div>
-            ) : (
-              <div className="publication-list agenda-event-list">
-                {selectedDayEvents.map((item) => {
-                  const completed = isAgendaItemCompleted(item);
-                  const isUpdating = updatingDeadlineId === item.entity_id;
-                  return (
-                    <div key={item.id} className={`publication-item agenda-event-item ${item.kind} ${completed ? "completed" : ""}`}>
-                      <div>
-                        <div className="publication-name">{item.title}</div>
-                        <div className="publication-meta">
-                          {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} · {agendaSourceLabel(item.source)}
-                          {item.reference ? ` · ${item.reference}` : ""}
-                        </div>
-                        {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
-                        {item.description && <div className="agenda-event-description">{item.description}</div>}
-                        {item.location && <div className="publication-meta">Local: {item.location}</div>}
-                        {item.meeting_url && (
-                          <a className="agenda-meeting-link" href={item.meeting_url} target="_blank" rel="noreferrer">
-                            Entrar na reunião
-                          </a>
-                        )}
-                      </div>
-                      <div className="agenda-event-side">
-                        <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
-                        {completed && <span className="agenda-status completed">Concluído</span>}
-                        {item.source === "internal" && (
-                          <div className="agenda-event-actions">
-                            <button
-                              type="button"
-                              className={`link-btn ${completed ? "" : "success"}`}
-                              onClick={() => handleToggleDeadlineCompleted(item)}
-                              disabled={isUpdating}
-                            >
-                              {isUpdating ? "Salvando..." : completed ? "Reabrir" : "Concluir"}
-                            </button>
-                            <button type="button" className="link-btn danger" onClick={() => handleDeleteDeadline(item)}>
-                              Remover
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          <div className="publication-card agenda-upcoming-card">
-            <div className="publication-title">Próximos compromissos</div>
-            {upcomingEvents.length === 0 ? (
-              <div className="publication-empty">Sem itens futuros para os filtros escolhidos.</div>
-            ) : (
-              <div className="publication-list">
-                {upcomingEvents.map((item) => (
-                  <div key={`upcoming-${item.id}`} className={`publication-item agenda-upcoming-item ${isAgendaItemCompleted(item) ? "completed" : ""}`}>
-                    <div>
-                      <div className="publication-name">{item.title}</div>
-                      <div className="publication-meta">
-                      {new Date(item.starts_at).toLocaleDateString("pt-BR")} · {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)} ·{" "}
-                        {agendaSourceLabel(item.source)}
-                      </div>
-                      {agendaEventAssigneesLabel(item) && <div className="publication-meta">Responsáveis: {agendaEventAssigneesLabel(item)}</div>}
-                    </div>
-                    <div className="agenda-event-side">
-                      <span className={`publication-tag agenda-tag ${item.kind}`}>{agendaEventTagLabel(item)}</span>
-                      {isAgendaItemCompleted(item) && <span className="agenda-status completed">Concluído</span>}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+      )}
     </div>
   );
 }

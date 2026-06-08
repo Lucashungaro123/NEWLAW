@@ -49,6 +49,15 @@ NEWLAW_ADMIN_SECRET=troque_por_um_segredo_forte
 NEWLAW_MASTER_EMAIL=master@newlaw.app.br
 NEWLAW_MASTER_PASSWORD=Newlaw#2026!Master
 NEWLAW_MASTER_NAME=Administrador
+NEWLAW_INVITE_BASE_URL=https://api.newlaw.app.br/invite
+NEWLAW_SMTP_HOST=smtp.zoho.com
+NEWLAW_SMTP_PORT=587
+NEWLAW_SMTP_STARTTLS=1
+NEWLAW_SMTP_USERNAME=suporte@newlaw.app.br
+NEWLAW_SMTP_PASSWORD=SENHA_DO_SMTP_AQUI
+NEWLAW_SMTP_FROM_EMAIL=suporte@newlaw.app.br
+NEWLAW_SMTP_FROM_NAME=NEWLAW_Suporte
+NEWLAW_EMAIL_SIGNATURE_TEXT='Atenciosamente,\nEquipe NEWLAW\nsuporte@newlaw.app.br'
 ENV
 ```
 
@@ -112,6 +121,22 @@ sudo certbot --nginx -d api.newlaw.app.br
 ## 9) Verificações
 - Healthcheck: `https://api.newlaw.app.br/health`
 - Login: `POST https://api.newlaw.app.br/auth/login`
+
+## 10) Email transacional e remetente verificado
+O backend envia convites por SMTP usando:
+- `NEWLAW_SMTP_HOST`, `NEWLAW_SMTP_PORT`, `NEWLAW_SMTP_STARTTLS`
+- `NEWLAW_SMTP_USERNAME`, `NEWLAW_SMTP_PASSWORD`
+- `NEWLAW_SMTP_FROM_EMAIL`, `NEWLAW_SMTP_FROM_NAME`
+- `NEWLAW_EMAIL_SIGNATURE_TEXT` para anexar assinatura em texto aos emails do sistema
+- `NEWLAW_EMAIL_SIGNATURE_HTML` opcional para usar uma assinatura HTML customizada
+
+Se o SMTP for Zoho (`smtp.zoho.com`) e o remetente for `suporte@newlaw.app.br`, o DNS do dominio precisa autorizar o Zoho:
+- SPF: mantenha apenas um TXT SPF no dominio raiz. Exemplo para Zoho: `v=spf1 include:zohomail.com -all`.
+- Se tambem enviar pelo Microsoft 365, combine tudo em um unico SPF: `v=spf1 include:spf.protection.outlook.com include:zohomail.com -all`.
+- DKIM: gere a chave no Zoho Mail Admin Console, publique o TXT no seletor indicado pelo Zoho e ative/valide o seletor.
+- DMARC: publique um TXT em `_dmarc.newlaw.app.br`. Exemplo inicial: `v=DMARC1; p=none; rua=mailto:suporte@newlaw.app.br; adkim=s; aspf=s`.
+
+Depois de alterar DNS, aguarde a propagacao, clique em verificar SPF/DKIM no painel do Zoho e envie um novo convite de teste.
 
 ## Observações
 - Em produção, troque a senha master e os segredos.

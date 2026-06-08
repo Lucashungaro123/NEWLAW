@@ -98,6 +98,8 @@ SMTP_PASSWORD = os.getenv("NEWLAW_SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.getenv("NEWLAW_SMTP_FROM_EMAIL", SMTP_USERNAME or "no-reply@newlaw.app.br")
 SMTP_FROM_NAME = os.getenv("NEWLAW_SMTP_FROM_NAME", "NEWLAW")
 SMTP_STARTTLS = os.getenv("NEWLAW_SMTP_STARTTLS", "1") == "1"
+EMAIL_SIGNATURE_TEXT = os.getenv("NEWLAW_EMAIL_SIGNATURE_TEXT", "")
+EMAIL_SIGNATURE_HTML = os.getenv("NEWLAW_EMAIL_SIGNATURE_HTML", "")
 CALENDAR_REDIRECT_URI = os.getenv("NEWLAW_CALENDAR_REDIRECT_URI", "").strip()
 CALENDAR_TOKEN_KEY = os.getenv("NEWLAW_CALENDAR_TOKEN_KEY", "")
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("NEWLAW_GOOGLE_CLIENT_ID", "")
@@ -410,10 +412,48 @@ def ensure_user_can_access_wallet(session: Session, user: User, wallet: Wallet) 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem acesso a esta carteira")
 
 
+def normalize_email_signature(value: str) -> str:
+    return value.replace("\\n", "\n").strip()
+
+
+def render_email_signature_text() -> str:
+    return normalize_email_signature(EMAIL_SIGNATURE_TEXT)
+
+
+def render_email_signature_html() -> str:
+    configured_html = normalize_email_signature(EMAIL_SIGNATURE_HTML)
+    if configured_html:
+        return configured_html
+    signature_text = render_email_signature_text()
+    if not signature_text:
+        return ""
+    escaped_lines = "<br />".join(escape(line) for line in signature_text.splitlines())
+    return (
+        "<div style=\"margin-top:24px;color:#475569;font-size:14px;line-height:1.5;\">"
+        f"{escaped_lines}"
+        "</div>"
+    )
+
+
+def apply_email_signature(text_body: str, html_body: str | None = None) -> tuple[str, str | None]:
+    signature_text = render_email_signature_text()
+    signature_html = render_email_signature_html()
+    if signature_text:
+        text_body = f"{text_body}\n\n--\n{signature_text}"
+    if html_body and signature_html:
+        html_body = (
+            f"{html_body}"
+            "<hr style=\"border:0;border-top:1px solid #e2e8f0;margin:24px 0 16px 0;\" />"
+            f"{signature_html}"
+        )
+    return text_body, html_body
+
+
 def send_system_email(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
     """Send transactional email through SMTP. Returns False when not configured or on failure."""
     if not SMTP_HOST:
         return False
+    text_body, html_body = apply_email_signature(text_body, html_body)
     message = EmailMessage()
     message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
     message["To"] = to_email
@@ -1210,7 +1250,7 @@ def parse_deadline_due_date(raw_value: str) -> datetime:
     return parsed
 
 
-INTERNAL_AGENDA_EVENT_TYPES = {"deadline", "meeting", "hearing", "audit"}
+INTERNAL_AGENDA_EVENT_TYPES = {"deadline", "task", "meeting", "hearing", "audit"}
 SERVICE_INTAKE_STATUSES = {"registrado", "proposta", "fechado", "nao_avancou"}
 
 
@@ -1218,6 +1258,7 @@ def normalize_internal_agenda_event_type(raw_value: str | None) -> str:
     value = (raw_value or "").strip().lower()
     aliases = {
         "prazo": "deadline",
+        "tarefa": "task",
         "reuniao": "meeting",
         "reunião": "meeting",
         "audiencia": "hearing",
@@ -2174,7 +2215,16 @@ class AgendaDeadlineCreateRequest(BaseModel):
 
 
 class AgendaDeadlineUpdateRequest(BaseModel):
-    is_completed: bool
+    title: str | None = None
+    due_date: str | None = None
+    reference: str | None = None
+    notes: str | None = None
+    event_type: str | None = None
+    meeting_url: str | None = None
+    assignees: str | None = None
+    end_time: str | None = None
+    is_all_day: bool | None = None
+    is_completed: bool | None = None
 
 
 class ServiceIntakeRequest(BaseModel):
@@ -2378,12 +2428,15 @@ class PublicationHandleRequest(BaseModel):
     responsible_emails: list[str] | None = None
     include_actor_responsible: bool = True
     allow_office_wide_responsibles: bool = False
+    event_type: str | None = None
+    end_time: str | None = None
+    is_all_day: bool = True
 
 
 class PublicationHandleResponse(BaseModel):
     source_key: str
-    status: str
-    handled_at: datetime
+    status: str | None = None
+    handled_at: datetime | None = None
     created_agenda_items: int = 0
     message: str
 
@@ -3714,6 +3767,7 @@ def build_publication_client_name_lookup(session: Session, organization_id: int)
 
 
 PUBLICATION_HANDLING_STATUSES = {"task_created", "read_no_action"}
+PUBLICATION_HANDLING_ACTIONS = PUBLICATION_HANDLING_STATUSES | {"clear"}
 
 
 def normalize_publication_source_key(raw_value: str) -> str:
@@ -3994,6 +4048,9 @@ def create_publication_agenda_deadlines(
     due_at: datetime,
     task_title: str,
     task_details: str | None,
+    event_type: str,
+    end_time: str | None,
+    is_all_day: bool,
     source_key: str,
     process_number: str | None,
     detail_url: str,
@@ -4013,13 +4070,13 @@ def create_publication_agenda_deadlines(
             reference=reference,
             notes=serialize_internal_agenda_metadata(
                 notes=task_details,
-                event_type="deadline",
+                event_type=event_type,
                 meeting_url=None,
                 assignees=assignees_label or None,
-                end_time=None,
+                end_time=end_time,
                 assignee_id=assignee_user.id,
                 assignee_name=(assignee_user.full_name or "").strip() or assignee_user.email,
-                is_all_day=True,
+                is_all_day=is_all_day,
                 publication_source_key=source_key,
                 publication_process_number=(process_number or "").strip() or None,
                 publication_detail_url=(detail_url or "").strip() or None,
@@ -4655,6 +4712,59 @@ def ensure_unique_team_member_email(
 
 def get_user_by_email(session: Session, email: str) -> User | None:
     return session.exec(select(User).where(User.email == normalize_email(email))).first()
+
+
+def purge_member_login_account(session: Session, linked_user: User) -> None:
+    """Remove auth/personal data for a deleted team member while preserving business records."""
+    if linked_user.id is None:
+        return
+    linked_user_id = linked_user.id
+    now = datetime.utcnow()
+
+    session.exec(delete(RefreshToken).where(RefreshToken.user_id == linked_user_id))
+    session.exec(delete(ExternalCalendarEvent).where(ExternalCalendarEvent.user_id == linked_user_id))
+    session.exec(delete(CalendarConnection).where(CalendarConnection.user_id == linked_user_id))
+    session.exec(delete(AgendaDeadline).where(AgendaDeadline.user_id == linked_user_id))
+
+    service_records = session.exec(select(ServiceIntake).where(ServiceIntake.handled_by_user_id == linked_user_id)).all()
+    for record in service_records:
+        record.handled_by_user_id = None
+        record.updated_at = now
+        session.add(record)
+
+    finance_records = session.exec(select(FinancialEntry).where(FinancialEntry.created_by_user_id == linked_user_id)).all()
+    for record in finance_records:
+        record.created_by_user_id = None
+        record.updated_at = now
+        session.add(record)
+
+    document_records = session.exec(select(ClientDocument).where(ClientDocument.uploaded_by_user_id == linked_user_id)).all()
+    for record in document_records:
+        record.uploaded_by_user_id = None
+        record.updated_at = now
+        session.add(record)
+
+    publication_records = session.exec(select(PublicationHandling).where(PublicationHandling.handled_by_user_id == linked_user_id)).all()
+    for record in publication_records:
+        record.handled_by_user_id = None
+        record.updated_at = now
+        session.add(record)
+
+    session.delete(linked_user)
+
+
+def purge_deleted_member_user_for_email(session: Session, email: str) -> bool:
+    linked_user = get_user_by_email(session, email)
+    if (
+        not linked_user
+        or linked_user.role != "member"
+        or linked_user.is_active
+        or get_team_member_for_user(session, linked_user) is not None
+    ):
+        return False
+    purge_member_login_account(session, linked_user)
+    session.flush()
+    return True
 
 
 def serialize_team_member(member: TeamMember, *, invite_email_sent: bool = False, invite_token: str | None = None) -> dict:
@@ -5415,7 +5525,48 @@ def update_agenda_deadline(
     if not deadline:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prazo não encontrado")
     ensure_can_manage_agenda_deadline(deadline, user)
-    deadline.is_completed = bool(payload.is_completed)
+
+    fields_set = payload.model_fields_set
+    if "title" in fields_set:
+        title = (payload.title or "").strip()
+        if not title:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título do prazo é obrigatório")
+        deadline.title = title
+    if "due_date" in fields_set:
+        deadline.due_at = parse_deadline_due_date(payload.due_date or "")
+    if "reference" in fields_set:
+        deadline.reference = (payload.reference or "").strip() or None
+    if "is_completed" in fields_set:
+        deadline.is_completed = bool(payload.is_completed)
+
+    metadata = parse_internal_agenda_metadata(deadline.notes)
+    if "notes" in fields_set:
+        metadata["notes"] = (payload.notes or "").strip() or None
+    if "event_type" in fields_set:
+        metadata["event_type"] = normalize_internal_agenda_event_type(payload.event_type)
+    if "meeting_url" in fields_set:
+        metadata["meeting_url"] = (payload.meeting_url or "").strip() or None
+    if "assignees" in fields_set:
+        metadata["assignees"] = (payload.assignees or "").strip() or None
+    if "end_time" in fields_set:
+        metadata["end_time"] = normalize_internal_agenda_time(payload.end_time)
+    if "is_all_day" in fields_set:
+        metadata["is_all_day"] = bool(payload.is_all_day)
+
+    deadline.notes = serialize_internal_agenda_metadata(
+        notes=metadata.get("notes"),
+        event_type=metadata.get("event_type"),
+        meeting_url=metadata.get("meeting_url"),
+        assignees=metadata.get("assignees"),
+        end_time=metadata.get("end_time"),
+        assignee_id=metadata.get("assignee_id"),
+        assignee_name=metadata.get("assignee_name"),
+        is_all_day=bool(metadata.get("is_all_day", True)),
+        publication_source_key=metadata.get("publication_source_key"),
+        publication_process_number=metadata.get("publication_process_number"),
+        publication_detail_url=metadata.get("publication_detail_url"),
+        created_via=metadata.get("created_via"),
+    )
     deadline.updated_at = datetime.utcnow()
     session.add(deadline)
     session.commit()
@@ -5720,6 +5871,7 @@ def create_team_member(
     clean = sanitize_team_member_payload(payload)
     ensure_unique_team_member_cpf(session, clean["cpf"], organization_id)
     ensure_unique_team_member_email(session, clean["email"], organization_id)
+    purge_deleted_member_user_for_email(session, clean["email"])
     member = TeamMember(
         organization_id=organization_id,
         full_name=clean["full_name"],
@@ -5797,6 +5949,8 @@ def update_team_member(
     clean = sanitize_team_member_payload(payload)
     ensure_unique_team_member_cpf(session, clean["cpf"], target_organization_id, ignore_id=member.id)
     ensure_unique_team_member_email(session, clean["email"], target_organization_id, ignore_id=member.id)
+    if normalize_email(member.email) != clean["email"]:
+        purge_deleted_member_user_for_email(session, clean["email"])
 
     old_member_email = member.email
     old_member_active = member.is_active
@@ -5916,17 +6070,7 @@ def delete_team_member(
     if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "owner":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A conta master não pode ser excluída.")
     if linked_user and linked_user.id is not None and linked_user.organization_id == member.organization_id and linked_user.role == "member":
-        linked_user.is_active = False
-        linked_user.updated_at = datetime.utcnow()
-        session.add(linked_user)
-        active_tokens = session.exec(
-            select(RefreshToken).where(RefreshToken.user_id == linked_user.id, RefreshToken.revoked_at == None)  # noqa: E712
-        ).all()
-        if active_tokens:
-            revoked_at = datetime.utcnow()
-            for token in active_tokens:
-                token.revoked_at = revoked_at
-            session.add_all(active_tokens)
+        purge_member_login_account(session, linked_user)
     access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.team_member_id == member.id)).all()
     for row in access_rows:
         session.delete(row)
@@ -6721,7 +6865,7 @@ def handle_publication(
     organization = resolve_organization_entity(user, session, user.organization_id)
     organization_id = get_organization_pk(organization)
     action = (payload.action or "").strip().lower()
-    if action not in PUBLICATION_HANDLING_STATUSES:
+    if action not in PUBLICATION_HANDLING_ACTIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ação da publicação inválida")
 
     source_key = normalize_publication_source_key(payload.source_key)
@@ -6754,15 +6898,28 @@ def handle_publication(
         wallet=wallet,
     )
 
-    current_status = normalize_publication_handling_status(handling.status)
     handled_at = get_local_now()
 
+    if action == "clear":
+        handling.status = None
+        handling.handled_by_user_id = None
+        handling.handled_at = None
+        handling.task_title = None
+        handling.task_details = None
+        handling.task_due_at = None
+        handling.task_assignees = None
+        handling.updated_at = datetime.utcnow()
+        session.add(handling)
+        session.commit()
+        return PublicationHandleResponse(
+            source_key=source_key,
+            status=None,
+            handled_at=None,
+            created_agenda_items=0,
+            message="Marcação da publicação removida.",
+        ).model_dump()
+
     if action == "read_no_action":
-        if current_status == "task_created":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Esta publicação já possui uma providência cadastrada.",
-            )
         handling.status = "read_no_action"
         handling.handled_by_user_id = user.id
         handling.handled_at = handled_at
@@ -6781,12 +6938,6 @@ def handle_publication(
             message="Publicação marcada como lida sem providências.",
         ).model_dump()
 
-    if current_status == "task_created":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Esta publicação já possui uma providência cadastrada.",
-        )
-
     task_title = (payload.task_title or "").strip()
     if not task_title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Título da tarefa é obrigatório")
@@ -6804,6 +6955,7 @@ def handle_publication(
         allow_office_wide_responsibles=payload.allow_office_wide_responsibles,
     )
     due_at = parse_deadline_due_date(payload.due_date or "")
+    event_type = normalize_internal_agenda_event_type(payload.event_type)
     created_agenda_items = create_publication_agenda_deadlines(
         session,
         assignee_users=assignee_users,
@@ -6811,6 +6963,9 @@ def handle_publication(
         due_at=due_at,
         task_title=task_title,
         task_details=(payload.task_details or "").strip() or None,
+        event_type=event_type,
+        end_time=payload.end_time,
+        is_all_day=payload.is_all_day,
         source_key=source_key,
         process_number=matched_case.number if matched_case else process_number,
         detail_url=detail_url,
@@ -6832,7 +6987,7 @@ def handle_publication(
         status=handling.status,
         handled_at=handled_at,
         created_agenda_items=created_agenda_items,
-        message="Tarefa criada com sucesso a partir da publicação.",
+        message="Providência criada com sucesso a partir da publicação.",
     ).model_dump()
 
 

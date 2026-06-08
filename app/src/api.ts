@@ -282,7 +282,7 @@ export type CalendarConnectionStart = {
   expires_in_seconds: number;
 };
 export type AgendaItemKind = "deadline" | "meeting";
-export type InternalAgendaEventType = "deadline" | "meeting" | "hearing" | "audit";
+export type InternalAgendaEventType = "deadline" | "task" | "meeting" | "hearing" | "audit";
 export type AgendaItem = {
   id: string;
   entity_id: number;
@@ -317,7 +317,16 @@ export type CreateAgendaDeadlinePayload = {
   is_all_day?: boolean;
 };
 export type UpdateAgendaDeadlinePayload = {
-  is_completed: boolean;
+  title?: string;
+  due_date?: string;
+  reference?: string;
+  notes?: string;
+  event_type?: InternalAgendaEventType;
+  meeting_url?: string;
+  assignees?: string;
+  end_time?: string;
+  is_all_day?: boolean;
+  is_completed?: boolean;
 };
 export type FinanceEntryType = "receita" | "despesa";
 export type FinancePaymentMethod = "" | "pix" | "boleto" | "cartao" | "dinheiro" | "transferencia";
@@ -384,6 +393,7 @@ export type TodayPublicationsResponse = {
   items: TodayPublicationItem[];
 };
 export type PublicationHandlingStatus = "task_created" | "read_no_action";
+export type PublicationHandlingAction = PublicationHandlingStatus | "clear";
 export type PublicationResponsibleOption = {
   name: string;
   email: string;
@@ -415,18 +425,21 @@ export type HandlePublicationPayload = {
   process_number?: string;
   detail_url: string;
   summary?: string;
-  action: PublicationHandlingStatus;
+  action: PublicationHandlingAction;
   task_title?: string;
   task_details?: string;
   due_date?: string;
   responsible_emails?: string[];
   include_actor_responsible?: boolean;
   allow_office_wide_responsibles?: boolean;
+  event_type?: InternalAgendaEventType;
+  end_time?: string;
+  is_all_day?: boolean;
 };
 export type HandlePublicationResponse = {
   source_key: string;
-  status: PublicationHandlingStatus;
-  handled_at: string;
+  status: PublicationHandlingStatus | null;
+  handled_at: string | null;
   created_agenda_items: number;
   message: string;
 };
