@@ -228,6 +228,10 @@ export type CreateWalletPayload = {
   organization_id?: number;
 };
 export type UpdateWalletPayload = CreateWalletPayload;
+export type TransferWalletPayload = {
+  source_team_member_id?: number;
+  target_team_member_id: number;
+};
 
 export type ApiTeamMember = {
   id: number;
@@ -884,6 +888,11 @@ export async function createWallet(payload: CreateWalletPayload) {
 
 export async function updateWallet(walletId: number, payload: UpdateWalletPayload) {
   const { data } = await api.put(`/wallets/${walletId}`, payload);
+  return data as ApiWallet;
+}
+
+export async function transferWallet(walletId: number, payload: TransferWalletPayload) {
+  const { data } = await api.post(`/wallets/${walletId}/transfer`, payload);
   return data as ApiWallet;
 }
 

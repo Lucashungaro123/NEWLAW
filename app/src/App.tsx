@@ -68,6 +68,7 @@ import {
   updateClient as apiUpdateClient,
   updateFinanceEntry as apiUpdateFinanceEntry,
   updateWallet as apiUpdateWallet,
+  transferWallet as apiTransferWallet,
   loadAuthSession,
   logout as apiLogout,
   ping,
@@ -1864,7 +1865,7 @@ function ProcessFormFields({
           <option value="">Selecione</option>
           {(wallets || []).map((wallet) => (
             <option key={wallet.id} value={String(wallet.id)}>
-              {wallet.name} - {wallet.nickname}
+              {wallet.nickname}
             </option>
           ))}
         </select>
@@ -3450,6 +3451,8 @@ function Service({ user }: { user: AuthUser | null }) {
   const [records, setRecords] = useState<ApiServiceIntake[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [form, setForm] = useState<ServiceIntakeFormState>(() => buildEmptyServiceIntakeForm(user));
+  const [searchTerm, setSearchTerm] = useState("");
+  const [isFormModalOpen, setIsFormModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -3509,15 +3512,51 @@ function Service({ user }: { user: AuthUser | null }) {
     [records]
   );
 
+  const filteredRecords = useMemo(() => {
+    const normalizedTerm = normalizeSearchText(searchTerm.trim());
+    if (!normalizedTerm) return records;
+    return records.filter((record) => {
+      const haystack = normalizeSearchText(
+        [
+          record.lead_name,
+          record.document,
+          record.email,
+          record.phone,
+          record.legal_area,
+          record.process_overview,
+          record.summary,
+          record.next_steps,
+          record.handled_by_name,
+          record.payment_terms
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+      return haystack.includes(normalizedTerm);
+    });
+  }, [records, searchTerm]);
+
   const resetForm = () => {
     setSelectedId(null);
     setForm(buildEmptyServiceIntakeForm(user));
     setError("");
   };
 
+  const handleNewRecord = () => {
+    resetForm();
+    setIsFormModalOpen(true);
+  };
+
   const handleSelectRecord = (record: ApiServiceIntake) => {
     setSelectedId(record.id);
     setForm(mapServiceIntakeToForm(record));
+    setError("");
+    setIsFormModalOpen(true);
+  };
+
+  const handleCloseFormModal = () => {
+    if (isSaving || isDeleting) return;
+    setIsFormModalOpen(false);
     setError("");
   };
 
@@ -3569,6 +3608,7 @@ function Service({ user }: { user: AuthUser | null }) {
       });
       setSelectedId(saved.id);
       setForm(mapServiceIntakeToForm(saved));
+      setIsFormModalOpen(false);
       setInlineMessage(selectedRecord ? "Atendimento atualizado." : "Atendimento registrado.");
     } catch (err) {
       setError(extractApiErrorMessage(err, "Não foi possível salvar o atendimento."));
@@ -3586,6 +3626,7 @@ function Service({ user }: { user: AuthUser | null }) {
       await apiDeleteServiceIntake(selectedRecord.id);
       setRecords((prev) => prev.filter((item) => item.id !== selectedRecord.id));
       resetForm();
+      setIsFormModalOpen(false);
       setInlineMessage("Atendimento removido.");
     } catch (err) {
       setError(extractApiErrorMessage(err, "Não foi possível remover o atendimento."));
@@ -3604,7 +3645,7 @@ function Service({ user }: { user: AuthUser | null }) {
             Registre quem é o interessado, como foi a reunião, a estratégia inicial e os valores combinados.
           </div>
         </div>
-        <button type="button" className="btn small" onClick={resetForm}>
+        <button type="button" className="btn small" onClick={handleNewRecord}>
           Novo atendimento
         </button>
       </div>
@@ -3624,106 +3665,147 @@ function Service({ user }: { user: AuthUser | null }) {
         </div>
       </div>
 
-      {error && <div className="error">{error}</div>}
+      {error && !isFormModalOpen && <div className="error">{error}</div>}
       {inlineMessage && <div className="agenda-inline">{inlineMessage}</div>}
 
-      <div className="service-layout">
-        <aside className="service-sidebar">
-          <div className="service-list-card">
-            <div className="service-list-head">
-              <strong>Histórico</strong>
-              <span className="pill">{records.length}</span>
-            </div>
-            {isLoading ? (
-              <div className="service-empty">Carregando atendimentos...</div>
-            ) : records.length > 0 ? (
-              <div className="service-list">
-                {records.map((record) => (
-                  <button
-                    type="button"
-                    key={record.id}
-                    className={`service-list-item ${record.id === selectedId ? "active" : ""}`}
-                    onClick={() => handleSelectRecord(record)}
-                  >
-                    <div className="service-list-top">
-                      <strong>{record.lead_name}</strong>
-                      <span className={`service-status-pill tone-${record.status}`}>{serviceStatusLabelMap[record.status]}</span>
-                    </div>
-                    <div className="service-list-meta">
-                      <span>{record.meeting_date ? formatBrazilDate(record.meeting_date) : "Sem data"}</span>
-                      <span>{record.meeting_time || "Sem horário"}</span>
-                    </div>
-                    <div className="service-list-note">{getServiceIntakePreview(record)}</div>
-                    <div className="service-list-footer">
-                      <span>{record.handled_by_name || "Sem responsável"}</span>
-                      <span>{typeof record.agreed_fee === "number" ? formatCurrencyBRL(record.agreed_fee) : "Sem valor"}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="service-empty">Nenhum atendimento registrado ainda.</div>
-            )}
+      <section className="service-history-card">
+        <div className="service-history-head">
+          <div>
+            <strong>Histórico de atendimentos</strong>
+            <span>Pesquise por cliente, documento, assunto ou conteúdo do processo.</span>
           </div>
-        </aside>
+          <span className="pill">{filteredRecords.length}</span>
+        </div>
 
-        <section className="service-main">
-          <form className="service-form-card" onSubmit={handleSave}>
-            <div className="service-form-head">
-              <div>
-                <strong>{selectedRecord ? "Editar atendimento" : "Novo atendimento"}</strong>
-                <span>{selectedRecord ? "Atualize a ficha e mantenha o histórico da reunião." : "Preencha a ficha simples do atendimento."}</span>
+        <div className="service-search-row">
+          <input
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder="Buscar por cliente, documento, processo ou assunto"
+          />
+          {searchTerm.trim() ? (
+            <button type="button" className="btn ghost small" onClick={() => setSearchTerm("")}>
+              Limpar
+            </button>
+          ) : null}
+        </div>
+
+        {isLoading ? (
+          <div className="service-empty">Carregando atendimentos...</div>
+        ) : records.length === 0 ? (
+          <div className="service-empty">Nenhum atendimento registrado ainda.</div>
+        ) : filteredRecords.length === 0 ? (
+          <div className="service-empty">Nenhum atendimento encontrado para a busca.</div>
+        ) : (
+          <div className="service-history-list">
+            {filteredRecords.map((record) => (
+              <button
+                type="button"
+                key={record.id}
+                className={`service-history-item ${record.id === selectedId ? "active" : ""}`}
+                onClick={() => handleSelectRecord(record)}
+              >
+                <div className="service-history-main">
+                  <div className="service-history-title-row">
+                    <strong>{record.lead_name}</strong>
+                    <span className={`service-status-pill tone-${record.status}`}>{serviceStatusLabelMap[record.status]}</span>
+                  </div>
+                  <div className="service-history-meta">
+                    <span>{record.meeting_date ? formatBrazilDate(record.meeting_date) : "Sem data"}</span>
+                    <span>{record.meeting_time || "Sem horário"}</span>
+                    <span>{record.legal_area || "Sem assunto"}</span>
+                    <span>{record.document || "Sem documento"}</span>
+                  </div>
+                  <div className="service-history-preview">{getServiceIntakePreview(record)}</div>
+                  {record.process_overview ? (
+                    <div className="service-history-process">
+                      <span>Processo</span>
+                      <p>{record.process_overview}</p>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="service-history-side">
+                  <span>{record.handled_by_name || "Sem responsável"}</span>
+                  <strong>{typeof record.agreed_fee === "number" ? formatCurrencyBRL(record.agreed_fee) : "Sem valor"}</strong>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {isFormModalOpen ? (
+        <div className="modal-backdrop service-modal-backdrop" onClick={handleCloseFormModal}>
+          <div
+            className="modal-card service-modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="service-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <form className="service-form-card service-form-modal" onSubmit={handleSave}>
+              <div className="modal-head service-modal-head">
+                <h2 id="service-modal-title" className="modal-title">
+                  {selectedRecord ? "Editar atendimento" : "Novo atendimento"}
+                </h2>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="Fechar"
+                  onClick={handleCloseFormModal}
+                  disabled={isSaving || isDeleting}
+                >
+                  ×
+                </button>
+              </div>
+
+              <div className="modal-note">
+                Campos obrigatórios: Nome do interessado.
               </div>
               {selectedRecord?.updated_at ? (
                 <div className="service-form-updated">
                   Atualizado em {new Date(selectedRecord.updated_at).toLocaleString("pt-BR")}
                 </div>
               ) : null}
-            </div>
+              {error && <div className="error">{error}</div>}
 
-            <div className="service-section">
-              <div className="service-section-title">Cadastro básico</div>
-              <div className="service-form-grid">
-                <label>
-                  Nome do interessado *
+              <div className="modal-grid service-intake-grid">
+                <div className="field span-2">
+                  <label>
+                    Nome do interessado <span className="required">*</span>
+                  </label>
                   <input value={form.leadName} onChange={handleChangeField("leadName")} placeholder="Nome completo" />
-                </label>
-                <label>
-                  CPF/CNPJ
+                </div>
+                <div className="field">
+                  <label>CPF/CNPJ</label>
                   <input value={form.document} onChange={handleChangeField("document")} placeholder="Documento" />
-                </label>
-                <label>
-                  Telefone / WhatsApp
+                </div>
+                <div className="field">
+                  <label>Telefone / WhatsApp</label>
                   <input value={form.phone} onChange={handleChangeField("phone")} placeholder="(00) 00000-0000" />
-                </label>
-                <label>
-                  E-mail
+                </div>
+                <div className="field span-2">
+                  <label>E-mail</label>
                   <input type="email" value={form.email} onChange={handleChangeField("email")} placeholder="email@cliente.com" />
-                </label>
-              </div>
-            </div>
-
-            <div className="service-section">
-              <div className="service-section-title">Reunião</div>
-              <div className="service-form-grid">
-                <label>
-                  Área / assunto
+                </div>
+                <div className="field">
+                  <label>Área / assunto</label>
                   <input value={form.legalArea} onChange={handleChangeField("legalArea")} placeholder="Ex.: Trabalhista, família, consumidor" />
-                </label>
-                <label>
-                  Onde nos conheceu
+                </div>
+                <div className="field">
+                  <label>Onde nos conheceu</label>
                   <input value={form.referralSource} onChange={handleChangeField("referralSource")} placeholder="Indicação, Instagram, Google..." />
-                </label>
-                <label>
-                  Data do atendimento
+                </div>
+                <div className="field">
+                  <label>Data do atendimento</label>
                   <input type="date" value={form.meetingDate} onChange={handleChangeField("meetingDate")} />
-                </label>
-                <label>
-                  Horário
+                </div>
+                <div className="field">
+                  <label>Horário</label>
                   <input type="time" value={form.meetingTime} onChange={handleChangeField("meetingTime")} />
-                </label>
-                <label>
-                  Forma do atendimento
+                </div>
+                <div className="field">
+                  <label>Forma do atendimento</label>
                   <select value={form.meetingMode} onChange={handleChangeField("meetingMode")}>
                     {serviceMeetingModeOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -3731,13 +3813,13 @@ function Service({ user }: { user: AuthUser | null }) {
                       </option>
                     ))}
                   </select>
-                </label>
-                <label>
-                  Responsável pelo atendimento
+                </div>
+                <div className="field">
+                  <label>Responsável pelo atendimento</label>
                   <input value={form.handledByName} onChange={handleChangeField("handledByName")} placeholder="Quem conduziu a reunião" />
-                </label>
-                <label>
-                  Status
+                </div>
+                <div className="field">
+                  <label>Status</label>
                   <select value={form.status} onChange={handleChangeField("status")}>
                     {serviceIntakeStatusOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -3745,87 +3827,77 @@ function Service({ user }: { user: AuthUser | null }) {
                       </option>
                     ))}
                   </select>
-                </label>
-              </div>
-            </div>
-
-            <div className="service-section">
-              <div className="service-section-title">Conteúdo do atendimento</div>
-              <div className="service-form-grid service-form-grid-wide">
-                <label className="service-field-span-2">
-                  Síntese da reunião
-                  <textarea
-                    value={form.summary}
-                    onChange={handleChangeField("summary")}
-                    placeholder="Resumo objetivo do que o cliente trouxe e do que foi conversado."
-                    rows={4}
-                  />
-                </label>
-                <label className="service-field-span-2">
-                  Como será o processo
-                  <textarea
-                    value={form.processOverview}
-                    onChange={handleChangeField("processOverview")}
-                    placeholder="Explique a estratégia inicial, documentos necessários, riscos e caminho processual."
-                    rows={4}
-                  />
-                </label>
-                <label className="service-field-span-2">
-                  Próximos passos
-                  <textarea
-                    value={form.nextSteps}
-                    onChange={handleChangeField("nextSteps")}
-                    placeholder="Ex.: enviar proposta, aguardar documentos, abrir pasta, agendar retorno."
-                    rows={3}
-                  />
-                </label>
-              </div>
-            </div>
-
-            <div className="service-section">
-              <div className="service-section-title">Financeiro do atendimento</div>
-              <div className="service-form-grid">
-                <label>
-                  Valor acordado
+                </div>
+                <div className="field">
+                  <label>Valor acordado</label>
                   <input
                     value={form.agreedFee}
                     onChange={handleChangeField("agreedFee")}
                     placeholder="R$ 0,00"
                     inputMode="decimal"
                   />
-                </label>
-                <label className="service-field-span-2">
-                  Condições / observações financeiras
+                </div>
+                <div className="field span-2">
+                  <label>Síntese da reunião</label>
+                  <textarea
+                    value={form.summary}
+                    onChange={handleChangeField("summary")}
+                    placeholder="Resumo objetivo do que o cliente trouxe e do que foi conversado."
+                    rows={4}
+                  />
+                </div>
+                <div className="field span-2">
+                  <label>Como será o processo</label>
+                  <textarea
+                    value={form.processOverview}
+                    onChange={handleChangeField("processOverview")}
+                    placeholder="Explique a estratégia inicial, documentos necessários, riscos e caminho processual."
+                    rows={4}
+                  />
+                </div>
+                <div className="field">
+                  <label>Próximos passos</label>
+                  <textarea
+                    value={form.nextSteps}
+                    onChange={handleChangeField("nextSteps")}
+                    placeholder="Ex.: enviar proposta, aguardar documentos, abrir pasta, agendar retorno."
+                    rows={3}
+                  />
+                </div>
+                <div className="field">
+                  <label>Condições / observações financeiras</label>
                   <textarea
                     value={form.paymentTerms}
                     onChange={handleChangeField("paymentTerms")}
                     placeholder="Parcelamento, entrada, consulta paga, êxito, pendência de aprovação..."
                     rows={3}
                   />
-                </label>
+                </div>
               </div>
-            </div>
 
-            <div className="modal-actions service-actions">
-              {selectedRecord ? (
-                <button className="btn ghost danger small" type="button" onClick={handleDelete} disabled={isDeleting || isSaving}>
-                  Excluir atendimento
-                </button>
-              ) : (
-                <span />
-              )}
-              <div className="service-actions-right">
-                <button className="btn ghost small" type="button" onClick={resetForm} disabled={isSaving}>
-                  Limpar
-                </button>
-                <button className="btn small" type="submit" disabled={isSaving || !form.leadName.trim()}>
-                  {isSaving ? "Salvando..." : selectedRecord ? "Salvar alterações" : "Registrar atendimento"}
-                </button>
+              <div className="modal-actions service-actions">
+                {selectedRecord ? (
+                  <button className="btn ghost danger" type="button" onClick={handleDelete} disabled={isDeleting || isSaving}>
+                    Excluir atendimento
+                  </button>
+                ) : (
+                  <button className="btn ghost" type="button" onClick={resetForm} disabled={isSaving}>
+                    Limpar
+                  </button>
+                )}
+                <div className="service-actions-right">
+                  <button className="btn ghost" type="button" onClick={handleCloseFormModal} disabled={isSaving || isDeleting}>
+                    Cancelar
+                  </button>
+                  <button className="btn" type="submit" disabled={isSaving || !form.leadName.trim()}>
+                    {isSaving ? "Salvando..." : selectedRecord ? "Salvar alterações" : "Registrar atendimento"}
+                  </button>
+                </div>
               </div>
-            </div>
-          </form>
-        </section>
-      </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -6388,6 +6460,34 @@ type HomeAgendaEditForm = {
   isCompleted: boolean;
 };
 
+type HomeFocusPanelKey = "fatal" | "hearings" | "meetings" | "audits" | "weekDeadlines" | "tasks";
+type HomeFocusPanelTone = "red" | "blue" | "cyan" | "purple" | "amber" | "green";
+
+const internalAgendaEventTypeValues: InternalAgendaEventType[] = ["deadline", "task", "meeting", "hearing", "audit"];
+
+const isKnownInternalAgendaEventType = (value?: string | null): value is InternalAgendaEventType =>
+  internalAgendaEventTypeValues.includes(value as InternalAgendaEventType);
+
+const isPublicationTaskLikeAgendaItem = (item: AgendaItem) => {
+  const isPublicationItem =
+    item.created_via === "publication" ||
+    Boolean(item.publication_source_key) ||
+    (item.reference || "").trim().startsWith("[Publicação]");
+  const haystack = normalizeLooseText([item.title, item.reference, item.description].filter(Boolean).join(" "));
+  return (
+    (isPublicationItem && (haystack.includes("providencia do processo") || haystack.includes("providencia da publicacao"))) ||
+    haystack.includes("tipo tarefa") ||
+    haystack.includes("categoria tarefa") ||
+    haystack.startsWith("tarefa ")
+  );
+};
+
+const getAgendaItemEventType = (item: AgendaItem): InternalAgendaEventType => {
+  if (isPublicationTaskLikeAgendaItem(item)) return "task";
+  if (isKnownInternalAgendaEventType(item.event_type)) return item.event_type;
+  return item.kind === "deadline" ? "deadline" : "task";
+};
+
 const getAgendaTimeInputValue = (value: string) => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -6399,7 +6499,7 @@ const buildHomeAgendaEditForm = (item: AgendaItem): HomeAgendaEditForm => ({
   dueDate: getAgendaDateKey(item.starts_at),
   startTime: item.is_all_day ? "" : getAgendaTimeInputValue(item.starts_at),
   endTime: item.is_all_day ? "" : getAgendaTimeInputValue(item.ends_at),
-  eventType: (item.event_type || (item.kind === "deadline" ? "deadline" : "task")) as InternalAgendaEventType,
+  eventType: getAgendaItemEventType(item),
   assignees: item.assignees || item.assignee_name || "",
   meetingUrl: item.meeting_url || "",
   reference: item.reference || "",
@@ -6413,21 +6513,25 @@ function HomeAgendaEditModal({
   form,
   saving,
   deleting,
+  confirmingDelete,
   errorMessage,
   onClose,
   onChange,
   onSave,
-  onDelete
+  onDelete,
+  onCancelDelete
 }: {
   item: AgendaItem | null;
   form: HomeAgendaEditForm;
   saving: boolean;
   deleting: boolean;
+  confirmingDelete: boolean;
   errorMessage: string;
   onClose: () => void;
   onChange: (field: keyof HomeAgendaEditForm, value: string | boolean) => void;
   onSave: (event: React.FormEvent) => void;
   onDelete: () => void;
+  onCancelDelete: () => void;
 }) {
   if (!item) return null;
   const isBusy = saving || deleting;
@@ -6528,13 +6632,20 @@ function HomeAgendaEditModal({
             </div>
           </div>
 
+          {confirmingDelete && (
+            <div className="home-agenda-delete-warning">
+              <strong>Remover este compromisso?</strong>
+              <span>Essa ação apaga o evento da agenda e não pode ser desfeita.</span>
+            </div>
+          )}
+
           <div className="modal-actions home-agenda-modal-actions">
-            <button className="btn ghost danger" type="button" onClick={onDelete} disabled={isBusy}>
-              {deleting ? "Removendo..." : "Remover"}
+            <button className="btn danger" type="button" onClick={onDelete} disabled={deleting}>
+              {deleting ? "Removendo..." : confirmingDelete ? "Confirmar remoção" : "Remover"}
             </button>
             <div className="home-agenda-modal-actions-right">
-              <button className="btn ghost" type="button" onClick={onClose} disabled={isBusy}>
-                Cancelar
+              <button className="btn ghost" type="button" onClick={confirmingDelete ? onCancelDelete : onClose} disabled={isBusy}>
+                {confirmingDelete ? "Voltar" : "Cancelar"}
               </button>
               <button className="btn" type="submit" disabled={isBusy || !form.title.trim() || !form.dueDate}>
                 {saving ? "Salvando..." : "Salvar alterações"}
@@ -6542,6 +6653,125 @@ function HomeAgendaEditModal({
             </div>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+function HomeFocusPanelModal({
+  open,
+  title,
+  tone,
+  items,
+  count,
+  emptyMessage,
+  showTaskControls = false,
+  updatingTaskIds,
+  onClose,
+  onOpenItem,
+  onToggleTask,
+  getAssigneesLabel
+}: {
+  open: boolean;
+  title: string;
+  tone: HomeFocusPanelTone;
+  items: AgendaItem[];
+  count: number;
+  emptyMessage: string;
+  showTaskControls?: boolean;
+  updatingTaskIds: number[];
+  onClose: () => void;
+  onOpenItem: (item: AgendaItem) => void;
+  onToggleTask: (item: AgendaItem) => void;
+  getAssigneesLabel: (item: AgendaItem) => string;
+}) {
+  if (!open) return null;
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card home-focus-modal-card">
+        <div className="modal-head">
+          <div className={`home-focus-modal-title tone-${tone}`}>
+            <span className="home-focus-dot" />
+            <div>
+              <h2 className="modal-title">{title}</h2>
+              <div className="publication-meta">{count} item(ns) nesta visão</div>
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar">
+            ×
+          </button>
+        </div>
+
+        <div className="home-focus-modal-list">
+          {items.length > 0 ? (
+            items.map((item) => {
+              const completed = isAgendaItemCompleted(item);
+              const isUpdating = updatingTaskIds.includes(item.entity_id);
+              const responsibleLabel = getAssigneesLabel(item) || "Sem responsável";
+              const referenceLabel = item.reference || item.location || "Sem referência";
+              return (
+                <div
+                  key={item.id}
+                  className={`home-focus-modal-item ${completed ? "done" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => onOpenItem(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onOpenItem(item);
+                    }
+                  }}
+                >
+                  {showTaskControls && (
+                    <button
+                      type="button"
+                      className={`home-task-check ${completed ? "done" : ""}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onToggleTask(item);
+                      }}
+                      disabled={isUpdating}
+                      aria-label={completed ? `Desmarcar tarefa ${item.title}` : `Marcar tarefa ${item.title} como concluída`}
+                      aria-pressed={completed}
+                    >
+                      {completed ? "✓" : ""}
+                    </button>
+                  )}
+                  <div className="home-focus-modal-copy">
+                    <div className="home-focus-modal-row-head">
+                      <strong>{item.title}</strong>
+                      <span className={`home-focus-modal-status ${completed ? "done" : ""}`}>
+                        {completed ? "Concluído" : "Em aberto"}
+                      </span>
+                    </div>
+                    <div className="home-focus-modal-meta-grid">
+                      <span>
+                        <strong>Data</strong>
+                        {formatBrazilDate(getAgendaDateKey(item.starts_at))}
+                      </span>
+                      <span>
+                        <strong>Horário</strong>
+                        {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}
+                      </span>
+                      <span>
+                        <strong>Responsável</strong>
+                        {responsibleLabel}
+                      </span>
+                      <span>
+                        <strong>Referência</strong>
+                        {referenceLabel}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="home-focus-modal-empty">{emptyMessage}</div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -6571,6 +6801,8 @@ function Home({ user }: { user: AuthUser | null }) {
   const [homeAgendaModalError, setHomeAgendaModalError] = useState("");
   const [isSavingHomeAgenda, setIsSavingHomeAgenda] = useState(false);
   const [isDeletingHomeAgenda, setIsDeletingHomeAgenda] = useState(false);
+  const [isConfirmingHomeAgendaDelete, setIsConfirmingHomeAgendaDelete] = useState(false);
+  const [activeHomeFocusPanel, setActiveHomeFocusPanel] = useState<HomeFocusPanelKey | null>(null);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => setClock(new Date()), 30000);
@@ -6693,25 +6925,79 @@ function Home({ user }: { user: AuthUser | null }) {
   };
 
   const deadlinesToday = internalWeekItems.filter(
-    (item) => item.event_type === "deadline" && getAgendaDateKey(item.starts_at) === todayKey
+    (item) => getAgendaItemEventType(item) === "deadline" && getAgendaDateKey(item.starts_at) === todayKey
   );
   const fatalDeadlinesToday = deadlinesToday.filter((item) => !isAgendaItemDone(item));
-  const hearingsWeek = internalWeekItems.filter((item) => item.event_type === "hearing");
+  const hearingsWeek = internalWeekItems.filter((item) => getAgendaItemEventType(item) === "hearing");
+  const meetingsWeek = internalWeekItems.filter((item) => getAgendaItemEventType(item) === "meeting");
+  const auditsWeek = internalWeekItems.filter((item) => getAgendaItemEventType(item) === "audit");
   const deadlinesWeek = internalWeekItems.filter((item) => {
     const dateKey = getAgendaDateKey(item.starts_at);
-    return item.event_type === "deadline" && dateKey > todayKey && dateKey <= weekEndKey;
+    return getAgendaItemEventType(item) === "deadline" && dateKey > todayKey && dateKey <= weekEndKey;
   });
   const pendingDeadlinesWeek = deadlinesWeek.filter((item) => !isAgendaItemDone(item));
   const tasksToday = internalWeekItems
     .filter((item) => {
-      const isTaskType =
-        item.event_type === "meeting" ||
-        item.event_type === "audit" ||
-        (item.kind === "meeting" && item.event_type !== "hearing");
-      return isTaskType && getAgendaDateKey(item.starts_at) === todayKey;
+      return getAgendaItemEventType(item) === "task" && getAgendaDateKey(item.starts_at) === todayKey;
     })
     .sort((left, right) => Number(isAgendaItemDone(left)) - Number(isAgendaItemDone(right)));
   const pendingTasksToday = tasksToday.filter((item) => !isAgendaItemDone(item));
+  const homeFocusPanelMap: Record<
+    HomeFocusPanelKey,
+    {
+      title: string;
+      tone: HomeFocusPanelTone;
+      items: AgendaItem[];
+      count: number;
+      emptyMessage: string;
+      showTaskControls?: boolean;
+    }
+  > = {
+    fatal: {
+      title: "Prazos Fatais",
+      tone: "red",
+      items: fatalDeadlinesToday,
+      count: fatalDeadlinesToday.length,
+      emptyMessage: "Nenhum prazo fatal vencendo hoje."
+    },
+    hearings: {
+      title: "Audiências da Semana",
+      tone: "blue",
+      items: hearingsWeek,
+      count: hearingsWeek.length,
+      emptyMessage: "Nenhuma audiência cadastrada nesta semana."
+    },
+    meetings: {
+      title: "Reuniões da Semana",
+      tone: "cyan",
+      items: meetingsWeek,
+      count: meetingsWeek.length,
+      emptyMessage: "Nenhuma reunião cadastrada nesta semana."
+    },
+    audits: {
+      title: "Auditorias da Semana",
+      tone: "purple",
+      items: auditsWeek,
+      count: auditsWeek.length,
+      emptyMessage: "Nenhuma auditoria cadastrada nesta semana."
+    },
+    weekDeadlines: {
+      title: "Prazos da Semana",
+      tone: "amber",
+      items: pendingDeadlinesWeek,
+      count: pendingDeadlinesWeek.length,
+      emptyMessage: "Nenhum prazo adicional programado nesta semana."
+    },
+    tasks: {
+      title: "Tarefas Pendentes",
+      tone: "green",
+      items: tasksToday,
+      count: pendingTasksToday.length,
+      emptyMessage: "Nenhuma tarefa cadastrada para hoje.",
+      showTaskControls: true
+    }
+  };
+  const activeHomeFocusPanelConfig = activeHomeFocusPanel ? homeFocusPanelMap[activeHomeFocusPanel] : null;
 
   const handleToggleHomeTask = async (item: AgendaItem) => {
     if (item.source !== "internal") return;
@@ -6739,19 +7025,23 @@ function Home({ user }: { user: AuthUser | null }) {
 
   const handleOpenHomeAgendaItem = (item: AgendaItem) => {
     if (item.source !== "internal") return;
+    setActiveHomeFocusPanel(null);
     setSelectedHomeAgendaItem(item);
     setHomeAgendaForm(buildHomeAgendaEditForm(item));
     setHomeAgendaModalError("");
+    setIsConfirmingHomeAgendaDelete(false);
   };
 
   const handleCloseHomeAgendaModal = () => {
     if (isSavingHomeAgenda || isDeletingHomeAgenda) return;
     setSelectedHomeAgendaItem(null);
     setHomeAgendaModalError("");
+    setIsConfirmingHomeAgendaDelete(false);
   };
 
   const handleChangeHomeAgendaForm = (field: keyof HomeAgendaEditForm, value: string | boolean) => {
     setHomeAgendaModalError("");
+    setIsConfirmingHomeAgendaDelete(false);
     setHomeAgendaForm((prev) => ({
       ...prev,
       [field]: value,
@@ -6803,14 +7093,18 @@ function Home({ user }: { user: AuthUser | null }) {
 
   const handleDeleteHomeAgendaItem = async () => {
     if (!selectedHomeAgendaItem) return;
-    const confirmed = window.confirm("Remover este compromisso da agenda?");
-    if (!confirmed) return;
+    if (!isConfirmingHomeAgendaDelete) {
+      setIsConfirmingHomeAgendaDelete(true);
+      setHomeAgendaModalError("");
+      return;
+    }
     setIsDeletingHomeAgenda(true);
     setHomeAgendaModalError("");
     try {
       await apiDeleteAgendaDeadline(selectedHomeAgendaItem.entity_id);
       setEvents((prev) => prev.filter((entry) => entry.id !== selectedHomeAgendaItem.id));
       setSelectedHomeAgendaItem(null);
+      setIsConfirmingHomeAgendaDelete(false);
     } catch (err) {
       setHomeAgendaModalError(extractApiErrorMessage(err, "Não foi possível remover o compromisso."));
     } finally {
@@ -6831,15 +7125,22 @@ function Home({ user }: { user: AuthUser | null }) {
         date.setDate(weekStart.getDate() + index);
         const dateKey = formatIsoDate(date);
         const items = internalWeekItems.filter((item) => getAgendaDateKey(item.starts_at) === dateKey);
-        const hasDeadline = items.some((item) => item.event_type === "deadline");
-        const hasHearing = items.some((item) => item.event_type === "hearing");
-        const hasTask = items.some(
-          (item) =>
-            item.event_type === "meeting" ||
-            item.event_type === "audit" ||
-            (item.kind === "meeting" && item.event_type !== "hearing")
-        );
-        const tone = hasDeadline ? "red" : hasHearing ? "blue" : hasTask ? "green" : "muted";
+        const hasDeadline = items.some((item) => getAgendaItemEventType(item) === "deadline");
+        const hasHearing = items.some((item) => getAgendaItemEventType(item) === "hearing");
+        const hasMeeting = items.some((item) => getAgendaItemEventType(item) === "meeting");
+        const hasAudit = items.some((item) => getAgendaItemEventType(item) === "audit");
+        const hasTask = items.some((item) => getAgendaItemEventType(item) === "task");
+        const tone = hasDeadline
+          ? "red"
+          : hasHearing
+            ? "blue"
+            : hasMeeting
+              ? "cyan"
+              : hasAudit
+                ? "purple"
+                : hasTask
+                  ? "green"
+                  : "muted";
         return {
           key: dateKey,
           label: weekDays[index],
@@ -6885,13 +7186,13 @@ function Home({ user }: { user: AuthUser | null }) {
       ) : (
         <div className="home-focus-grid">
             <section className="home-focus-card">
-              <div className="home-focus-head tone-red">
+              <button className="home-focus-head tone-red" type="button" onClick={() => setActiveHomeFocusPanel("fatal")}>
                 <div className="home-focus-head-main">
                   <span className="home-focus-dot" />
                   <strong>Prazos Fatais</strong>
                 </div>
                 <span className="home-focus-count">{fatalDeadlinesToday.length}</span>
-              </div>
+              </button>
               <div className="home-focus-list">
                 {fatalDeadlinesToday.length > 0 ? (
                   fatalDeadlinesToday.map((item) => (
@@ -6919,13 +7220,13 @@ function Home({ user }: { user: AuthUser | null }) {
             </section>
 
             <section className="home-focus-card">
-              <div className="home-focus-head tone-blue">
+              <button className="home-focus-head tone-blue" type="button" onClick={() => setActiveHomeFocusPanel("hearings")}>
                 <div className="home-focus-head-main">
                   <span className="home-focus-dot" />
                   <strong>Audiências da Semana</strong>
                 </div>
                 <span className="home-focus-count">{hearingsWeek.length}</span>
-              </div>
+              </button>
               <div className="home-focus-list">
                 {hearingsWeek.length > 0 ? (
                   hearingsWeek.map((item) => (
@@ -6957,13 +7258,91 @@ function Home({ user }: { user: AuthUser | null }) {
             </section>
 
             <section className="home-focus-card">
-              <div className="home-focus-head tone-amber">
+              <button className="home-focus-head tone-cyan" type="button" onClick={() => setActiveHomeFocusPanel("meetings")}>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Reuniões da Semana</strong>
+                </div>
+                <span className="home-focus-count">{meetingsWeek.length}</span>
+              </button>
+              <div className="home-focus-list">
+                {meetingsWeek.length > 0 ? (
+                  meetingsWeek.map((item) => (
+                    <div
+                      key={item.id}
+                      className="home-focus-item clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
+                      <div className="home-focus-main">
+                        <span className="home-focus-pill cyan">
+                          {weekDays[new Date(item.starts_at).getDay() === 0 ? 6 : new Date(item.starts_at).getDay() - 1]}
+                        </span>
+                        <div>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Reunião vinculada à agenda"}</div>
+                        </div>
+                      </div>
+                      <div className="home-focus-side">
+                        {formatBrazilDate(getAgendaDateKey(item.starts_at))} · {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="home-focus-empty">Nenhuma reunião cadastrada nesta semana.</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-focus-card">
+              <button className="home-focus-head tone-purple" type="button" onClick={() => setActiveHomeFocusPanel("audits")}>
+                <div className="home-focus-head-main">
+                  <span className="home-focus-dot" />
+                  <strong>Auditorias da Semana</strong>
+                </div>
+                <span className="home-focus-count">{auditsWeek.length}</span>
+              </button>
+              <div className="home-focus-list">
+                {auditsWeek.length > 0 ? (
+                  auditsWeek.map((item) => (
+                    <div
+                      key={item.id}
+                      className="home-focus-item clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenHomeAgendaItem(item)}
+                      onKeyDown={(event) => handleHomeAgendaItemKeyDown(event, item)}
+                    >
+                      <div className="home-focus-main">
+                        <span className="home-focus-pill purple">
+                          {weekDays[new Date(item.starts_at).getDay() === 0 ? 6 : new Date(item.starts_at).getDay() - 1]}
+                        </span>
+                        <div>
+                          <div className="home-focus-title">{item.title}</div>
+                          <div className="home-focus-meta">{homeMetaLabel(item) || "Auditoria interna do escritório"}</div>
+                        </div>
+                      </div>
+                      <div className="home-focus-side">
+                        {formatBrazilDate(getAgendaDateKey(item.starts_at))} · {formatAgendaTime(item.starts_at, item.ends_at, item.is_all_day)}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="home-focus-empty">Nenhuma auditoria cadastrada nesta semana.</div>
+                )}
+              </div>
+            </section>
+
+            <section className="home-focus-card">
+              <button className="home-focus-head tone-amber" type="button" onClick={() => setActiveHomeFocusPanel("weekDeadlines")}>
                 <div className="home-focus-head-main">
                   <span className="home-focus-dot" />
                   <strong>Prazos da Semana</strong>
                 </div>
                 <span className="home-focus-count">{pendingDeadlinesWeek.length}</span>
-              </div>
+              </button>
               <div className="home-focus-list">
                 {pendingDeadlinesWeek.length > 0 ? (
                   pendingDeadlinesWeek.map((item) => (
@@ -6994,13 +7373,13 @@ function Home({ user }: { user: AuthUser | null }) {
             </section>
 
             <section className="home-focus-card">
-              <div className="home-focus-head tone-green">
+              <button className="home-focus-head tone-green" type="button" onClick={() => setActiveHomeFocusPanel("tasks")}>
                 <div className="home-focus-head-main">
                   <span className="home-focus-dot" />
                   <strong>Tarefas Pendentes</strong>
                 </div>
                 <span className="home-focus-count">{pendingTasksToday.length}</span>
-              </div>
+              </button>
               <div className="home-focus-list">
                 {tasksToday.length > 0 ? (
                   tasksToday.map((item) => {
@@ -7043,16 +7422,34 @@ function Home({ user }: { user: AuthUser | null }) {
 
           </div>
       )}
+      {activeHomeFocusPanelConfig && (
+        <HomeFocusPanelModal
+          open={Boolean(activeHomeFocusPanel)}
+          title={activeHomeFocusPanelConfig.title}
+          tone={activeHomeFocusPanelConfig.tone}
+          items={activeHomeFocusPanelConfig.items}
+          count={activeHomeFocusPanelConfig.count}
+          emptyMessage={activeHomeFocusPanelConfig.emptyMessage}
+          showTaskControls={activeHomeFocusPanelConfig.showTaskControls}
+          updatingTaskIds={updatingTaskIds}
+          onClose={() => setActiveHomeFocusPanel(null)}
+          onOpenItem={handleOpenHomeAgendaItem}
+          onToggleTask={(item) => void handleToggleHomeTask(item)}
+          getAssigneesLabel={homeAssigneesLabel}
+        />
+      )}
       <HomeAgendaEditModal
         item={selectedHomeAgendaItem}
         form={homeAgendaForm}
         saving={isSavingHomeAgenda}
         deleting={isDeletingHomeAgenda}
+        confirmingDelete={isConfirmingHomeAgendaDelete}
         errorMessage={homeAgendaModalError}
         onClose={handleCloseHomeAgendaModal}
         onChange={handleChangeHomeAgendaForm}
         onSave={handleSubmitHomeAgendaForm}
         onDelete={handleDeleteHomeAgendaItem}
+        onCancelDelete={() => setIsConfirmingHomeAgendaDelete(false)}
       />
     </div>
   );
@@ -7180,7 +7577,7 @@ function Dashboard() {
     () =>
       cases.map((item) => ({
         status: normalizeCaseStatus(item.status),
-        walletName: item.wallet_name?.trim() || item.wallet_nickname?.trim() || "Sem carteira",
+        walletName: item.wallet_nickname?.trim() || item.wallet_name?.trim() || "Sem carteira",
         area: item.court?.trim() ? formatCourtOrRegion(item.court.trim()) : "Sem área"
       })),
     [cases]
@@ -7259,7 +7656,7 @@ function Dashboard() {
       const linkedCase =
         (entry.caseId ? casesById.get(entry.caseId) : undefined) ||
         casesByNumber.get(normalizeCaseDigits(entry.process));
-      const walletLabel = linkedCase?.wallet_name?.trim() || linkedCase?.wallet_nickname?.trim() || "Sem carteira";
+      const walletLabel = linkedCase?.wallet_nickname?.trim() || linkedCase?.wallet_name?.trim() || "Sem carteira";
       const current = buckets.get(walletLabel) || { expected: 0, received: 0 };
       current.expected += entry.amount;
       current.received += getFinanceSettledAmount(entry);
@@ -8067,7 +8464,26 @@ const splitStoredOab = (value: string) => {
   };
 };
 
-type PublicationActionMode = "details" | "task" | "deadline" | "hearing" | "register";
+type PublicationEventActionMode = "deadline" | "task" | "meeting" | "hearing" | "audit";
+type PublicationAppointmentActionMode = Extract<PublicationEventActionMode, "meeting" | "hearing" | "audit">;
+type PublicationActionMode = "details" | "event" | "ai" | PublicationEventActionMode | "register";
+type PublicationAiSuggestionAction = PublicationEventActionMode | "register" | "read";
+
+const publicationEventActionOptions: { value: PublicationEventActionMode; label: string; description: string }[] = [
+  { value: "deadline", label: "Prazo", description: "Data fatal, manifestação, recurso ou cumprimento de determinação." },
+  { value: "task", label: "Tarefa", description: "Providência interna simples vinculada à publicação." },
+  { value: "meeting", label: "Reunião", description: "Compromisso com cliente, equipe ou parte relacionada ao caso." },
+  { value: "hearing", label: "Audiência", description: "Audiência, conciliação, perícia ou sessão judicial." },
+  { value: "audit", label: "Auditoria", description: "Revisão interna de documentos, andamento ou estratégia do processo." }
+];
+
+const publicationEventActionLabels: Record<PublicationEventActionMode, string> = publicationEventActionOptions.reduce(
+  (acc, option) => ({ ...acc, [option.value]: option.label }),
+  {} as Record<PublicationEventActionMode, string>
+);
+
+const isPublicationAppointmentActionMode = (mode: PublicationActionMode | null): mode is PublicationAppointmentActionMode =>
+  mode === "meeting" || mode === "hearing" || mode === "audit";
 
 type PublicationTaskFormState = {
   title: string;
@@ -8651,6 +9067,115 @@ const buildPublicationHearingTaskDetails = (form: PublicationHearingFormState) =
   return lines.join("\n");
 };
 
+const buildPublicationAiAnalysis = (publication: TodayPublicationItem, context: PublicationContextItem | null) => {
+  const text = normalizeLooseText(
+    [publication.title, publication.summary, publication.communication_type, publication.court_name].filter(Boolean).join(" ")
+  );
+  const termDays = extractSuggestedPublicationTermDays(publication);
+  const dueDate = extractSuggestedPublicationDueDate(publication);
+  const hearingDate = extractSuggestedPublicationHearingDate(publication);
+  const hearingTime = extractSuggestedPublicationHearingTime(publication);
+  const hasDeadlineSignal =
+    Boolean(termDays || dueDate) || publicationDeadlineKeywordHints.some((keyword) => text.includes(normalizeLooseText(keyword)));
+  const hasHearingSignal =
+    Boolean(hearingDate || hearingTime) || publicationHearingKeywordHints.some((keyword) => text.includes(normalizeLooseText(keyword)));
+  const hasDecisionSignal = ["decisao", "sentenca", "acordao", "despacho"].some((keyword) => text.includes(keyword));
+  const hasArchiveSignal = ["arquiv", "baixa", "extincao"].some((keyword) => text.includes(keyword));
+  const hasScienceSignal = ["ciencia", "intimacao", "publique-se", "aguardara eventual manifestacao"].some((keyword) =>
+    text.includes(keyword)
+  );
+
+  const signals = [
+    publication.process_number ? `Processo identificado: ${publication.process_number}` : "Processo não identificado na publicação",
+    context?.has_registered_case ? "Processo já cadastrado no escritório" : "Processo ainda não cadastrado no escritório",
+    termDays ? `Menção a prazo de ${formatPublicationDeadlineTermLabel(termDays)}` : "",
+    dueDate ? `Data provável de vencimento: ${formatBrazilDate(dueDate)}` : "",
+    hearingDate ? `Data provável de audiência: ${formatBrazilDate(hearingDate)}` : "",
+    hearingTime ? `Horário localizado: ${hearingTime}` : "",
+    hasDecisionSignal ? "Há menção a decisão, sentença, acórdão ou despacho" : "",
+    hasArchiveSignal ? "Há sinal de arquivamento, baixa ou encerramento" : ""
+  ].filter(Boolean);
+
+  const suggestions: {
+    title: string;
+    description: string;
+    actionLabel?: string;
+    action?: PublicationAiSuggestionAction;
+  }[] = [];
+
+  if (hasDeadlineSignal) {
+    suggestions.push({
+      title: "Gerar um prazo",
+      description: [
+        termDays ? `A publicação menciona ${formatPublicationDeadlineTermLabel(termDays)}.` : "A redação indica possível prazo.",
+        dueDate ? `Use ${formatBrazilDate(dueDate)} como data sugerida e confira a contagem processual.` : "Confira a contagem antes de salvar."
+      ].join(" "),
+      actionLabel: "Gerar prazo",
+      action: "deadline"
+    });
+  }
+
+  if (hasHearingSignal) {
+    suggestions.push({
+      title: "Gerar audiência",
+      description: [
+        hearingDate ? `Foi localizada a data ${formatBrazilDate(hearingDate)}.` : "A publicação parece tratar de audiência, sessão ou perícia.",
+        hearingTime ? `Horário sugerido: ${hearingTime}.` : "Preencha o horário se ele estiver no documento do processo."
+      ].join(" "),
+      actionLabel: "Gerar audiência",
+      action: "hearing"
+    });
+  }
+
+  if (hasDecisionSignal) {
+    suggestions.push({
+      title: "Criar uma tarefa de conferência",
+      description: "Vale revisar o teor do ato e decidir se há recurso, manifestação, cumprimento ou comunicação ao cliente.",
+      actionLabel: "Gerar tarefa",
+      action: "task"
+    });
+  }
+
+  if (!context?.has_registered_case) {
+    suggestions.push({
+      title: "Cadastrar cliente/processo",
+      description: "Sem cadastro, a publicação fica limitada ao seu calendário e não permite distribuir responsáveis pela carteira.",
+      actionLabel: "Cadastrar",
+      action: "register"
+    });
+  }
+
+  if (!hasDeadlineSignal && !hasHearingSignal && (hasArchiveSignal || hasScienceSignal)) {
+    suggestions.push({
+      title: "Marcar como lida, se não houver providência",
+      description: "A publicação parece ser de ciência ou encerramento. Confirme no processo antes de encerrar a triagem.",
+      actionLabel: "Li e não há providências",
+      action: "read"
+    });
+  }
+
+  if (suggestions.length === 0) {
+    suggestions.push({
+      title: "Fazer triagem manual",
+      description: "Não encontrei um gatilho claro de prazo ou audiência. Leia o teor completo e crie uma tarefa se precisar acompanhar.",
+      actionLabel: "Gerar tarefa",
+      action: "task"
+    });
+  }
+
+  return {
+    headline: hasDeadlineSignal
+      ? "Provável providência com prazo"
+      : hasHearingSignal
+        ? "Provável compromisso de audiência"
+        : hasArchiveSignal
+          ? "Possível ciência ou encerramento"
+          : "Triagem recomendada",
+    signals: signals.slice(0, 6),
+    suggestions: suggestions.slice(0, 4)
+  };
+};
+
 const getPublicationResponsibleOptionsForContext = (
   officeResponsibleOptions: Array<{ value: string; label: string; note: string }>,
   user: AuthUser | null,
@@ -8756,14 +9281,14 @@ function PublicationActionsModal({
           {publication.summary && <div className="publication-detail-summary">{publication.summary}</div>}
 
           <div className="publication-detail-actions" aria-label="Ações da publicação">
-            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "deadline")} disabled={actionDisabled}>
-              Gerar prazo
+            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "event")} disabled={actionDisabled}>
+              Gerar evento
             </button>
-            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "hearing")} disabled={actionDisabled}>
-              Gerar audiência
+            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "ai")} disabled={busy}>
+              Newlaw IA
             </button>
-            <button className="btn secondary" type="button" onClick={() => onSelectAction(publication, "task")} disabled={actionDisabled}>
-              Gerar tarefa
+            <button className="btn secondary" type="button" onClick={() => onMarkAsRead(publication)} disabled={readDisabled}>
+              {context?.status === "read_no_action" ? "Limpar marcação" : "Li e não há providências"}
             </button>
             <button
               className="btn secondary"
@@ -8771,15 +9296,153 @@ function PublicationActionsModal({
               onClick={() => onSelectAction(publication, "register")}
               disabled={actionDisabled || !canRegisterCase}
             >
-              {canRegisterCase ? "Cadastrar cliente/processo" : "Processo cadastrado"}
-            </button>
-            <button className="btn secondary" type="button" onClick={() => onMarkAsRead(publication)} disabled={readDisabled}>
-              {context?.status === "read_no_action" ? "Limpar marcação" : "Li e não há providências"}
+              Cadastrar cliente/processo
             </button>
           </div>
 
           {loadingContext && <div className="publication-detail-footnote">Carregando status da publicação...</div>}
           {context?.warning && <div className="publication-warning-modal">{context.warning}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PublicationEventPickerModal({
+  open,
+  publication,
+  busy,
+  onClose,
+  onSelectEvent
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  busy: boolean;
+  onClose: () => void;
+  onSelectEvent: (publication: TodayPublicationItem, mode: PublicationEventActionMode) => void;
+}) {
+  if (!open || !publication) return null;
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-event-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Gerar evento</h2>
+            <div className="publication-meta">
+              {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        <div className="publication-event-options" aria-label="Tipo de evento">
+          {publicationEventActionOptions.map((option) => (
+            <button
+              key={option.value}
+              className="publication-event-option"
+              type="button"
+              onClick={() => onSelectEvent(publication, option.value)}
+              disabled={busy}
+            >
+              <span className="publication-event-option-label">{option.label}</span>
+              <span className="publication-event-option-description">{option.description}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PublicationAiModal({
+  open,
+  publication,
+  context,
+  busy,
+  onClose,
+  onSelectAction,
+  onMarkAsRead
+}: {
+  open: boolean;
+  publication: TodayPublicationItem | null;
+  context: PublicationContextItem | null;
+  busy: boolean;
+  onClose: () => void;
+  onSelectAction: (publication: TodayPublicationItem, mode: PublicationActionMode) => void;
+  onMarkAsRead: (publication: TodayPublicationItem) => void;
+}) {
+  if (!open || !publication) return null;
+  const analysis = buildPublicationAiAnalysis(publication, context);
+
+  const handleSuggestionClick = (action?: PublicationAiSuggestionAction) => {
+    if (!action) return;
+    if (action === "read") {
+      onMarkAsRead(publication);
+      return;
+    }
+    onSelectAction(publication, action);
+  };
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-card publication-ai-modal-card">
+        <div className="modal-head">
+          <div>
+            <h2 className="modal-title">Newlaw IA</h2>
+            <div className="publication-meta">
+              {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
+            </div>
+          </div>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Fechar" disabled={busy}>
+            ×
+          </button>
+        </div>
+
+        <div className="publication-ai-body">
+          <div className="publication-ai-summary">
+            <span>Leitura rápida</span>
+            <strong>{analysis.headline}</strong>
+          </div>
+
+          {analysis.signals.length > 0 && (
+            <div className="publication-ai-section">
+              <div className="publication-ai-section-title">Sinais encontrados</div>
+              <div className="publication-ai-signals">
+                {analysis.signals.map((signal) => (
+                  <span key={signal}>{signal}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="publication-ai-section">
+            <div className="publication-ai-section-title">Sugestões simples</div>
+            <div className="publication-ai-suggestions">
+              {analysis.suggestions.map((suggestion) => (
+                <div key={suggestion.title} className="publication-ai-suggestion">
+                  <div className="publication-ai-suggestion-main">
+                    <strong>{suggestion.title}</strong>
+                    <span>{suggestion.description}</span>
+                  </div>
+                  {suggestion.actionLabel && (
+                    <button
+                      className="btn ghost small"
+                      type="button"
+                      onClick={() => handleSuggestionClick(suggestion.action)}
+                      disabled={busy}
+                    >
+                      {suggestion.actionLabel}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="publication-ai-footnote">Confira o processo antes de protocolar ou encerrar a providência.</div>
         </div>
       </div>
     </div>
@@ -9037,6 +9700,7 @@ function PublicationHearingModal({
   publication,
   context,
   user,
+  eventLabel,
   form,
   officeResponsibleOptions,
   busy,
@@ -9049,6 +9713,7 @@ function PublicationHearingModal({
   publication: TodayPublicationItem | null;
   context: PublicationContextItem | null;
   user: AuthUser | null;
+  eventLabel: string;
   form: PublicationHearingFormState;
   officeResponsibleOptions: Array<{ value: string; label: string; note: string }>;
   busy: boolean;
@@ -9059,13 +9724,14 @@ function PublicationHearingModal({
 }) {
   if (!open || !publication) return null;
   const responsibleOptions = getPublicationResponsibleOptionsForContext(officeResponsibleOptions, user, context);
+  const eventLabelLower = eventLabel.toLowerCase();
 
   return (
     <div className="modal-backdrop">
       <div className="modal-card publication-task-modal-card">
         <div className="modal-head">
           <div>
-            <h2 className="modal-title">Gerar audiência</h2>
+            <h2 className="modal-title">Gerar {eventLabelLower}</h2>
             <div className="publication-meta">
               {publication.process_number ? `Processo ${publication.process_number}` : "Processo não identificado"}
             </div>
@@ -9114,7 +9780,7 @@ function PublicationHearingModal({
               <textarea
                 value={form.observations}
                 onChange={(event) => onChangeField("observations", event.target.value)}
-                placeholder="Adicione orientações ou detalhes da audiência."
+                placeholder={`Adicione orientações ou detalhes da ${eventLabelLower}.`}
               />
             </div>
           </div>
@@ -9124,7 +9790,7 @@ function PublicationHearingModal({
               Cancelar
             </button>
             <button className="btn" type="submit" disabled={!form.title.trim() || !form.date || busy}>
-              {busy ? "Gerando..." : "Salvar audiência"}
+              {busy ? "Gerando..." : `Salvar ${eventLabelLower}`}
             </button>
           </div>
         </form>
@@ -9460,12 +10126,12 @@ function Publications({ user }: { user: AuthUser | null }) {
     setPublicationActionError("");
     setTodayPublicationsError("");
     setTodayPublicationsInlineMessage("");
-    if (mode === "details") {
+    if (mode === "details" || mode === "event" || mode === "ai") {
       return;
     }
     if (mode === "task") {
       setPublicationTaskForm({
-        title: publication.process_number ? `Providência do processo ${publication.process_number}` : "Providência da publicação",
+        title: publication.process_number ? `Tarefa do processo ${publication.process_number}` : "Tarefa da publicação",
         details: "",
         dueDate: selectedPublicationDate,
         responsibleEmails: []
@@ -9506,14 +10172,15 @@ function Publications({ user }: { user: AuthUser | null }) {
       });
       return;
     }
-    if (mode === "hearing") {
-      const suggestedStartTime = extractSuggestedPublicationHearingTime(publication);
+    if (isPublicationAppointmentActionMode(mode)) {
+      const eventLabel = publicationEventActionLabels[mode];
+      const suggestedStartTime = mode === "hearing" ? extractSuggestedPublicationHearingTime(publication) : "";
       setPublicationHearingForm({
-        title: publication.process_number ? `Audiência do processo ${publication.process_number}` : "Audiência da publicação",
-        date: extractSuggestedPublicationHearingDate(publication) || selectedPublicationDate,
+        title: publication.process_number ? `${eventLabel} do processo ${publication.process_number}` : `${eventLabel} da publicação`,
+        date: mode === "hearing" ? extractSuggestedPublicationHearingDate(publication) || selectedPublicationDate : selectedPublicationDate,
         startTime: suggestedStartTime,
         endTime: suggestedStartTime ? addOneHourToPublicationTime(suggestedStartTime) : "",
-        location: extractSuggestedPublicationHearingLocation(publication),
+        location: mode === "hearing" ? extractSuggestedPublicationHearingLocation(publication) : publication.court_name || "",
         responsibleEmail: defaultResponsibleEmail,
         observations: ""
       });
@@ -9829,9 +10496,10 @@ function Publications({ user }: { user: AuthUser | null }) {
 
   const handleSubmitPublicationTask = async (event: React.FormEvent) => {
     event.preventDefault();
+    const taskDetails = ["Tipo: Tarefa", publicationTaskForm.details.trim()].filter(Boolean).join("\n");
     await submitPublicationGeneratedAction({
       taskTitle: publicationTaskForm.title.trim(),
-      taskDetails: publicationTaskForm.details.trim() || undefined,
+      taskDetails,
       dueDate: publicationTaskForm.dueDate,
       responsibleEmails: publicationTaskForm.responsibleEmails,
       includeActorResponsible: true,
@@ -9860,6 +10528,8 @@ function Publications({ user }: { user: AuthUser | null }) {
 
   const handleSubmitPublicationHearing = async (event: React.FormEvent) => {
     event.preventDefault();
+    const appointmentMode = isPublicationAppointmentActionMode(activePublicationAction) ? activePublicationAction : "hearing";
+    const eventLabel = publicationEventActionLabels[appointmentMode];
     if (publicationHearingForm.endTime && !publicationHearingForm.startTime) {
       setPublicationActionError("Preencha o horário de início antes do horário final.");
       return;
@@ -9885,11 +10555,11 @@ function Publications({ user }: { user: AuthUser | null }) {
       responsibleEmails: selectedResponsible ? [selectedResponsible] : [],
       includeActorResponsible: false,
       allowOfficeWideResponsibles: true,
-      eventType: "hearing",
+      eventType: appointmentMode,
       endTime: publicationHearingForm.endTime || undefined,
       isAllDay: !publicationHearingForm.startTime,
-      successMessage: "Audiência criada com sucesso a partir da publicação.",
-      failureMessage: "Não foi possível gerar a audiência da publicação."
+      successMessage: `${eventLabel} criada com sucesso a partir da publicação.`,
+      failureMessage: `Não foi possível gerar a ${eventLabel.toLowerCase()} da publicação.`
     });
   };
 
@@ -9954,11 +10624,11 @@ function Publications({ user }: { user: AuthUser | null }) {
   const tomorrowKey = formatIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1));
   const fiveDaysKey = formatIsoDate(new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 5));
   const publicationDeadlineItems = useMemo(
-    () => publicationAgendaItems.filter((item) => item.kind === "deadline" && isPublicationAgendaEvent(item)),
+    () => publicationAgendaItems.filter((item) => getAgendaItemEventType(item) === "deadline" && isPublicationAgendaEvent(item)),
     [publicationAgendaItems]
   );
   const publicationTaskItems = useMemo(
-    () => publicationAgendaItems.filter((item) => item.event_type === "task" && isPublicationAgendaEvent(item)),
+    () => publicationAgendaItems.filter((item) => getAgendaItemEventType(item) === "task" && isPublicationAgendaEvent(item)),
     [publicationAgendaItems]
   );
   const publicationDeadlinesBySourceKey = useMemo(() => {
@@ -10051,6 +10721,9 @@ function Publications({ user }: { user: AuthUser | null }) {
       : activePublicationContext?.status === "read_no_action"
       ? getPublicationHandlingLabel(activePublicationContext.status)
       : "";
+  const activePublicationAppointmentMode = isPublicationAppointmentActionMode(activePublicationAction)
+    ? activePublicationAction
+    : "hearing";
   const hearingItems = useMemo(() => {
     return publicationAgendaItems.filter((item) => {
       const haystack = normalizeLooseText(`${item.title} ${item.reference || ""} ${item.description || ""}`);
@@ -10334,6 +11007,22 @@ function Publications({ user }: { user: AuthUser | null }) {
         onSelectAction={openPublicationActionModal}
         onMarkAsRead={(publication) => void handleMarkPublicationAsRead(publication)}
       />
+      <PublicationEventPickerModal
+        open={Boolean(activePublication && activePublicationAction === "event")}
+        publication={activePublication}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        onClose={closePublicationActionModal}
+        onSelectEvent={openPublicationActionModal}
+      />
+      <PublicationAiModal
+        open={Boolean(activePublication && activePublicationAction === "ai")}
+        publication={activePublication}
+        context={activePublicationContext}
+        busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
+        onClose={closePublicationActionModal}
+        onSelectAction={openPublicationActionModal}
+        onMarkAsRead={(publication) => void handleMarkPublicationAsRead(publication)}
+      />
       <PublicationTaskModal
         open={Boolean(activePublication && activePublicationAction === "task")}
         publication={activePublication}
@@ -10361,10 +11050,11 @@ function Publications({ user }: { user: AuthUser | null }) {
         onChangeField={handlePublicationDeadlineFormField}
       />
       <PublicationHearingModal
-        open={Boolean(activePublication && activePublicationAction === "hearing")}
+        open={Boolean(activePublication && isPublicationAppointmentActionMode(activePublicationAction))}
         publication={activePublication}
         context={activePublicationContext}
         user={user}
+        eventLabel={publicationEventActionLabels[activePublicationAppointmentMode]}
         form={publicationHearingForm}
         officeResponsibleOptions={publicationOfficeResponsibleOptions}
         busy={Boolean(activePublication && processingPublicationSourceKey === buildPublicationSourceKey(activePublication))}
@@ -10434,7 +11124,7 @@ const agendaSourceLabel = (source: string) => {
 
 const agendaEventTagLabel = (item: AgendaItem) => {
   if (item.source === "internal") {
-    return getInternalAgendaTypeOption(item.event_type).label;
+    return getInternalAgendaTypeOption(getAgendaItemEventType(item)).label;
   }
   return item.kind === "deadline" ? "Prazo" : "Reunião";
 };
@@ -10443,17 +11133,18 @@ const agendaEventAssigneesLabel = (item: AgendaItem) => item.assignees || item.a
 
 const isAgendaItemCompleted = (item: AgendaItem) => (item.status || "").trim().toLowerCase() === "concluido";
 
-const isAgendaDeadlineItem = (item: AgendaItem) => item.kind === "deadline" || item.event_type === "deadline";
+const isAgendaDeadlineItem = (item: AgendaItem) => getAgendaItemEventType(item) === "deadline";
 
 const isAgendaHearingItem = (item: AgendaItem) => {
-  if (item.event_type === "hearing") return true;
+  if (getAgendaItemEventType(item) === "hearing") return true;
   const haystack = normalizeSearchText([item.title, item.description, item.reference, item.location].filter(Boolean).join(" "));
   return haystack.includes("audiencia") || haystack.includes("concilia");
 };
 
 const isAgendaTaskOrMeetingItem = (item: AgendaItem) => {
   if (isAgendaDeadlineItem(item) || isAgendaHearingItem(item)) return false;
-  return item.kind === "meeting" || item.event_type === "task" || item.event_type === "meeting" || item.event_type === "audit";
+  const eventType = getAgendaItemEventType(item);
+  return item.kind === "meeting" || eventType === "task" || eventType === "meeting" || eventType === "audit";
 };
 
 const formatAgendaTime = (startValue: string, endValue: string, isAllDay: boolean) => {
@@ -11850,17 +12541,19 @@ const getProgressToneFromCaseCode = (code: string): ProgressTimelineTone => {
 
 const getProgressToneFromAgendaItem = (item: AgendaItem): ProgressTimelineTone => {
   if (item.source !== "internal") return item.kind === "deadline" ? "amber" : "blue";
-  if (item.event_type === "hearing") return "violet";
-  if (item.event_type === "audit") return "green";
-  if (item.kind === "deadline") return "amber";
+  const eventType = getAgendaItemEventType(item);
+  if (eventType === "hearing") return "violet";
+  if (eventType === "audit") return "green";
+  if (eventType === "deadline") return "amber";
   return "blue";
 };
 
 const getProgressAgendaKind = (item: AgendaItem): ProgressTimelineKind => {
   if (item.source !== "internal") return "external";
-  if (item.event_type === "hearing") return "hearing";
-  if (item.event_type === "audit") return "audit";
-  return item.kind;
+  const eventType = getAgendaItemEventType(item);
+  if (eventType === "hearing") return "hearing";
+  if (eventType === "audit") return "audit";
+  return eventType === "deadline" ? "deadline" : "meeting";
 };
 
 function Progress() {
@@ -13495,6 +14188,11 @@ function Wallets({ canManage }: { canManage: boolean }) {
   const [saveError, setSaveError] = useState("");
   const [saveSuccess, setSaveSuccess] = useState("");
   const [editingWalletId, setEditingWalletId] = useState<number | null>(null);
+  const [transferWalletId, setTransferWalletId] = useState<number | null>(null);
+  const [transferSourceMemberId, setTransferSourceMemberId] = useState("");
+  const [transferTargetMemberId, setTransferTargetMemberId] = useState("");
+  const [transferError, setTransferError] = useState("");
+  const [isTransferring, setIsTransferring] = useState(false);
   const [form, setForm] = useState({ nickname: "", description: "", isActive: true, teamMemberIds: [] as number[] });
 
   useEffect(() => {
@@ -13536,10 +14234,12 @@ function Wallets({ canManage }: { canManage: boolean }) {
   const activeWallets = wallets.filter((wallet) => wallet.is_active).length;
   const linkedCases = wallets.reduce((sum, wallet) => sum + (wallet.case_count || 0), 0);
   const restrictedWallets = wallets.filter((wallet) => (wallet.team_member_ids?.length || 0) > 0).length;
-  const nextWalletNumber = (wallets.length ? Math.max(...wallets.map((wallet) => wallet.number)) : 0) + 1;
-  const editingWallet = editingWalletId ? wallets.find((wallet) => wallet.id === editingWalletId) || null : null;
+  const transferWallet = transferWalletId ? wallets.find((wallet) => wallet.id === transferWalletId) || null : null;
   const selectableMembers = members
     .filter((member) => member.is_active || form.teamMemberIds.includes(member.id))
+    .sort((a, b) => a.full_name.localeCompare(b.full_name, "pt-BR"));
+  const transferTargetMembers = members
+    .filter((member) => member.is_active && member.id !== Number(transferSourceMemberId))
     .sort((a, b) => a.full_name.localeCompare(b.full_name, "pt-BR"));
 
   const filteredWallets = useMemo(() => {
@@ -13547,7 +14247,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
     if (!term) return wallets;
     return wallets.filter((wallet) => {
       const accessNames = (wallet.team_members || []).map((member) => `${member.full_name} ${member.email}`).join(" ");
-      return `${wallet.name} ${wallet.nickname} ${wallet.description || ""} ${accessNames}`.toLowerCase().includes(term);
+      return `${wallet.nickname} ${wallet.description || ""} ${accessNames}`.toLowerCase().includes(term);
     });
   }, [wallets, searchTerm]);
 
@@ -13583,6 +14283,60 @@ function Wallets({ canManage }: { canManage: boolean }) {
     });
     setSaveError("");
     setView("create");
+  };
+
+  const handleOpenTransferWallet = (wallet: ApiWallet) => {
+    if (!canManage) return;
+    const currentMemberIds = wallet.team_member_ids || [];
+    setTransferWalletId(wallet.id);
+    setTransferSourceMemberId(currentMemberIds.length === 1 ? String(currentMemberIds[0]) : "");
+    setTransferTargetMemberId("");
+    setTransferError("");
+    setSaveSuccess("");
+  };
+
+  const handleCloseTransferWallet = () => {
+    if (isTransferring) return;
+    setTransferWalletId(null);
+    setTransferSourceMemberId("");
+    setTransferTargetMemberId("");
+    setTransferError("");
+  };
+
+  const handleTransferWallet = async () => {
+    if (!canManage) {
+      setTransferError("Somente administradores podem transferir carteiras.");
+      return;
+    }
+    if (!transferWallet) return;
+    const currentMemberIds = transferWallet.team_member_ids || [];
+    if (currentMemberIds.length > 0 && !transferSourceMemberId) {
+      setTransferError("Selecione quem deixará de ser responsável pela carteira.");
+      return;
+    }
+    if (!transferTargetMemberId) {
+      setTransferError("Selecione quem receberá a carteira.");
+      return;
+    }
+    setIsTransferring(true);
+    setTransferError("");
+    try {
+      const updated = await apiTransferWallet(transferWallet.id, {
+        source_team_member_id: transferSourceMemberId ? Number(transferSourceMemberId) : undefined,
+        target_team_member_id: Number(transferTargetMemberId)
+      });
+      const targetMember = members.find((member) => member.id === Number(transferTargetMemberId));
+      setWallets((prev) => prev.map((wallet) => (wallet.id === updated.id ? updated : wallet)));
+      setSaveSuccess(`A carteira ${updated.nickname} foi transferida para ${targetMember?.full_name || "o novo responsável"}.`);
+      setTransferWalletId(null);
+      setTransferSourceMemberId("");
+      setTransferTargetMemberId("");
+      setTransferError("");
+    } catch (err) {
+      setTransferError(extractApiErrorMessage(err, "Não foi possível transferir a carteira."));
+    } finally {
+      setIsTransferring(false);
+    }
   };
 
   const handleSaveWallet = async () => {
@@ -13652,7 +14406,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
           </div>
           <div className="processes-search wallets-search">
             <input
-              placeholder="Pesquisar por nome ou apelido"
+              placeholder="Pesquisar por carteira ou responsável"
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}
             />
@@ -13708,8 +14462,7 @@ function Wallets({ canManage }: { canManage: boolean }) {
             </div>
             <div className="processes-table">
               <div className="wallets-table-row head">
-                <div>Nome</div>
-                <div>Apelido</div>
+                <div>Carteira</div>
                 <div>Acesso</div>
                 <div>Processos</div>
                 <div>Status</div>
@@ -13722,7 +14475,6 @@ function Wallets({ canManage }: { canManage: boolean }) {
               ) : (
                 filteredWallets.map((wallet) => (
                   <div key={wallet.id} className="wallets-table-row">
-                    <div>{wallet.name}</div>
                     <div>
                       <strong>{wallet.nickname}</strong>
                       <div className="wallets-row-sub">{wallet.description || "Sem descrição"}</div>
@@ -13742,9 +14494,14 @@ function Wallets({ canManage }: { canManage: boolean }) {
                     <div>{wallet.is_active ? "Ativa" : "Inativa"}</div>
                     <div className="wallets-row-actions">
                       {canManage && (
-                        <button className="btn ghost small" type="button" onClick={() => handleEditWallet(wallet)}>
-                          Editar
-                        </button>
+                        <>
+                          <button className="btn ghost small" type="button" onClick={() => handleEditWallet(wallet)}>
+                            Editar
+                          </button>
+                          <button className="btn secondary small" type="button" onClick={() => handleOpenTransferWallet(wallet)}>
+                            Transferir
+                          </button>
+                        </>
                       )}
                     </div>
                   </div>
@@ -13759,19 +14516,15 @@ function Wallets({ canManage }: { canManage: boolean }) {
             <div className="processes-eyebrow">Cadastro</div>
             <h2>{editingWalletId ? "Editar carteira" : "Nova carteira"}</h2>
             <div className="wallets-form-hint">
-              Nome automático: sempre o último número + 1. O master e administradores sempre visualizam todas as carteiras.
+              Use um nome claro para identificar a carteira. O master e administradores sempre visualizam todas as carteiras.
             </div>
             <div className="modal-grid">
-              <div className="field">
-                <label>Nome da carteira</label>
-                <input value={editingWallet?.name || `Carteira ${nextWalletNumber}`} readOnly />
-              </div>
-              <div className="field">
-                <label>Apelido *</label>
+              <div className="field span-2">
+                <label>Nome da carteira *</label>
                 <input
                   value={form.nickname}
                   onChange={(event) => setForm((prev) => ({ ...prev, nickname: event.target.value }))}
-                  placeholder="Ex: Cível SP"
+                  placeholder="Ex.: Processos Marcela"
                 />
               </div>
               <div className="field span-2">
@@ -13843,6 +14596,107 @@ function Wallets({ canManage }: { canManage: boolean }) {
           </div>
         )}
       </div>
+
+      {transferWallet && canManage ? (
+        <div className="modal-backdrop" onClick={handleCloseTransferWallet}>
+          <div
+            className="modal-card wallet-transfer-modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="wallet-transfer-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h2 id="wallet-transfer-title" className="modal-title">Transferir carteira</h2>
+              <button
+                className="icon-btn"
+                type="button"
+                onClick={handleCloseTransferWallet}
+                aria-label="Fechar"
+                disabled={isTransferring}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="wallet-transfer-summary">
+              <strong>{transferWallet.nickname}</strong>
+              <span>
+                {transferWallet.case_count || 0} processo(s) permanecerão vinculados à carteira durante a transferência.
+              </span>
+            </div>
+
+            <div className="modal-grid wallet-transfer-grid">
+              {(transferWallet.team_members || []).length > 0 ? (
+                <div className="field">
+                  <label>Responsável atual *</label>
+                  <select
+                    value={transferSourceMemberId}
+                    onChange={(event) => {
+                      const nextSourceId = event.target.value;
+                      setTransferSourceMemberId(nextSourceId);
+                      if (transferTargetMemberId === nextSourceId) {
+                        setTransferTargetMemberId("");
+                      }
+                      setTransferError("");
+                    }}
+                  >
+                    <option value="">Selecione quem deixará a carteira</option>
+                    {(transferWallet.team_members || []).map((member) => (
+                      <option key={member.id} value={String(member.id)}>
+                        {member.full_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div className="wallet-transfer-empty">
+                  A carteira ainda não possui um membro responsável. O novo responsável será adicionado.
+                </div>
+              )}
+
+              <div className="field">
+                <label>Novo responsável *</label>
+                <select
+                  value={transferTargetMemberId}
+                  onChange={(event) => {
+                    setTransferTargetMemberId(event.target.value);
+                    setTransferError("");
+                  }}
+                >
+                  <option value="">Selecione quem receberá a carteira</option>
+                  {transferTargetMembers.map((member) => (
+                    <option key={member.id} value={String(member.id)}>
+                      {member.full_name} · {member.role_title}
+                    </option>
+                  ))}
+                </select>
+                {transferTargetMembers.length === 0 ? (
+                  <div className="error-inline">Não há outro membro ativo disponível para receber esta carteira.</div>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="wallet-transfer-note">
+              Os demais membros com acesso continuarão na carteira. Esta ação altera apenas a pessoa selecionada.
+            </div>
+            {transferError && <div className="error">{transferError}</div>}
+            <div className="modal-actions">
+              <button className="btn ghost" type="button" onClick={handleCloseTransferWallet} disabled={isTransferring}>
+                Cancelar
+              </button>
+              <button
+                className="btn"
+                type="button"
+                onClick={handleTransferWallet}
+                disabled={isTransferring || transferTargetMembers.length === 0}
+              >
+                {isTransferring ? "Transferindo..." : "Confirmar transferência"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -14444,7 +15298,7 @@ function Team({ canManage }: { canManage: boolean }) {
                     disabled={editingMasterAccount}
                     onChange={(event) => handleToggleAdmin(event.target.checked)}
                   />
-                  Administrador da equipe (pode cadastrar membros e criar carteiras)
+                  Administrador da equipe (pode cadastrar membros e criar ou transferir carteiras)
                 </label>
               </div>
               <div className="field span-2">
@@ -15469,12 +16323,16 @@ function App() {
   const activeNav = visibleNavItems.some((item) => item.key === active) ? active : (visibleNavItems[0]?.key ?? "settings");
   const effectiveProfilePreferences = profilePreview ?? profilePreferences;
   const sidebarDisplayName = effectiveProfilePreferences.displayName || user?.name || "Responsável da conta";
-  const sidebarFooterName = (() => {
+  const sidebarCompactDisplayName = (() => {
     const parts = sidebarDisplayName.trim().split(/\s+/).filter(Boolean);
     if (parts.length <= 2) return parts.join(" ");
     return `${parts[0]} ${parts[parts.length - 1]}`;
   })();
   const sidebarOfficeName = user?.organization_name?.trim() || MASTER_OFFICE_NAME;
+  const sidebarPersonNameSizeClass =
+    sidebarCompactDisplayName.length > 24 ? "brand-full-extra-long" : sidebarCompactDisplayName.length > 17 ? "brand-full-long" : "";
+  const sidebarOfficeNameSizeClass =
+    sidebarOfficeName.length > 60 ? "sidebar-user-extra-long" : sidebarOfficeName.length > 36 ? "sidebar-user-long" : "";
   const sidebarRoleLabel =
     user?.role_title?.trim() ||
     (user?.role === "superadmin" || user?.role === "owner" || user?.role === "admin" ? "Responsável master" : "Membro da equipe");
@@ -15671,14 +16529,15 @@ function App() {
       <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="sidebar-top">
           <div className="sidebar-account">
-            <ProfileAvatar avatarDataUrl={effectiveProfilePreferences.avatarDataUrl} label={sidebarOfficeName} size="sidebar" />
+            <ProfileAvatar avatarDataUrl={effectiveProfilePreferences.avatarDataUrl} label={sidebarDisplayName} size="sidebar" />
             <div className="brand">
-              <span className="brand-full">{sidebarOfficeName}</span>
+              <span className={`brand-full ${sidebarPersonNameSizeClass}`} title={sidebarDisplayName}>
+                {sidebarCompactDisplayName}
+              </span>
               <span className="brand-meta">{sidebarRoleLabel}</span>
             </div>
           </div>
         </div>
-        <div className="section-label">Ferramentas</div>
         <div className="nav-list scroll-area" ref={navListRef}>
           {visibleNavItems.map((item) => (
             <button
@@ -15695,7 +16554,9 @@ function App() {
           ))}
         </div>
         <div className="sidebar-footer">
-          <div className="sidebar-user">{sidebarFooterName}</div>
+          <div className={`sidebar-user ${sidebarOfficeNameSizeClass}`} title={sidebarOfficeName}>
+            {sidebarOfficeName}
+          </div>
           <button
             className={`sidebar-ai-trigger ${isAssistantOpen ? "active" : ""}`}
             type="button"

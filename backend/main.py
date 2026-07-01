@@ -1280,6 +1280,46 @@ def normalize_internal_agenda_time(raw_value: str | None) -> str | None:
     return parsed.strftime("%H:%M")
 
 
+def normalize_internal_agenda_match_text(value: str | None) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def infer_internal_agenda_event_type_from_deadline(
+    deadline: AgendaDeadline,
+    metadata: dict[str, Any],
+    event_type: str,
+) -> str:
+    if event_type != "deadline":
+        return event_type
+    reference = (deadline.reference or "").strip()
+    haystack = normalize_internal_agenda_match_text(
+        " ".join(
+            [
+                deadline.title,
+                reference,
+                metadata.get("notes") or "",
+                metadata.get("created_via") or "",
+            ]
+        )
+    )
+    is_publication_item = (
+        metadata.get("created_via") == "publication"
+        or bool(metadata.get("publication_source_key"))
+        or reference.startswith("[Publicação]")
+    )
+    if is_publication_item and (
+        "providencia do processo" in haystack
+        or "providencia da publicacao" in haystack
+        or haystack.startswith("tarefa ")
+        or "tipo tarefa" in haystack
+        or "categoria tarefa" in haystack
+    ):
+        return "task"
+    return event_type
+
+
 def parse_optional_iso_date(raw_value: str | None, detail: str) -> date | None:
     value = (raw_value or "").strip()
     if not value:
@@ -1422,6 +1462,7 @@ def serialize_calendar_connection_status(provider: str, connection: CalendarConn
 def serialize_deadline(deadline: AgendaDeadline) -> dict[str, Any]:
     metadata = parse_internal_agenda_metadata(deadline.notes)
     event_type = normalize_internal_agenda_event_type(metadata.get("event_type"))
+    event_type = infer_internal_agenda_event_type_from_deadline(deadline, metadata, event_type)
     is_all_day = bool(metadata.get("is_all_day", True))
     assignees = metadata.get("assignees") or metadata.get("assignee_name")
     ends_at = deadline.due_at + timedelta(hours=1)
@@ -2148,6 +2189,11 @@ class UpdateWalletRequest(BaseModel):
     organization_id: int | None = None
 
 
+class TransferWalletRequest(BaseModel):
+    source_team_member_id: int | None = None
+    target_team_member_id: int
+
+
 class CreateTeamMemberRequest(BaseModel):
     full_name: str
     email: str
@@ -2826,7 +2872,7 @@ def serialize_case(case: Case, wallet: Wallet | None = None) -> dict:
         "court": case.court,
         "value": case.value,
         "wallet_id": wallet.id if wallet else None,
-        "wallet_name": wallet.name if wallet else None,
+        "wallet_name": wallet.nickname if wallet else None,
         "wallet_nickname": wallet.nickname if wallet else None,
         "closing": serialize_case_closing(case),
         "created_at": case.created_at,
@@ -3883,7 +3929,7 @@ def build_publication_context_items(
                 case_id=matched_case.id if matched_case and matched_case.id is not None else None,
                 case_number=matched_case.number if matched_case else None,
                 wallet_id=wallet.id if wallet and wallet.id is not None else None,
-                wallet_name=wallet.name if wallet else None,
+                wallet_name=wallet.nickname if wallet else None,
                 allow_additional_responsibles=bool(wallet and allowed_responsibles),
                 allowed_responsibles=allowed_responsibles,
                 warning=warning,
@@ -5783,6 +5829,58 @@ def update_wallet(
     return serialize_wallet(wallet, case_count, assigned_members)
 
 
+@app.post("/wallets/{wallet_id}/transfer")
+def transfer_wallet(
+    wallet_id: int,
+    payload: TransferWalletRequest,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> dict:
+    ensure_can_manage_team_and_wallets(user)
+    wallet = session.get(Wallet, wallet_id)
+    if not wallet:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Carteira não encontrada")
+    current_scope = resolve_existing_record_scope(user, session, wallet.organization_id)
+    if current_scope is not None and wallet.organization_id != current_scope:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sem permissão para esta carteira")
+
+    target_member = session.get(TeamMember, payload.target_team_member_id)
+    if not target_member or target_member.organization_id != wallet.organization_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Novo responsável inválido para esta carteira")
+    if not target_member.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="O novo responsável precisa estar ativo")
+
+    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.wallet_id == wallet.id)).all()
+    current_member_ids = {row.team_member_id for row in access_rows}
+    source_member_id = payload.source_team_member_id
+
+    if current_member_ids:
+        if source_member_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selecione o responsável atual da carteira")
+        if source_member_id not in current_member_ids:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="O responsável atual não está vinculado à carteira")
+    elif source_member_id is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A carteira ainda não possui responsável vinculado")
+
+    if source_member_id == target_member.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Escolha uma pessoa diferente para receber a carteira")
+    next_member_ids = set(current_member_ids)
+    if source_member_id is not None:
+        next_member_ids.discard(source_member_id)
+    if target_member.id is not None:
+        next_member_ids.add(target_member.id)
+
+    sync_wallet_team_member_access(session, wallet, list(next_member_ids))
+    wallet.updated_at = datetime.utcnow()
+    session.add(wallet)
+    session.commit()
+    session.refresh(wallet)
+
+    assigned_members = resolve_wallet_team_members(session, wallet.organization_id, list(next_member_ids))
+    case_count = build_wallet_case_count_map(session, [wallet.id]).get(wallet.id, 0)
+    return serialize_wallet(wallet, case_count, assigned_members)
+
+
 @app.delete("/wallets/{wallet_id}")
 def delete_wallet(
     wallet_id: int,
@@ -6069,11 +6167,17 @@ def delete_team_member(
     linked_user = get_user_by_email(session, member.email)
     if linked_user and linked_user.organization_id == member.organization_id and linked_user.role == "owner":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A conta master não pode ser excluída.")
+    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.team_member_id == member.id)).all()
+    if access_rows:
+        wallet_ids = list({row.wallet_id for row in access_rows})
+        linked_wallets = session.exec(select(Wallet).where(Wallet.id.in_(wallet_ids))).all()
+        wallet_names = ", ".join(sorted(wallet.nickname for wallet in linked_wallets if wallet.nickname))
+        detail = "Transfira as carteiras deste membro antes de excluí-lo."
+        if wallet_names:
+            detail = f"{detail} Carteiras vinculadas: {wallet_names}."
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     if linked_user and linked_user.id is not None and linked_user.organization_id == member.organization_id and linked_user.role == "member":
         purge_member_login_account(session, linked_user)
-    access_rows = session.exec(select(WalletTeamMemberAccess).where(WalletTeamMemberAccess.team_member_id == member.id)).all()
-    for row in access_rows:
-        session.delete(row)
     session.delete(member)
     session.commit()
     return {"status": "ok", "id": member_id}
